@@ -298,3 +298,12 @@ pub(super) fn connected(name: &str) -> Wlan {
         }),
     )
 }
+
+#[test]
+fn the_theme_follows_the_stock_status_bar_insets() {
+    let mut app = App::new(Screen::Home, W, H, PPD);
+    app.set_status_bar(100.0, 247.0, 43.0, 29.0);
+    let m = app.theme().m;
+    assert!((m.status_cy - 99.35).abs() < 0.01, "one clock-digit height below the middle");
+    assert_eq!((m.status_x, m.status_right, m.status_bolt_right), (247.0, 43.0, 29.0));
+}

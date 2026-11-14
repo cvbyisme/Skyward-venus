@@ -46,6 +46,10 @@ pub struct DeviceConfig {
     pub device: Device,
     #[serde(default)]
     pub display: Display,
+    /// The status bar the phone's own system draws, when its overlay names
+    /// the dimensions Skyward should follow.
+    #[serde(default)]
+    pub status_bar: Option<StatusBar>,
     #[serde(default)]
     pub modules: Modules,
     #[serde(default)]
@@ -61,6 +65,10 @@ pub struct DeviceConfig {
     /// The vibration motor's click, on phones that have one.
     #[serde(default)]
     pub haptics: Option<Haptics>,
+    /// The panel's own doze, on phones whose display driver offers one: what
+    /// keeps a little on the glass with the backlight out.
+    #[serde(default)]
+    pub aod: Option<Aod>,
     /// The recovery's own logd, on phones whose recovery leaves out
     /// libraries it needs.
     #[serde(default)]
@@ -84,6 +92,18 @@ pub struct DeviceConfig {
     /// The stock build the recovery is made on.
     #[serde(default)]
     pub stock: Option<Stock>,
+}
+
+/// The stock status bar's dimensions, in display pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct StatusBar {
+    pub height: u32,
+    /// Where the clock starts from the left edge, past a cutout.
+    pub left: u32,
+    /// Where the battery ends from the right edge.
+    pub right: u32,
+    /// Where the charging bolt ends from the right edge.
+    pub bolt_right: u32,
 }
 
 /// The stock build a recovery is made on: the phone maker's full update
@@ -207,14 +227,98 @@ const DATA: &str = "/data";
 /// and the ticks of the screen going off by the power key, made too.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Haptics {
+    /// The kernel's force-feedback argument layout.
+    #[serde(default)]
+    pub driver: HapticDriver,
     /// The driver's number for a click waveform it keeps, on phones whose
     /// driver plays the waveforms it keeps.
     #[serde(default)]
     pub click: Option<i16>,
-    /// The file the driver says the motor's resonant frequency in, in
-    /// tenths of a hertz whatever its label.
-    pub resonance: String,
+    /// The file the motor's driver says its resonant frequency in, in
+    /// tenths of a hertz whatever its label, on phones whose click is made
+    /// for the motor's own frequency. A driver that says it nowhere, as
+    /// Cirrus Logic's CS40L26 does not, takes a click made at the nominal
+    /// frequency instead, which is why this may be left out.
+    #[serde(default)]
+    pub resonance: Option<String>,
+    /// The kernel modules the motor's driver is in, which the recovery loads
+    /// as it brings the motor up: a motor whose driver the phone's own
+    /// recovery leaves out makes no force-feedback device until it is.
+    #[serde(default)]
+    pub modules: Vec<String>,
+    /// Firmware files the driver asks the kernel's loader for, which the
+    /// phone's own recovery keeps out of its reach: a motor driver that ends
+    /// its probe for want of one makes no force-feedback device either.
+    #[serde(default)]
+    pub firmware: Vec<Firmware>,
     pub strength: Strength,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HapticDriver {
+    #[default]
+    Periodic,
+    Aw8697,
+}
+
+/// The panel's own doze: what the display driver is told to keep a little of
+/// the panel alight with the backlight out, as the stock system keeps its
+/// always-on display on these phones. The driver is Xiaomi's `mi_disp`, which
+/// lives inside `msm_drm` — the same module that drives the pages.
+///
+/// A panel is put into its doze by sending it one of its own command sets and
+/// taken out of it by sending others, through the node the driver writes a
+/// set's number to; the panel stays dark to the rest of the system either
+/// way, its backlight at 0. What glows is decided by the frame, not by the
+/// light: an OLED lights the subpixels the framebuffer lights, so the pages
+/// draw black but for the clock.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Aod {
+    /// The display driver's folder for the panel: it holds the node that
+    /// lists the driver's features, and one node per feature.
+    #[serde(default = "default_aod_dir")]
+    pub dir: String,
+    /// The node a command set's number is written to, which has the driver
+    /// send that set to the panel.
+    #[serde(default = "default_aod_node")]
+    pub node: String,
+    /// The driver's features written as the panel goes into its doze, each by
+    /// the number `disp_param` gives it: a feature the driver does not list
+    /// is left alone rather than written blind.
+    #[serde(default)]
+    pub enter: Vec<Feature>,
+    /// The command sets sent as it goes in, by the number the node's own
+    /// listing gives each.
+    #[serde(default)]
+    pub enter_cmds: Vec<u32>,
+    /// The features written as it comes back out.
+    #[serde(default)]
+    pub leave: Vec<Feature>,
+    /// The command sets sent as it comes back out.
+    #[serde(default)]
+    pub leave_cmds: Vec<u32>,
+}
+
+/// One of the display driver's features, as `disp_param` lists it: the number
+/// it gives the feature in brackets after its name, and the value to write.
+/// The driver's own folder carries a node for each feature it lets be
+/// written, named as the listing names it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Feature {
+    /// The number in brackets after the feature's name: `doze_brightness` is
+    /// `[03]`, `apl_dimming` is `[36]`. The driver counts them in hex.
+    pub id: u32,
+    /// What is written to the feature's node, as text.
+    pub value: String,
+}
+
+fn default_aod_dir() -> String {
+    "/sys/class/mi_display/disp-DSI-0".into()
+}
+
+fn default_aod_node() -> String {
+    "/proc/mi_display/tx_cmd_set_prim".into()
 }
 
 /// How strongly the click plays, each as a share of the most its waveform
@@ -317,6 +421,22 @@ pub struct Touch {
     /// step of starting the controller.
     #[serde(default)]
     pub writes: Vec<Write>,
+    /// Whether two taps on the dark panel light it, as the phone's own
+    /// system's double tap does. A phone whose panel goes dark but whose
+    /// controller keeps reporting taps is one this is worth setting on: the
+    /// recovery then keeps the phone awake while the panel is off, since a
+    /// suspended phone is one the touchscreen cannot report a tap to.
+    #[serde(default)]
+    pub double_tap: bool,
+    /// A controller gesture that wakes the suspended phone through KEY_WAKEUP.
+    #[serde(default)]
+    pub hardware_double_tap: Option<HardwareDoubleTap>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwareDoubleTap {
+    XiaomiFts,
 }
 
 /// Partitions as the phone itself mounts them.
@@ -539,13 +659,44 @@ impl DeviceConfig {
             ensure!(plain && !folder.is_empty(), "[backup] data_skipped: {folder} is not a path from the top of {DATA}");
         }
         if let Some(haptics) = &cfg.haptics {
-            let file = &haptics.resonance;
-            ensure!(Path::new(file).is_absolute(), "[haptics] resonance: {file} is not an absolute path");
+            // A click is either a waveform the driver keeps or one made at
+            // the motor's own frequency, and a phone may name the frequency
+            // beside a kept waveform too, for the ticks the screen going off
+            // plays. A driver that says its motor's frequency nowhere, as
+            // Cirrus Logic's CS40L26 does not, names neither and takes a
+            // click made at the nominal frequency.
+            if let Some(file) = &haptics.resonance {
+                ensure!(Path::new(file).has_root(), "[haptics] resonance: {file} is not an absolute path");
+            }
             let Strength { lightest, strongest } = haptics.strength;
             ensure!(
                 0.0 < lightest && lightest < strongest && strongest <= 1.0,
                 "[haptics] strength: {lightest} and {strongest} are not shares rising from above 0 to at most 1"
             );
+            for name in &haptics.modules {
+                ensure!(!name.is_empty() && !name.contains('/') && !name.ends_with(".ko"), "[haptics] modules: {name} is not a module's name");
+            }
+            for file in &haptics.firmware {
+                ensure!(
+                    !file.name.is_empty() && !file.name.starts_with('/') && !file.name.contains(".."),
+                    "[haptics] firmware: {} is not a name from the loader's folders",
+                    file.name
+                );
+                ensure!(!file.path.is_empty(), "[haptics] firmware: {} names no file", file.name);
+                if let Some(partition) = &file.partition {
+                    ensure!(
+                        !partition.is_empty() && !partition.contains('/'),
+                        "[haptics] firmware: {partition} is not a partition's name"
+                    );
+                }
+            }
+        }
+        if let Some(aod) = &cfg.aod {
+            for path in [&aod.dir, &aod.node] {
+                ensure!(Path::new(path).has_root(), "[aod] {path} is not an absolute path");
+            }
+            ensure!(!aod.enter_cmds.is_empty(), "[aod] enter_cmds names no command set that puts the panel into its doze");
+            ensure!(!aod.leave_cmds.is_empty(), "[aod] leave_cmds names no command set that brings the panel back out");
         }
         if let Some(logd) = &cfg.logd {
             for library in &logd.libraries {
@@ -641,7 +792,7 @@ mod tests {
     fn ishtar_clicks_with_a_waveform_its_driver_keeps() {
         let cfg = DeviceConfig::parse(include_str!("../../../devices/ishtar.toml")).unwrap();
         let haptics = cfg.haptics.expect("the 13 Ultra has a motor");
-        assert_eq!((haptics.click, haptics.resonance.as_str()), (Some(0), "/sys/class/qcom-haptics/lra_frequency_hz"));
+        assert_eq!((haptics.click, haptics.resonance.as_deref()), (Some(0), Some("/sys/class/qcom-haptics/lra_frequency_hz")));
         assert_eq!(haptics.strength, Strength { lightest: 0.5, strongest: 1.0 });
     }
 
@@ -651,7 +802,7 @@ mod tests {
         let (strength, resonance) = ("strength = { lightest = 0.25, strongest = 1.0 }", "resonance = \"/sys/class/qcom-haptics/lra_frequency_hz\"");
         assert!(with(&format!("{resonance}\n{strength}")).is_ok(), "a click made");
         assert!(with(&format!("click = 0\n{resonance}\n{strength}")).is_ok(), "a click kept");
-        assert!(with(&format!("click = 0\n{strength}")).is_err(), "no motor's resonance to make the ticks at");
+        assert!(with(&format!("click = 0\n{strength}")).is_ok(), "a click kept without a resonance file, ticks made at the nominal frequency");
         assert!(with(&format!("resonance = \"sys/f\"\n{strength}")).is_err(), "a file named from nowhere");
         assert!(with(resonance).is_err(), "a click without its strengths");
         for (lightest, strongest) in [(0.0, 0.5), (0.5, 0.5), (0.5, 0.25), (0.25, 1.5)] {
@@ -707,7 +858,7 @@ mod tests {
         assert_eq!(post_boot.args, ["/vendor/bin/init.kernel.post_boot.sh"]);
         assert_eq!(post_boot.libraries, ["/system/lib64", "/vendor/lib64"], "it loads the recovery's own libraries first");
         let haptics = cfg.haptics.expect("the 17 Ultra has a motor");
-        assert_eq!((haptics.click, haptics.resonance.as_str()), (None, "/sys/class/qcom-haptics/lra_frequency_hz"), "its click is made");
+        assert_eq!((haptics.click, haptics.resonance.as_deref()), (None, Some("/sys/class/qcom-haptics/lra_frequency_hz")), "its click is made");
         assert_eq!(haptics.strength, Strength { lightest: 0.25, strongest: 0.75 }, "past three quarters the motor rattles");
         assert_eq!(cfg.backup.efs, ["modemst1", "modemst2", "fsg", "fsc", "persist"]);
         assert!(cfg.backup.data_skipped.contains(&"vendor/goodix".to_string()));
@@ -947,5 +1098,46 @@ mod tests {
         assert!(!report.uses(Path::new("/vendor")));
         let nezha = DeviceConfig::parse(include_str!("../../../devices/nezha.toml")).unwrap();
         assert!(nezha.services[0].uses(Path::new("/vendor")), "its shell and its libraries are the vendor partition's");
+    }
+
+    #[test]
+    fn a_doze_names_its_command_sets_both_ways() {
+        let text = "[device]\ncodename = \"x\"\n[aod]\nenter = [{ id = 3, value = \"1\" }]\nenter_cmds = [44]\nleave_cmds = [18]\n";
+        let cfg = DeviceConfig::parse(text).unwrap();
+        let aod = cfg.aod.expect("the phone dozes with the panel's own command sets");
+        assert_eq!((aod.enter_cmds, aod.leave_cmds), (vec![44], vec![18]), "the high-brightness doze in, the way out");
+        assert_eq!(aod.enter.len(), 1, "the driver's doze brightness is set before the panel dozes");
+        assert_eq!((aod.enter[0].id, aod.enter[0].value.as_str()), (3, "1"));
+        assert_eq!(aod.node, "/proc/mi_display/tx_cmd_set_prim");
+        let base = "[device]\ncodename = \"x\"\n";
+        assert!(DeviceConfig::parse(base).unwrap().aod.is_none(), "a phone that names none blanks the ordinary way");
+        assert!(DeviceConfig::parse(&format!("{base}\n[aod]\nenter_cmds = [45]\n")).is_err(), "no way back out");
+        assert!(DeviceConfig::parse(&format!("{base}\n[aod]\nleave_cmds = [18]\n")).is_err(), "no way in");
+        let relative = format!("{base}\n[aod]\nnode = \"proc/x\"\nenter_cmds = [45]\nleave_cmds = [18]\n");
+        assert!(DeviceConfig::parse(&relative).is_err());
+    }
+
+    /// haotian's panel lights on two taps, as the phone's own system's does;
+    /// no other phone is given that, since a phone whose controller stops
+    /// reporting fingers with its panel off has nothing for it to work with.
+    #[test]
+    fn the_phone_whose_panel_lights_on_two_taps_names_it() {
+        let cfg = DeviceConfig::parse("[device]\ncodename = \"x\"\n[touch]\ndouble_tap = true\n").unwrap();
+        assert!(cfg.touch.double_tap, "two taps on its dark panel light it");
+        // A phone that names nothing lights only by its power key.
+        let none = "[device]\ncodename = \"x\"\n";
+        assert!(!DeviceConfig::parse(none).unwrap().touch.double_tap);
+        let set = format!("{none}\n[touch.double_tap]\n");
+        assert!(DeviceConfig::parse(&set).is_err(), "the flag is a word of [touch], not a table of its own");
+    }
+
+    #[test]
+    fn venus_follows_its_product_overlays_status_bar_and_corners() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/venus.toml")).unwrap();
+        assert_eq!(cfg.display.corner_radius, 196);
+        assert_eq!(
+            cfg.status_bar,
+            Some(StatusBar { height: 100, left: 247, right: 43, bolt_right: 29 })
+        );
     }
 }

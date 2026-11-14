@@ -1,5 +1,10 @@
+pub mod ce_store;
+pub mod blobs;
 pub mod encryption;
 pub mod fscrypt;
+pub mod keymaster;
+#[cfg(target_os = "android")]
+mod keymint_aidl;
 pub mod gatekeeper;
 pub mod keystore;
 pub mod locksettings;

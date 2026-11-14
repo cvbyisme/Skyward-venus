@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 /// The battery is read this often, and at once when asked; all the
 /// readings every so many times instead.
 const BATTERY_EVERY: Duration = Duration::from_secs(1);
-const ALL_EVERY: u32 = 30;
+const ALL_EVERY: Duration = Duration::from_secs(30);
 
 pub enum Reading {
     /// The battery, and when reading it started.
@@ -24,7 +24,7 @@ pub enum Reading {
 
 pub struct Readings {
     taken: Told<Reading>,
-    asks: Sender<()>,
+    asks: Sender<bool>,
 }
 
 impl Readings {
@@ -32,27 +32,24 @@ impl Readings {
     /// second from now. The thread ends once the screen lets them go.
     pub fn start(cfg: &DeviceConfig) -> Result<Readings> {
         let (tell, taken) = worker::telling().context("make the readings' wake pipe")?;
-        let (asks, asked) = mpsc::channel::<()>();
+        let (asks, asked) = mpsc::channel::<bool>();
         let cfg = cfg.clone();
         thread::Builder::new()
             .name("readings".into())
             .spawn(move || {
-                let mut ticks = 0u32;
+                let mut all_at = Instant::now();
                 loop {
-                    let at_once = match asked.recv_timeout(BATTERY_EVERY) {
-                        Ok(()) => {
-                            while asked.try_recv().is_ok() {}
-                            true
-                        }
+                    let full = match asked.recv_timeout(BATTERY_EVERY) {
+                        Ok(full) => asked.try_iter().fold(full, |a, b| a || b),
                         Err(RecvTimeoutError::Timeout) => false,
                         Err(RecvTimeoutError::Disconnected) => return,
                     };
-                    if !at_once {
-                        ticks += 1;
-                    }
                     let at = Instant::now();
-                    let reading = if !at_once && ticks.is_multiple_of(ALL_EVERY) {
-                        Reading::All(Box::new(skyward_info::collect(&cfg)), at)
+                    // Healthd may produce events faster than the timeout.
+                    // A wall-clock deadline cannot be starved by that stream.
+                    let reading = if full || at.duration_since(all_at) >= ALL_EVERY {
+                        all_at = at;
+                        Reading::All(Box::new(crate::ui::collect_info(&cfg)), at)
                     } else {
                         Reading::Battery(skyward_info::battery_now(), at)
                     };
@@ -72,7 +69,12 @@ impl Readings {
 
     /// Read the battery at once.
     pub fn ask(&self) {
-        self.asks.send(()).expect("the readings thread runs while its readings are taken");
+        self.asks.send(false).expect("the readings thread runs while its readings are taken");
+    }
+
+    /// Refresh storage and installed-system information after mounting Data.
+    pub fn refresh(&self) {
+        self.asks.send(true).expect("the readings thread runs while its readings are taken");
     }
 
     /// The readings taken since the last call.

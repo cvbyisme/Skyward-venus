@@ -36,6 +36,12 @@ const S_IFSOCK: u32 = 0o140000;
 /// in system/bin that stand for toybox.
 const LINK_MODE: u32 = 0o755;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Format {
+    Lz4Legacy,
+    Gzip,
+}
+
 impl Entry {
     pub fn is_dir(&self) -> bool {
         self.mode & S_IFMT == S_IFDIR
@@ -46,22 +52,60 @@ impl Entry {
 /// device numbers exactly as the archive had them.
 pub struct Ramdisk {
     pub entries: Vec<Entry>,
+    format: Format,
 }
 
 impl Ramdisk {
-    /// Unpack an LZ4 (legacy framing) compressed newc archive, as Android
-    /// boot images carry.
+    /// Start a new archive in the kernel's legacy LZ4 format.
+    pub fn empty() -> Self {
+        Self { entries: Vec::new(), format: Format::Lz4Legacy }
+    }
+    /// Unpack a GZIP or LZ4 compressed newc archive.
     pub fn decode(compressed: &[u8]) -> Result<Self> {
+        Self::decode_bounded(compressed, usize::MAX, usize::MAX)
+    }
+
+    /// Decode an untrusted capsule with explicit decompression and entry bounds.
+    pub fn decode_bounded(compressed: &[u8], maximum: usize, max_entries: usize) -> Result<Self> {
         let mut cpio = Vec::new();
-        lz4_flex::frame::FrameDecoder::new(compressed).read_to_end(&mut cpio).context("lz4 decode")?;
+        let format = if compressed.starts_with(&[0x1f, 0x8b]) {
+            flate2::read::MultiGzDecoder::new(compressed)
+                .take(maximum.saturating_add(1) as u64)
+                .read_to_end(&mut cpio)
+                .context("gzip decode")?;
+            Format::Gzip
+        } else {
+            lz4_flex::frame::FrameDecoder::new(compressed)
+                .take(maximum.saturating_add(1) as u64)
+                .read_to_end(&mut cpio)
+                .context("lz4 decode")?;
+            Format::Lz4Legacy
+        };
+        anyhow::ensure!(cpio.len() <= maximum, "ramdisk exceeds decompression limit");
         let mut entries = Vec::new();
         let mut rest = Cursor::new(cpio.as_slice());
         loop {
+            // cpio's reader allocates c_namesize before reading it. Validate both
+            // variable lengths against this archive before handing it that header.
+            let remaining = &cpio[rest.position() as usize..];
+            anyhow::ensure!(remaining.len() >= 110, "truncated CPIO header");
+            let field = |offset| -> Result<usize> {
+                Ok(u32::from_str_radix(std::str::from_utf8(&remaining[offset..offset + 8])?, 16)? as usize)
+            };
+            let name_bytes = field(94)?;
+            let payload_bytes = field(54)?;
+            anyhow::ensure!((1..=4096).contains(&name_bytes), "invalid or oversized CPIO name");
+            let data_offset = (110 + name_bytes).next_multiple_of(4);
+            anyhow::ensure!(data_offset <= remaining.len() && payload_bytes <= remaining.len() - data_offset,
+                "declared CPIO entry exceeds remaining archive");
             let mut r = NewcReader::new(rest).context("cpio entry")?;
             if r.entry().is_trailer() {
                 break;
             }
             let e = r.entry();
+            anyhow::ensure!(entries.len() < max_entries, "ramdisk has too many entries");
+            anyhow::ensure!(e.file_size() as usize <= cpio.len(), "declared CPIO payload exceeds archive");
+            let expected_size = e.file_size() as usize;
             let mut entry = Entry {
                 name: e.name().to_string(),
                 mode: e.mode(),
@@ -74,17 +118,24 @@ impl Ramdisk {
                 data: Vec::with_capacity(e.file_size() as usize),
             };
             r.read_to_end(&mut entry.data).with_context(|| format!("cpio data of {}", entry.name))?;
+            anyhow::ensure!(entry.data.len() == expected_size, "truncated CPIO payload");
             entries.push(entry);
             rest = r.finish().context("cpio entry end")?;
         }
-        Ok(Ramdisk { entries })
+        Ok(Ramdisk { entries, format })
     }
 
-    /// Pack as a newc archive compressed the way AOSP packs boot ramdisks,
-    /// with the reference `lz4` tool in legacy framing (the kernel's initramfs
-    /// unpacker reads no other LZ4 framing) at its highest compression.
+    /// Rebuild the archive, retaining the input compression format.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        lz4_tool(&self.archive()?)
+        let cpio = self.archive()?;
+        match self.format {
+            Format::Lz4Legacy => lz4_tool(&cpio),
+            Format::Gzip => {
+                let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+                encoder.write_all(&cpio).context("gzip encode")?;
+                encoder.finish().context("finish gzip ramdisk")
+            }
+        }
     }
 
     /// Pack as a newc archive, uncompressed.
@@ -298,8 +349,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gzip_round_trip_keeps_format_and_contents() {
+        let mut rd = Ramdisk { entries: Vec::new(), format: Format::Gzip };
+        rd.add("system/bin/recovery", 0o750, b"binary".to_vec()).unwrap();
+        let packed = rd.encode().unwrap();
+        assert!(packed.starts_with(&[0x1f, 0x8b]));
+        let back = Ramdisk::decode(&packed).unwrap();
+        assert_eq!(back.format, Format::Gzip);
+        let entry = back.find("system/bin/recovery").unwrap();
+        assert_eq!(entry.data.as_slice(), b"binary");
+        assert_eq!(entry.mode, S_IFREG | 0o750);
+        assert!(back.encode().unwrap().starts_with(&[0x1f, 0x8b]));
+    }
+
+    #[test]
     fn round_trip_keeps_metadata() {
-        let mut rd = Ramdisk { entries: Vec::new() };
+        let mut rd = Ramdisk { entries: Vec::new(), format: Format::Lz4Legacy };
         rd.add("system/bin/recovery", 0o750, b"binary".to_vec()).unwrap();
         rd.entries.push(Entry {
             name: "dev/console".into(),
@@ -348,9 +413,9 @@ mod tests {
 
     #[test]
     fn a_stream_after_the_vendor_ramdisk_is_read_on_into() {
-        let mut vendor = Ramdisk { entries: Vec::new() };
+        let mut vendor = Ramdisk { entries: Vec::new(), format: Format::Lz4Legacy };
         vendor.add("lib/modules/ufs_qcom.ko", 0o644, b"module".to_vec()).unwrap();
-        let mut ours = Ramdisk { entries: Vec::new() };
+        let mut ours = Ramdisk { entries: Vec::new(), format: Format::Lz4Legacy };
         ours.add("init", 0o750, b"program".to_vec()).unwrap();
         let joined = [vendor.encode().unwrap(), lz4_legacy(&ours.archive().unwrap())].concat();
         assert_eq!(unpacked_by_the_tool(&joined), [vendor.archive().unwrap(), ours.archive().unwrap()].concat(), "both archives, one after the other");
@@ -358,7 +423,7 @@ mod tests {
 
     #[test]
     fn a_link_is_kept_as_a_link_to_its_target() {
-        let mut rd = Ramdisk { entries: Vec::new() };
+        let mut rd = Ramdisk { entries: Vec::new(), format: Format::Lz4Legacy };
         rd.add("system/bin/recovery", 0o750, b"binary".to_vec()).unwrap();
         rd.link("system/bin/zstd", "recovery").unwrap();
         rd.link("sbin/sh", "/system/bin/sh").unwrap();
@@ -390,6 +455,7 @@ mod tests {
         fs::write(root.join("etc"), b"a file").unwrap();
         std::os::unix::fs::symlink("nowhere", root.join("bin")).unwrap();
         let rd = Ramdisk {
+            format: Format::Lz4Legacy,
             entries: vec![
                 mine("init", S_IFLNK | 0o750, b"/system/bin/init"),
                 mine("dev", S_IFDIR | 0o755, b""),
@@ -425,14 +491,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("lib")).unwrap();
         fs::write(dir.path().join("lib/modules.load"), b"").unwrap();
-        let rd = Ramdisk { entries: vec![mine("lib", S_IFREG | 0o644, b"a file")] };
+        let rd = Ramdisk { entries: vec![mine("lib", S_IFREG | 0o644, b"a file")], format: Format::Lz4Legacy };
         assert!(rd.unpack(dir.path()).is_err());
         assert!(dir.path().join("lib/modules.load").exists());
     }
 
     #[test]
     fn a_link_already_there_is_pointed_anew_keeping_the_rest_of_its_entry() {
-        let mut rd = Ramdisk { entries: Vec::new() };
+        let mut rd = Ramdisk { entries: Vec::new(), format: Format::Lz4Legacy };
         rd.add("system/bin/ziptool", 0o755, b"binary".to_vec()).unwrap();
         rd.entries.push(Entry {
             name: "system/bin/unzip".into(),

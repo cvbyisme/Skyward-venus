@@ -40,8 +40,40 @@ impl App {
         if let Some(fr) = self.frame.as_ref().filter(|_| self.cols < self.w) {
             left.fill_rect(self.cols as f32, 0.0, (self.w - self.cols) as f32, self.h as f32, fr.bg);
         }
-        self.turn = Some(Turn { back, left, spring: None });
+        self.turn = Some(Turn { back, left, spring: None, drag: None, behind: None });
         self.dirty = true;
+    }
+
+    /// Hold the page under a back drag from an edge: the page shown follows
+    /// the finger and the page last under it comes in.
+    pub(super) fn begin_back_preview(&mut self) {
+        if self.stack.len() <= 1 || self.turn.is_some() {
+            return;
+        }
+        let behind = self.backdrop.clone();
+        self.leave(true);
+        if let Some(turn) = self.turn.as_mut() {
+            turn.drag = Some(0.0);
+            turn.behind = behind;
+        }
+        self.dirty = true;
+    }
+
+    /// Carry the predictive back page with the finger, as a share of the
+    /// screen's width.
+    pub(super) fn drag_back_preview(&mut self, progress: f32) {
+        if let Some(turn) = self.turn.as_mut().filter(|t| t.drag.is_some()) {
+            turn.drag = Some(progress.clamp(0.0, 0.62));
+            self.dirty = true;
+        }
+    }
+
+    /// Let go short of going back, and put the page back where it was.
+    pub(super) fn cancel_back_preview(&mut self) {
+        if let Some(turn) = self.turn.take().filter(|t| t.drag.is_some()) {
+            self.backdrop = turn.behind;
+            self.dirty = true;
+        }
     }
 
     /// Set the home page's search bar moving up to the search page's field,
@@ -80,6 +112,20 @@ impl App {
     /// and in a place, until it reaches the place's top.
     pub(super) fn back(&mut self, now: u64) -> Vec<Effect> {
         let (l, mut fx) = (self.state.lang, Vec::new());
+        if matches!(self.screen(), Screen::Maintenance(_)) {
+            if self.state.maintenance.as_ref().is_some_and(|m| matches!(m.phase, MaintenancePhase::Preparing | MaintenancePhase::Writing { .. })) {
+                self.say(l.pick(["请等待完成后再返回", "請等待完成後再返回", "Wait for it to finish before going back"]), now);
+                return fx;
+            }
+            self.state.maintenance = None;
+            fx.push(Effect::CancelMaintenance);
+            if self.stack.len() <= 1 {
+                self.top_mut().0 = Screen::Advanced;
+                self.settle_page();
+                self.refresh();
+                return fx;
+            }
+        }
         if self.stack.len() <= 1 {
             return fx;
         }
@@ -284,6 +330,11 @@ impl App {
     /// how it learns which control a user's screen lock is answered with.
     pub(super) fn arrive_at(&mut self, s: Screen) -> Vec<Effect> {
         match s {
+            Screen::Maintenance(action) if self.state.venus_maintenance && self.state.maintenance.is_none() => {
+                self.state.maintenance = Some(Maintenance { action, phase: MaintenancePhase::Preparing });
+                self.refresh();
+                vec![Effect::PrepareMaintenance(action)]
+            }
             Screen::Mount => vec![Effect::ReadMounts],
             Screen::Filesystems => vec![Effect::ReadFilesystems],
             Screen::Slot | Screen::Reboot => vec![Effect::ReadSlots],
@@ -321,6 +372,7 @@ impl App {
                 self.state.skyward_check = SkywardCheck::Asking;
                 vec![Effect::CheckSkyward]
             }
+            Screen::Cellular => vec![Effect::RefreshCellular],
             Screen::Wlan if self.state.wlan.as_ref().is_some_and(|w| w.power == Power::On) => vec![Effect::ScanWlan],
             _ => Vec::new(),
         }

@@ -10,7 +10,7 @@ use skyward_net::http::Servers;
 use skyward_net::iface;
 use skyward_net::reach::{self, Reach};
 use skyward_net::supplicant::{self, Bss, Control, Event as Told, Security};
-use skyward_net::wlan::{self, Joined, Link, Next, Power, Stage, Traffic, Wlan};
+use skyward_net::wlan::{self, Attempt, Joined, Link, Next, Power, Stage, Traffic, Wlan};
 use skyward_sys::worker::{self, Teller};
 use std::fs;
 use std::net::Ipv4Addr;
@@ -18,9 +18,7 @@ use std::os::fd::RawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// The first folder the firmware loader looks in that a recovery can
@@ -72,8 +70,8 @@ pub enum Command {
 /// thread go.
 enum Inbox {
     Command(Command),
-    Address(u64, Result<Asked>),
-    Reach(u64, Reach),
+    Address(Attempt, Result<Asked>),
+    Reach(Attempt, Reach),
     End,
 }
 
@@ -145,18 +143,20 @@ impl Drop for Worker {
 /// The supplicant running, and the address the network gave.
 struct Running {
     child: Child,
+    venus: Option<crate::venus_wlan::Runtime>,
     control: Control,
     monitor: Control,
     mac: [u8; 6],
     found: Vec<Bss>,
     lease: Option<Held>,
-    /// The thread asking for an address or to keep one, and its number;
-    /// what an earlier one answers is let go.
-    asking: Option<(u64, Arc<AtomicBool>)>,
-    asked: u64,
-    /// The number of the last look at how far the network reaches; what an
-    /// earlier one finds is let go.
-    probed: u64,
+    /// Pending operations carry identities that cannot recur across power
+    /// cycles. Cancelled or replaced operations cannot change this session.
+    asking: Option<Attempt>,
+    asking_thread: Option<JoinHandle<()>>,
+    probing: Option<Attempt>,
+    /// Configuration may fail after setting the address but before adding
+    /// the route. It still has to be removed when this attempt ends.
+    configured: bool,
     /// When to ask for an address again after the network gave none.
     retry_at: Option<Instant>,
     polled_at: Instant,
@@ -173,6 +173,15 @@ struct Counted {
     tx: u64,
 }
 
+impl Running {
+    fn stop_asking(&mut self) {
+        if let Some(old) = self.asking.take() { old.cancel(); }
+        // Release the old port-68 socket before another operation can take
+        // it. Otherwise a cancelled receiver can consume the new reply.
+        if let Some(thread) = self.asking_thread.take() { let _ = thread.join(); }
+    }
+}
+
 /// A lease, when it was given, and how far keeping it has come: 0 asks its
 /// server at the renewal time, 1 any server at the rebinding time, 2 lets
 /// it go when it runs out.
@@ -183,6 +192,10 @@ struct Held {
 }
 
 impl Held {
+    fn expires(&self) -> Instant {
+        self.at + Duration::from_secs(self.lease.seconds.into())
+    }
+
     fn due(&self) -> Instant {
         let after = match self.phase {
             0 => self.lease.renew,
@@ -239,9 +252,11 @@ impl Station {
     /// The soonest a timer is due.
     fn next(&self) -> Option<Instant> {
         let r = self.running.as_ref()?;
-        let poll = matches!(self.state.joined, Some(Joined { stage: Stage::Connected(_), .. })).then(|| r.polled_at + POLL);
+        // Venus helpers can exit while no network is joined and no socket
+        // event arrives. Keep their liveness check on the polling deadline.
+        let poll = (r.venus.is_some() || matches!(self.state.joined, Some(Joined { stage: Stage::Connected(_), .. }))).then(|| r.polled_at + POLL);
         let count = r.lease.as_ref().map(|_| r.counted.map_or_else(Instant::now, |c| c.at + TRAFFIC));
-        [r.lease.as_ref().filter(|_| r.asking.is_none()).map(Held::due), r.retry_at, poll, count].into_iter().flatten().min()
+        [r.lease.as_ref().map(Held::expires), r.lease.as_ref().filter(|_| r.asking.is_none() && r.retry_at.is_none()).map(Held::due), r.retry_at, poll, count].into_iter().flatten().min()
     }
 
     fn command(&mut self, c: Command) {
@@ -298,34 +313,37 @@ impl Station {
     }
 
     fn start(&self) -> Result<Running> {
+        let venus = crate::venus_rw::enabled().then(crate::venus_wlan::Runtime::start).transpose()?;
         bring_up(&self.cfg, &self.modules)?;
         let mut child = start_supplicant(&self.cfg, self.libraries.as_deref())?;
         let socket = Path::new(HOME).join("sockets").join(&self.cfg.interface);
-        let connected = (|| -> Result<(Control, Control)> {
+        let connected = (|| -> Result<(Control, Control, [u8; 6])> {
             let control = Control::open(&socket)?;
             ensure!(control.ask("PING")?.trim_end() == "PONG", "wpa_supplicant does not answer PING");
             let monitor = Control::open(&socket)?;
             monitor.attach()?;
-            Ok((control, monitor))
+            let mac = iface::hardware_address(&self.cfg.interface)?;
+            Ok((control, monitor, mac))
         })();
-        let (control, monitor) = match connected {
+        let (control, monitor, mac) = match connected {
             Ok(both) => both,
             Err(e) => {
                 end(&mut child, None);
                 return Err(e);
             }
         };
-        let mac = iface::hardware_address(&self.cfg.interface)?;
         Ok(Running {
             child,
+            venus,
             control,
             monitor,
             mac,
             found: Vec::new(),
             lease: None,
             asking: None,
-            asked: 0,
-            probed: 0,
+            asking_thread: None,
+            probing: None,
+            configured: false,
             retry_at: None,
             polled_at: Instant::now(),
             counted: None,
@@ -334,12 +352,14 @@ impl Station {
 
     fn off(&mut self) {
         self.unaddress();
-        if let Some(mut r) = self.running.take() {
+        let mut running = self.running.take();
+        if let Some(r) = &mut running {
             end(&mut r.child, Some(&r.control));
         }
         if let Err(e) = iface::set_up(&self.cfg.interface, false) {
             let _ = skyward_sys::kmsg(&format!("{e:#}"));
         }
+        drop(running);
         self.state = Wlan::default();
     }
 
@@ -407,10 +427,11 @@ impl Station {
             Next::Address => self.ask_address(),
             Next::Unaddress => self.unaddress(),
             Next::Forget => {
-                if let Some(r) = &self.running
-                    && let Err(e) = r.control.order("REMOVE_NETWORK all")
-                {
-                    self.lost(e);
+                self.unaddress();
+                if let Some(r) = &self.running {
+                    if let Err(e) = r.control.order("REMOVE_NETWORK all") {
+                        self.lost(e);
+                    }
                 }
             }
         }
@@ -422,30 +443,29 @@ impl Station {
         let back = self.back.clone();
         let Some(r) = &mut self.running else { return };
         r.retry_at = None;
-        if let Some((_, stop)) = r.asking.take() {
-            stop.store(true, Ordering::Relaxed);
-        }
-        r.asked += 1;
-        let n = r.asked;
-        let stop = Arc::new(AtomicBool::new(false));
-        r.asking = Some((n, stop.clone()));
+        r.stop_asking();
+        let attempt = Attempt::default();
+        r.asking = Some(attempt.clone());
         let mac = r.mac;
-        let keeping = r.lease.as_ref().map(|h| (h.lease.clone(), h.phase));
-        thread::spawn(move || {
-            let answer = match keeping {
-                None => dhcp::obtain(&interface, mac, &stop).map(Asked::Got),
-                Some((lease, phase)) => dhcp::keep(&interface, mac, &lease, phase > 0, &stop).map(Asked::Kept),
-            };
-            back.tell(Inbox::Address(n, answer));
+        let keeping = r.lease.as_ref().map(|h| {
+            let anyone = h.phase > 0 || Instant::now() >= h.at + Duration::from_secs(h.lease.rebind.into());
+            (h.lease.clone(), anyone)
         });
+        r.asking_thread = Some(thread::spawn(move || {
+            let answer = match keeping {
+                None => dhcp::obtain(&interface, mac, attempt.stop_flag()).map(Asked::Got),
+                Some((lease, anyone)) => dhcp::keep(&interface, mac, &lease, anyone, attempt.stop_flag()).map(Asked::Kept),
+            };
+            back.tell(Inbox::Address(attempt, answer));
+        }));
     }
 
-    fn addressed(&mut self, n: u64, answer: Result<Asked>) {
+    fn addressed(&mut self, attempt: Attempt, answer: Result<Asked>) {
         let Some(r) = &mut self.running else { return };
-        if r.asking.as_ref().map(|(m, _)| *m) != Some(n) {
+        if !attempt.matches(r.asking.as_ref()) {
             return;
         }
-        r.asking = None;
+        r.stop_asking();
         let lease = match answer {
             Ok(Asked::Got(lease)) | Ok(Asked::Kept(Kept::Kept(lease))) => lease,
             Ok(Asked::Kept(Kept::Unanswered)) => {
@@ -456,28 +476,35 @@ impl Station {
             }
             Ok(Asked::Kept(Kept::Refused)) => {
                 self.unaddress();
+                if let Some(j) = &mut self.state.joined { j.stage = Stage::Addressing; }
                 return self.ask_address();
             }
             Err(e) if e.is::<skyward_net::Stopped>() => return,
             Err(e) => {
                 let _ = skyward_sys::kmsg(&format!("no address: {e:#}"));
                 r.retry_at = Some(Instant::now() + RETRY);
-                if let Some(j) = &mut self.state.joined {
-                    j.stage = Stage::NoAddress(format!("{e:#}"));
+                // A renewal failure does not invalidate an unexpired lease.
+                // Its independent expiry timer still takes the address away.
+                if r.lease.is_none() {
+                    if let Some(j) = &mut self.state.joined {
+                        j.stage = Stage::NoAddress(format!("{e:#}"));
+                    }
                 }
                 return;
             }
         };
         let same = r.lease.as_ref().is_some_and(|h| (h.lease.address, h.lease.mask, h.lease.router) == (lease.address, lease.mask, lease.router));
-        if !same
-            && let Err(e) = iface::configure(&self.cfg.interface, lease.address, lease.mask, lease.router)
-        {
-            let _ = skyward_sys::kmsg(&format!("{e:#}"));
-            r.retry_at = Some(Instant::now() + RETRY);
-            if let Some(j) = &mut self.state.joined {
-                j.stage = Stage::NoAddress(format!("{e:#}"));
+        if !same {
+            r.configured = true;
+            if let Err(e) = iface::configure(&self.cfg.interface, lease.address, lease.mask, lease.router) {
+                let _ = skyward_sys::kmsg(&format!("{e:#}"));
+                self.unaddress();
+                if let Some(r) = &mut self.running { r.retry_at = Some(Instant::now() + RETRY); }
+                if let Some(j) = &mut self.state.joined {
+                    j.stage = Stage::NoAddress(format!("{e:#}"));
+                }
+                return;
             }
-            return;
         }
         let _ = skyward_sys::kmsg(&format!(
             "{} has {} ({}) through {:?} for {} s, kept again after {} s",
@@ -507,18 +534,21 @@ impl Station {
     fn probe(&mut self, dns: Vec<Ipv4Addr>) {
         let (page, back) = (self.cfg.probe.clone(), self.back.clone());
         let Some(r) = &mut self.running else { return };
-        r.probed += 1;
-        let n = r.probed;
+        if let Some(old) = r.probing.take() { old.cancel(); }
+        let attempt = Attempt::default();
+        r.probing = Some(attempt.clone());
         thread::spawn(move || {
             let reach = reach::probe(&page, &dns);
-            back.tell(Inbox::Reach(n, reach));
+            back.tell(Inbox::Reach(attempt, reach));
         });
     }
 
-    fn reached(&mut self, n: u64, reach: Reach) {
-        if self.running.as_ref().is_none_or(|r| r.probed != n) {
+    fn reached(&mut self, attempt: Attempt, reach: Reach) {
+        let Some(r) = &mut self.running else { return };
+        if !attempt.matches(r.probing.as_ref()) {
             return;
         }
+        r.probing = None;
         let Some(Joined { stage: Stage::Connected(link), .. }) = &mut self.state.joined else { return };
         let _ = skyward_sys::kmsg(&format!("the network on {} {reach}", self.cfg.interface));
         link.reach = Some(reach);
@@ -528,13 +558,14 @@ impl Station {
     fn unaddress(&mut self) {
         let Some(r) = &mut self.running else { return };
         r.retry_at = None;
-        if let Some((_, stop)) = r.asking.take() {
-            stop.store(true, Ordering::Relaxed);
-        }
-        if r.lease.take().is_some()
-            && let Err(e) = iface::unconfigure(&self.cfg.interface)
-        {
-            let _ = skyward_sys::kmsg(&format!("{e:#}"));
+        r.stop_asking();
+        if let Some(old) = r.probing.take() { old.cancel(); }
+        r.lease = None;
+        if r.configured {
+            match iface::unconfigure(&self.cfg.interface) {
+                Ok(()) => r.configured = false,
+                Err(e) => { let _ = skyward_sys::kmsg(&format!("{e:#}")); }
+            }
         }
         // Nothing goes over a network left, and counting starts afresh on
         // the next one.
@@ -547,22 +578,33 @@ impl Station {
     fn timers(&mut self) {
         let now = Instant::now();
         let Some(r) = &mut self.running else { return };
+        if let Some(venus) = &mut r.venus {
+            if let Err(error) = venus.check() { return self.lost(error); }
+        }
+        // Never use an expired address while a DHCP retry or exchange is
+        // pending. Cancelling also releases its socket before rediscovery.
+        if r.lease.as_ref().is_some_and(|h| now >= h.expires()) {
+            self.unaddress();
+            if let Some(j) = &mut self.state.joined { j.stage = Stage::Addressing; }
+            return self.ask_address();
+        }
         if r.retry_at.is_some_and(|at| now >= at) {
             r.retry_at = None;
             return self.ask_address();
         }
-        if r.asking.is_none()
-            && let Some(h) = &r.lease
-            && now >= h.due()
-        {
-            if h.phase >= 2 {
-                // The lease ran out with no server to keep it.
-                self.unaddress();
-                if let Some(j) = &mut self.state.joined {
-                    j.stage = Stage::Addressing;
+        if r.asking.is_none() && r.retry_at.is_none() {
+            if let Some(h) = &r.lease {
+                if now >= h.due() {
+                    if h.phase >= 2 {
+                        // The lease ran out with no server to keep it.
+                        self.unaddress();
+                        if let Some(j) = &mut self.state.joined {
+                            j.stage = Stage::Addressing;
+                        }
+                    }
+                    return self.ask_address();
                 }
             }
-            return self.ask_address();
         }
         if now >= r.polled_at + POLL {
             self.poll_link();
@@ -640,16 +682,61 @@ fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
             thread::sleep(Duration::from_millis(100));
         }
     }
-    iface::set_up(&cfg.interface, true)
+    // CNSS can publish wlan0 before it accepts SIOCSIFFLAGS. On Venus the
+    // first request may return EAGAIN while firmware and the bus are still
+    // settling; keep the WLAN runtime alive and retry that transient error
+    // within the same bounded window used to wait for the interface.
+    let until = Instant::now() + INTERFACE_WAIT;
+    let mut retried = false;
+    loop {
+        match iface::set_up(&cfg.interface, true) {
+            Ok(()) => {
+                if retried {
+                    let _ = skyward_sys::kmsg(&format!("{} came up after the driver finished initializing", cfg.interface));
+                }
+                return Ok(());
+            }
+            Err(error)
+                if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) =>
+            {
+                if Instant::now() >= until {
+                    return Err(error).context(format!("{} stayed busy for {} seconds while the driver initialized", cfg.interface, INTERFACE_WAIT.as_secs()));
+                }
+                if !retried {
+                    let _ = skyward_sys::kmsg(&format!("{} is still initializing; waiting before retrying interface up", cfg.interface));
+                    retried = true;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Put a file the driver asks for where the firmware loader looks.
 fn place(file: &Firmware) -> Result<()> {
-    let to = Path::new(FIRMWARE).join(&file.name);
+    place_firmware(file)
+}
+
+/// Put a file a driver asks the kernel's firmware loader for where the
+/// loader looks, read out of the running recovery or off the partition the
+/// file is kept on. The motor's driver asks for its own the same way, and
+/// ends its probe without it.
+pub(crate) fn place_firmware(file: &Firmware) -> Result<()> {
+    place_firmware_at(file, Path::new(FIRMWARE))
+}
+
+/// Direct firmware requests do not consult ueventd's /etc/firmware folder.
+/// Such drivers use the kernel's /lib/firmware search directory instead.
+pub(crate) fn place_firmware_at(file: &Firmware, root: &Path) -> Result<()> {
+    let to = root.join(&file.name);
     let dir = to.parent().expect("a firmware file is in a folder");
     fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
     let bytes = match &file.partition {
-        None => fs::read(&file.path).with_context(|| format!("read {}", file.path))?,
+        None => {
+            let path = crate::venus_rw::cached_file(Path::new(&file.path))?.unwrap_or_else(|| PathBuf::from(&file.path));
+            fs::read(&path).with_context(|| format!("read {}", path.display()))?
+        }
         Some(partition) => {
             let at = Path::new(PARTITIONS).join(partition);
             fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
@@ -683,10 +770,18 @@ fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
     if let Some(dir) = libraries {
         path.push(dir.to_string_lossy().into_owned());
     }
-    let mut child = Process::new(&cfg.supplicant)
-        .args(["-i", &cfg.interface, "-D", "nl80211", "-c"])
-        .arg(&settings)
-        .env("LD_LIBRARY_PATH", path.join(":"))
+    let mut process = if crate::venus_rw::enabled() {
+        ensure!(cfg.interface == "wlan0" && cfg.supplicant == "/vendor/bin/hw/wpa_supplicant", "unexpected Venus supplicant configuration");
+        let mut command = Process::new("/skyward/runtime/km41-launch");
+        command.arg("wpa");
+        command
+    } else {
+        let mut command = Process::new(&cfg.supplicant);
+        command.args(["-i", &cfg.interface, "-D", "nl80211", "-c"]).arg(&settings)
+            .env("LD_LIBRARY_PATH", path.join(":"));
+        command
+    };
+    let mut child = process
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())

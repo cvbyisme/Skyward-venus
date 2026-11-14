@@ -14,13 +14,18 @@ pub mod ota;
 pub mod package;
 pub mod script;
 pub mod signature;
+pub mod task_scope;
 pub mod upgrade;
+pub mod venus_avb;
+pub mod venus_capsule;
 pub mod wipe;
 
 #[cfg(target_os = "android")]
 mod ffs;
 #[cfg(target_os = "android")]
 mod run;
+#[cfg(any(target_os = "android", test))]
+mod shell_pipe;
 
 pub use image::{ImageKind, Ramdisk};
 #[cfg(target_os = "android")]

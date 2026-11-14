@@ -112,11 +112,11 @@ mod tests {
         assert_eq!(app.state.wlan.as_ref().unwrap().power, Power::Starting, "the switch moves at once");
         let nearby = vec![network("Skyward", -34, Security::Psk), network("Skyward-Open", -72, Security::Open), network("Skyward-WEP", -60, Security::Wep)];
         app.set_wlan(Wlan { power: Power::On, networks: nearby, joined: None });
-        tap(&mut app, &f, &i, Action::JoinNetwork(2));
+        tap(&mut app, &f, &i, Action::JoinNetwork(NetworkKey::of(&network("Skyward-WEP", 0, Security::Wep)).unwrap()));
         assert_eq!(toast(&app), Some("暂不支持 WEP 加密的网络"));
         let cafe = Effect::JoinWlan { ssid: b"Skyward-Open".to_vec(), name: "Skyward-Open".into(), security: Security::Open, password: Secret::default() };
-        assert_eq!(tap(&mut app, &f, &i, Action::JoinNetwork(1)), vec![cafe], "an open network is joined at once");
-        tap(&mut app, &f, &i, Action::JoinNetwork(0));
+        assert_eq!(tap(&mut app, &f, &i, Action::JoinNetwork(NetworkKey::of(&network("Skyward-Open", 0, Security::Open)).unwrap())), vec![cafe], "an open network is joined at once");
+        tap(&mut app, &f, &i, Action::JoinNetwork(NetworkKey::of(&network("Skyward", 0, Security::Psk)).unwrap()));
         assert_eq!(app.screen(), Screen::WlanPassword);
         let type_in = |app: &mut App, text: &str| {
             for ch in text.chars() {
@@ -320,17 +320,18 @@ mod tests {
         app.state.wlan = Some(Wlan { power: Power::On, networks: nearby, joined: None });
         app.act(Action::Open(Screen::Wlan), 0);
         assert_eq!(tap(&mut app, &f, &i, Action::Rescan), vec![Effect::ScanWlan]);
-        tap(&mut app, &f, &i, Action::NetworkDetails(1));
+        tap(&mut app, &f, &i, Action::NetworkDetails(NetworkKey::of(&network("Skyward-Open", 0, Security::Open)).unwrap()));
         assert_eq!(app.screen(), Screen::WlanNetwork);
         assert_eq!(app.state.details.as_ref().map(|n| n.name.as_str()), Some("Skyward-Open"));
         assert!(!app.frame(&f, &i).hits.iter().any(|h| h.action == Action::LeaveNetwork), "a network not chosen has nothing to forget");
         app.key(Key::Back, 0);
         // The round button sits on its row, and is what a touch on it finds.
         let fr = app.frame(&f, &i);
-        let row = fr.hits.iter().find(|h| h.action == Action::JoinNetwork(1)).expect("the row").rect;
-        let round = fr.hits.iter().find(|h| h.action == Action::NetworkDetails(1)).expect("its round button").rect;
+        let key = NetworkKey::of(&network("Skyward-Open", 0, Security::Open)).unwrap();
+        let row = fr.hits.iter().find(|h| h.action == Action::JoinNetwork(key)).expect("the row").rect;
+        let round = fr.hits.iter().find(|h| h.action == Action::NetworkDetails(key)).expect("its round button").rect;
         assert!(row.contains(round.x + round.w / 2.0, round.y + round.h / 2.0));
-        assert_eq!(fr.hit(round.x + round.w / 2.0, round.y + round.h / 2.0).map(|h| h.action), Some(Action::NetworkDetails(1)));
-        assert_eq!(fr.hit(row.x + row.w / 3.0, row.y + row.h / 2.0).map(|h| h.action), Some(Action::JoinNetwork(1)));
+        assert_eq!(fr.hit(round.x + round.w / 2.0, round.y + round.h / 2.0).map(|h| h.action), Some(Action::NetworkDetails(key)));
+        assert_eq!(fr.hit(row.x + row.w / 3.0, row.y + row.h / 2.0).map(|h| h.action), Some(Action::JoinNetwork(key)));
     }
 }

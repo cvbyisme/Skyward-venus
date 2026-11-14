@@ -5,10 +5,12 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+pub mod alarm;
 pub mod bcb;
 pub mod clock;
 pub mod control;
 pub mod cpu;
+pub mod touch_wake;
 #[cfg(target_os = "android")]
 pub mod sleep;
 #[cfg(target_os = "android")]

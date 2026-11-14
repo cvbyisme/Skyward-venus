@@ -34,9 +34,18 @@ impl Decryptor {
     pub fn start(job: Job) -> Result<Decryptor> {
         let worker = Worker::start("decrypt", move |tell| {
             tell.tell(match job {
-                Job::Open => Ended::Opened(with_key_service(data::open_without_credential)),
+                Job::Open => Ended::Opened(if crate::venus_rw::enabled() {
+                    crate::venus_rw::open().map_err(|e| format!("{e:#}"))
+                } else {
+                    with_key_service(data::open_without_credential)
+                }),
                 Job::Unlock { closed, user, credential } => {
-                    Ended::Unlocked(with_key_service(|service| data::unlock(service, &closed, user, &credential)))
+                    let credential = zeroize::Zeroizing::new(credential);
+                    Ended::Unlocked(if crate::venus_rw::enabled() {
+                        crate::venus_rw::unlock(&closed, user, &credential).map_err(|e| format!("{e:#}"))
+                    } else {
+                        with_key_service(|service| data::unlock(service, &closed, user, &credential))
+                    })
                 }
             });
         })?;
@@ -58,8 +67,8 @@ impl Decryptor {
 /// why it failed in words for the page.
 pub fn with_key_service<T>(work: impl FnOnce(&KeyMint) -> Result<T>) -> Result<T, String> {
     let done = (|| {
-        let binder = Binder::open()?;
-        let service = KeyMint::open(&binder)?;
+        let binder = if crate::venus_rw::enabled() { Binder::hardware()? } else { Binder::open()? };
+        let service = if crate::venus_rw::enabled() { KeyMint::open_hidl(&binder, false)? } else { KeyMint::open(&binder)? };
         work(&service)
     })();
     done.map_err(|e| format!("{e:#}"))

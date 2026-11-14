@@ -1,0 +1,19 @@
+# UI-only configuration; no HAL services, decryptors or flash operations.
+# Display geometry is observed from the current DSI connector.
+# 560 is a provisional logical UI density, NOT a measured physical PPI.
+[device]
+codename = "venus"
+brand = "Xiaomi"
+model = "Xiaomi 11"
+ab = true
+os_version_prop = "ro.build.version.incremental"
+
+[display]
+width = 1440
+height = 3200
+density = 560
+corner_radius = 0
+
+[modules]
+sources = ["vendor_boot", "vendor"]
+load = []

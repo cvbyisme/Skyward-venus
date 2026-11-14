@@ -27,6 +27,14 @@ pub enum Switch {
     /// over.
     KeepRecovery,
     Wlan,
+    /// Show the clock and the phone's readings on a dark panel, in the
+    /// panel's own doze, rather than putting the panel out.
+    AlwaysOn,
+    DoubleTapWake,
+    /// Open the data partition as the recovery starts.
+    AutoDecrypt,
+    /// adbd listens on the WLAN address.
+    WirelessAdb,
     /// Show the password typed rather than a dot for each character.
     ShowPassword,
 }

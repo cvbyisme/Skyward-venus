@@ -14,6 +14,7 @@ impl App {
             clock,
             battery: battery.map(|b| (b.level, b.charging().then_some(if b.quick { Bolt::Quick } else { Bolt::Charging }))),
             wlan: self.wlan_mark(),
+            mobile: self.state.mobile.as_ref().map(|m| crate::widgets::MobileMark { registered: m.registered(), level: m.level(), technology: m.technology() }),
             data: match self.state.data {
                 Data::Erased => None,
                 Data::Open => Some(true),
@@ -266,8 +267,12 @@ impl App {
         // starts darkening, and only that row: a finger that moves on
         // before then never waits for it.
         if let (Some(press), None) = (self.row_press.filter(|p| now >= p.rise), &self.row_art) {
+            let (x, y, w, h) = row_part(press.rect, &self.frame.as_ref().expect("rendered above").canvas);
+            // A visible row may extend past the viewport's drawn band.
+            // Keep its full normal artwork before making the pressed copy.
+            self.draw_cols(f, info, self.w);
+            self.draw_rows(f, info, y as f32, (y + h) as f32);
             let page = &self.frame.as_ref().expect("rendered above").canvas;
-            let (x, y, w, h) = row_part(press.rect, page);
             let pressed = t.pressed();
             let band = Band { rows: (y, y + h), cols: (x, x + w) };
             let cx = Ctx { t: &pressed, f, info, state: &self.state, term: self.term.as_ref(), band: Some(band) };
@@ -307,7 +312,8 @@ impl App {
                         }
                     };
                     let turn = self.turn.as_ref().expect("sliding");
-                    let (front, behind) = if back { (&turn.left, &page) } else { (&page, &turn.left) };
+                    let behind = if back && turn.drag.is_some() { turn.behind.as_ref().unwrap_or(&page) } else { &page };
+                    let (front, behind) = if back { (&turn.left, behind) } else { (&page, &turn.left) };
                     out.slide(front, behind, at, shift, dim, self.corners);
                     self.layer = Some((view, page));
                 }
@@ -502,6 +508,10 @@ impl App {
     /// [`Turn`].
     fn slid(&mut self, now: u64) -> Option<(i32, i32, f32)> {
         let turn = self.turn.as_mut()?;
+        if let Some(along) = turn.drag {
+            let w = self.w as f32;
+            return Some((((along * w).round()) as i32, (BEHIND_SHIFT * w * (1.0 - along)).round() as i32, BEHIND_DIM * (1.0 - along)));
+        }
         let spring = *turn.spring.get_or_insert_with(|| {
             if turn.back {
                 Spring::new(now, -1000.0, 0.0, BACK_PERIOD)

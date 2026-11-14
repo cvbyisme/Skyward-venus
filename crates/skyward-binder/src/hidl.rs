@@ -7,7 +7,7 @@
 //! the bytes themselves pointing back at that frame.
 
 use crate::parcel::Payload;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// An address a call hands over, as the driver carries it.
 const ADDRESS: u32 = u32::from_be_bytes([b'p', b't', b'*', 0x85]);
@@ -80,6 +80,44 @@ impl Message {
         self.framed(at, value.len(), value.len() + 1);
     }
 
+    /// A native HIDL structure, carried as one buffer object.
+    pub fn buffer(&mut self, bytes: Vec<u8>) -> usize {
+        let length = bytes.len();
+        let at = self.keep(bytes);
+        self.address(at, length, None)
+    }
+
+    /// Point a pointer field in an earlier buffer at an embedded buffer.
+    /// parent_offset is a byte offset, not a vector element number.
+    pub fn embedded_buffer(
+        &mut self,
+        parent: usize,
+        parent_offset: usize,
+        bytes: Vec<u8>,
+    ) -> Result<usize> {
+        let position = *self.addresses.get(parent).context("invalid HIDL parent")? as usize;
+        let address = u64::from_le_bytes(self.data[position + 8..position + 16].try_into()?);
+        let field_end = parent_offset
+            .checked_add(8)
+            .context("HIDL parent offset overflow")?;
+        let holder = self
+            .held
+            .iter()
+            .position(|b| b.as_ptr() as u64 == address)
+            .context("HIDL parent not owned")?;
+        anyhow::ensure!(
+            field_end <= self.held[holder].len(),
+            "HIDL pointer outside parent"
+        );
+        let length = bytes.len();
+        let at = self.keep(bytes);
+        self.held[holder][parent_offset..field_end].copy_from_slice(&at.to_le_bytes());
+        let index = self.address(at, length, Some(parent));
+        let pos = self.addresses[index] as usize;
+        self.data[pos + 32..pos + 40].copy_from_slice(&(parent_offset as u64).to_le_bytes());
+        Ok(index)
+    }
+
     /// Hold on to bytes the driver will read, and say where they are.
     fn keep(&mut self, bytes: Vec<u8>) -> u64 {
         let bytes = bytes.into_boxed_slice();
@@ -108,14 +146,26 @@ impl Message {
         let which = self.addresses.len();
         self.addresses.push(self.data.len() as u64);
         self.data.extend_from_slice(&ADDRESS.to_le_bytes());
-        self.data.extend_from_slice(&inside.map_or(0, |_| INSIDE_ANOTHER).to_le_bytes());
+        self.data
+            .extend_from_slice(&inside.map_or(0, |_| INSIDE_ANOTHER).to_le_bytes());
         self.data.extend_from_slice(&at.to_le_bytes());
         self.data.extend_from_slice(&(length as u64).to_le_bytes());
-        self.data.extend_from_slice(&(inside.unwrap_or(0) as u64).to_le_bytes());
+        self.data
+            .extend_from_slice(&(inside.unwrap_or(0) as u64).to_le_bytes());
         // The address inside the frame is the frame's first field.
         self.data.extend_from_slice(&0u64.to_le_bytes());
         self.pointed += (length as u64).next_multiple_of(WORD);
         which
+    }
+}
+
+// Credential-derived HIDL buffers are temporary and must not survive
+// in allocator memory after the synchronous transaction has completed.
+impl Drop for Message {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.data.zeroize();
+        for buffer in &mut self.held { buffer.as_mut().zeroize(); }
     }
 }
 
@@ -137,17 +187,39 @@ impl Payload for Message {
 pub struct Answer<'a> {
     data: &'a [u8],
     at: usize,
+    region: Option<(usize, usize)>,
 }
 
 impl<'a> Answer<'a> {
     pub fn new(data: &'a [u8]) -> Answer<'a> {
-        Answer { data, at: 0 }
+        Answer {
+            data,
+            at: 0,
+            region: None,
+        }
+    }
+
+    /// A reply backed by a known Binder mapping. All buffer pointers are
+    /// checked against that mapping before being dereferenced.
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn bounded(data: &'a [u8], start: usize, length: usize) -> Self {
+        Self {
+            data,
+            at: 0,
+            region: Some((start, length)),
+        }
+    }
+
+    pub fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into()?))
     }
 
     /// Whether the call went through. A service that refused says so first,
     /// and says why in the text that follows.
     pub fn status(&mut self) -> Result<()> {
-        let code = self.i32().context("read whether the service took the call")?;
+        let code = self
+            .i32()
+            .context("read whether the service took the call")?;
         if code == 0 {
             return Ok(());
         }
@@ -158,7 +230,9 @@ impl<'a> Answer<'a> {
     }
 
     pub fn i32(&mut self) -> Result<i32> {
-        Ok(i32::from_le_bytes(self.take(4)?.try_into().expect("four bytes")))
+        Ok(i32::from_le_bytes(
+            self.take(4)?.try_into().expect("four bytes"),
+        ))
     }
 
     /// A truth value: a byte, padded to four as everything is.
@@ -177,8 +251,20 @@ impl<'a> Answer<'a> {
         }
         let at = u64::from_le_bytes(raw[8..16].try_into().expect("eight bytes"));
         let length = u64::from_le_bytes(raw[16..24].try_into().expect("eight bytes"));
-        if at == 0 {
-            bail!("the service left out something the call asked for");
+        if length == 0 {
+            return Ok(&[]);
+        }
+        if at == 0 || length > 1024 * 1024 {
+            bail!("invalid HIDL buffer address/size");
+        }
+        if let Some((base, size)) = self.region {
+            let offset = (at as usize)
+                .checked_sub(base)
+                .context("HIDL buffer below Binder mapping")?;
+            anyhow::ensure!(
+                offset <= size && length as usize <= size - offset,
+                "HIDL buffer outside Binder mapping"
+            );
         }
         Ok(unsafe { std::slice::from_raw_parts(at as *const u8, length as usize) })
     }
@@ -193,7 +279,12 @@ impl<'a> Answer<'a> {
         while !self.at.is_multiple_of(4) && self.at < self.data.len() {
             self.at += 1;
         }
-        let utf16: Vec<u16> = raw[..units as usize * 2].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+        let utf16: Vec<u16> = raw[..units as usize * 2]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
         Ok(String::from_utf16_lossy(&utf16))
     }
 
@@ -206,9 +297,16 @@ impl<'a> Answer<'a> {
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self.at + n;
+        let end = self
+            .at
+            .checked_add(n)
+            .context("HIDL reply offset overflow")?;
         if end > self.data.len() {
-            bail!("the reply holds {} bytes, {n} more were read at {}", self.data.len(), self.at);
+            bail!(
+                "the reply holds {} bytes, {n} more were read at {}",
+                self.data.len(),
+                self.at
+            );
         }
         let out = &self.data[self.at..end];
         self.at = end;
@@ -219,7 +317,11 @@ impl<'a> Answer<'a> {
 /// The hardware service serving `interface` as `instance`, or `None` while
 /// nothing has registered it.
 #[cfg(target_os = "android")]
-pub fn find<'a>(binder: &'a crate::driver::Binder, interface: &str, instance: &str) -> Result<Option<crate::driver::Handle<'a>>> {
+pub fn find<'a>(
+    binder: &'a crate::driver::Binder,
+    interface: &str,
+    instance: &str,
+) -> Result<Option<crate::driver::Handle<'a>>> {
     use crate::driver::Handle;
     // The directory the phone's hardware services register with, which is
     // a second one beside the directory the rest of the phone uses, and
@@ -230,10 +332,16 @@ pub fn find<'a>(binder: &'a crate::driver::Binder, interface: &str, instance: &s
     let mut call = Message::call(DIRECTORY);
     call.text(interface);
     call.text(instance);
-    let reply = directory.transact(GET, &call).with_context(|| format!("look up {interface}/{instance}"))?;
-    let mut read = Answer::new(reply.bytes());
-    read.status().with_context(|| format!("look up {interface}/{instance}"))?;
-    match read.object().with_context(|| format!("read what the directory answered for {interface}"))? {
+    let reply = directory
+        .transact(GET, &call)
+        .with_context(|| format!("look up {interface}/{instance}"))?;
+    let mut read = reply.hidl();
+    read.status()
+        .with_context(|| format!("look up {interface}/{instance}"))?;
+    match read
+        .object()
+        .with_context(|| format!("read what the directory answered for {interface}"))?
+    {
         Some(handle) => Ok(Some(Handle::hold(reply.binder(), handle)?)),
         None => Ok(None),
     }
@@ -247,14 +355,20 @@ pub fn describes(service: &crate::driver::Handle) -> Result<String> {
     // call on it is named as being on it whatever else the service serves.
     const BASE: &str = "android.hidl.base@1.0::IBase";
     const DESCRIBE: u32 = 256_136_003;
-    let reply = service.transact(DESCRIBE, &Message::call(BASE)).context("ask the service what it serves")?;
-    let mut read = Answer::new(reply.bytes());
+    let reply = service
+        .transact(DESCRIBE, &Message::call(BASE))
+        .context("ask the service what it serves")?;
+    let mut read = reply.hidl();
     read.status().context("ask the service what it serves")?;
-    let frame = read.pointed().context("read the frame of what the service serves")?;
+    let frame = read
+        .pointed()
+        .context("read the frame of what the service serves")?;
     if frame.len() < FRAME_BYTES {
         bail!("the service answered a frame of {} bytes", frame.len());
     }
-    let name = read.pointed().context("read the name of what the service serves")?;
+    let name = read
+        .pointed()
+        .context("read the name of what the service serves")?;
     Ok(String::from_utf8_lossy(name.strip_suffix(&[0]).unwrap_or(name)).into_owned())
 }
 
@@ -273,7 +387,8 @@ mod tests {
                 let points = u64::from_le_bytes(raw[8..16].try_into().unwrap());
                 let length = u64::from_le_bytes(raw[16..24].try_into().unwrap()) as usize;
                 let inside = u64::from_le_bytes(raw[24..32].try_into().unwrap());
-                let bytes = unsafe { std::slice::from_raw_parts(points as *const u8, length) }.to_vec();
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(points as *const u8, length) }.to_vec();
                 assert_eq!(u32::from_le_bytes(raw[0..4].try_into().unwrap()), ADDRESS);
                 assert_eq!(u64::from_le_bytes(raw[32..40].try_into().unwrap()), 0);
                 (flags, inside, bytes)
@@ -285,7 +400,11 @@ mod tests {
     fn a_call_opens_with_the_interface_name_and_a_terminator() {
         let m = Message::call("a.b@1.0::IC");
         assert_eq!(&m.data[..11], b"a.b@1.0::IC");
-        assert_eq!(m.data.len(), 12, "the name, its terminator, and padding to four");
+        assert_eq!(
+            m.data.len(),
+            12,
+            "the name, its terminator, and padding to four"
+        );
         assert_eq!(m.data[11], 0);
         assert!(m.addresses.is_empty());
     }
@@ -295,9 +414,16 @@ mod tests {
         let mut m = Message::call("a.b@1.0::IC");
         m.u32(7);
         m.u64(1 << 40);
-        assert_eq!(m.data.len(), 12 + 4 + 8, "a word is not moved to a boundary of its own");
+        assert_eq!(
+            m.data.len(),
+            12 + 4 + 8,
+            "a word is not moved to a boundary of its own"
+        );
         assert_eq!(u32::from_le_bytes(m.data[12..16].try_into().unwrap()), 7);
-        assert_eq!(u64::from_le_bytes(m.data[16..24].try_into().unwrap()), 1 << 40);
+        assert_eq!(
+            u64::from_le_bytes(m.data[16..24].try_into().unwrap()),
+            1 << 40
+        );
     }
 
     #[test]
@@ -308,11 +434,19 @@ mod tests {
         assert_eq!(parts.len(), 2, "the frame, then the bytes");
         assert_eq!(parts[0].0, 0, "the frame points inside nothing");
         assert_eq!(parts[0].2.len(), FRAME_BYTES);
-        assert_eq!(u32::from_le_bytes(parts[0].2[8..12].try_into().unwrap()), 3, "how many bytes there are");
+        assert_eq!(
+            u32::from_le_bytes(parts[0].2[8..12].try_into().unwrap()),
+            3,
+            "how many bytes there are"
+        );
         assert_eq!(parts[1].0, INSIDE_ANOTHER, "the bytes sit inside the frame");
         assert_eq!(parts[1].1, 0, "inside the first address of the call");
         assert_eq!(parts[1].2, vec![1, 2, 3]);
-        assert_eq!(m.pointed, FRAME_BYTES as u64 + WORD, "both rounded up to a word");
+        assert_eq!(
+            m.pointed,
+            FRAME_BYTES as u64 + WORD,
+            "both rounded up to a word"
+        );
     }
 
     #[test]
@@ -320,7 +454,11 @@ mod tests {
         let mut m = Message::call("a.b@1.0::IC");
         m.text("default");
         let parts = written(&m);
-        assert_eq!(u32::from_le_bytes(parts[0].2[8..12].try_into().unwrap()), 7, "the terminator is not counted");
+        assert_eq!(
+            u32::from_le_bytes(parts[0].2[8..12].try_into().unwrap()),
+            7,
+            "the terminator is not counted"
+        );
         assert_eq!(parts[1].2, b"default\0", "but it is carried");
     }
 
@@ -353,7 +491,56 @@ mod tests {
         let mut read = Answer::new(&[1, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0]);
         assert!(read.bool().unwrap());
         assert!(!read.bool().unwrap());
-        assert_eq!(read.i32().unwrap(), 7, "what follows it starts four bytes on");
+        assert_eq!(
+            read.i32().unwrap(),
+            7,
+            "what follows it starts four bytes on"
+        );
         assert!(Answer::new(&[1, 0]).bool().is_err());
+    }
+
+    fn pointer_object(address: usize, length: usize) -> Vec<u8> {
+        let mut raw = vec![0u8; ADDRESS_BYTES];
+        raw[..4].copy_from_slice(&ADDRESS.to_le_bytes());
+        raw[8..16].copy_from_slice(&(address as u64).to_le_bytes());
+        raw[16..24].copy_from_slice(&(length as u64).to_le_bytes());
+        raw
+    }
+
+    #[test]
+    fn bounded_reply_rejects_foreign_and_overlong_buffers_before_dereference() {
+        let data = [4u8, 5, 6, 7];
+        let base = data.as_ptr() as usize;
+        for (at, len) in [
+            (base - 1, 1),
+            (base + 3, 2),
+            (base, 1024 * 1024 + 1),
+            (0, 1),
+        ] {
+            let obj = pointer_object(at, len);
+            assert!(Answer::bounded(&obj, base, data.len()).pointed().is_err());
+        }
+        let obj = pointer_object(base + 1, 2);
+        assert_eq!(
+            Answer::bounded(&obj, base, data.len()).pointed().unwrap(),
+            &[5, 6]
+        );
+        let empty = pointer_object(0, 0);
+        assert!(
+            Answer::bounded(&empty, base, data.len())
+                .pointed()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn embedded_buffers_reject_a_nonexistent_parent_or_out_of_range_field() {
+        let mut m = Message::call("x");
+        assert!(m.embedded_buffer(0, 0, vec![1]).is_err());
+        let p = m.buffer(vec![0; 16]);
+        assert!(m.embedded_buffer(p, 9, vec![1]).is_err());
+        assert!(m.embedded_buffer(p, usize::MAX, vec![1]).is_err());
+        assert!(m.embedded_buffer(p, 8, vec![1]).is_ok());
     }
 }

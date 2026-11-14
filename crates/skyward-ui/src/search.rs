@@ -28,6 +28,7 @@ const SETTINGS: Text = ["设置", "設定", "Settings"];
 const MOUNT: Text = ["挂载", "掛載", "Mount"];
 
 pub const ENTRIES: &[Entry] = &[
+    entry(["SIM 卡与移动网络", "SIM 卡與行動網路", "SIM & mobile network"], HOME, Screen::Cellular, &["sim", "yidongwangluo", "ydwl", "xinhao", "cellular", "mobile"]),
     entry(["WLAN", "Wi-Fi", "Wi-Fi"], HOME, Screen::Wlan, &["wuxianwangluo", "wxwl", "wangluo", "wl", "lianwang", "wifi", "wlan"]),
     entry(
         ["双系统", "雙系統", "Dual boot"],

@@ -142,6 +142,7 @@ impl App {
                     self.drag = match at_edge {
                         Some(from_left) if dx.abs() > slop && dx.abs() > dy.abs() => {
                             self.dirty = true;
+                            self.begin_back_preview();
                             Drag::Edge { start: x0, from_left, armed: false, x, cy: y0 - m.dp(CUE_LIFT_DP) }
                         }
                         _ if dy.abs() > slop => {
@@ -172,6 +173,7 @@ impl App {
                 Drag::Edge { start, from_left, armed, cy, .. } => {
                     let travel = if from_left { x - start } else { start - x };
                     let ready = travel > m.dp(BACK_SWIPE_DP);
+                    self.drag_back_preview(travel / (m.w as f32 * 0.62));
                     // A tap of the motor as the `<` appears, as the system
                     // gives.
                     if ready && !armed && self.state.vibrate {
@@ -242,8 +244,19 @@ impl App {
                         _ => self.settle_fold(now),
                     }
                 }
-                Drag::Edge { armed: true, .. } => fx.extend(self.back(now)),
+                Drag::Edge { armed: true, .. } => {
+                    let before = (self.stack.len(), self.screen());
+                    let progress = self.turn.as_ref().and_then(|t| t.drag).unwrap_or(0.0);
+                    fx.extend(self.back(now));
+                    if self.stack.len() == before.0 && self.screen() == before.1 {
+                        self.cancel_back_preview();
+                    } else if let Some(turn) = self.turn.as_mut().filter(|t| t.drag.is_some()) {
+                        turn.drag = None;
+                        turn.spring = Some(Spring::new(now, (progress - 1.0) * 1000.0, 0.0, BACK_PERIOD));
+                    }
+                }
                 Drag::Edge { start, from_left, x, cy, .. } => {
+                    self.cancel_back_preview();
                     // Short of going back, the cue sinks back into the edge.
                     let travel = if from_left { x - start } else { start - x };
                     let depth = widgets::back_cue_depth(&t, travel);
@@ -331,6 +344,9 @@ impl App {
         // Any button stops a gliding page, and brings a sliding one to rest.
         self.fling = None;
         self.end_turn();
+        if self.state.maintenance.is_some() {
+            return Vec::new();
+        }
         if let Some((first, at)) = self.chord
             && matches!((first, key), (Key::Power, Key::VolumeDown) | (Key::VolumeDown, Key::Power))
             && now < at + CHORD_MS
@@ -630,11 +646,44 @@ mod tests {
     fn swipe_from_the_left_edge_goes_back() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Reboot, &f, &i);
+        let mut first = Canvas::new(W, H);
+        app.compose(&mut first, &f, &i, "12:00", 1000);
         app.touch(Touch::Down(10.0, 1600.0), &f, 0);
         app.touch(Touch::Move(90.0, 1605.0), &f, 0);
         app.touch(Touch::Move(320.0, 1610.0), &f, 0);
         app.touch(Touch::Up, &f, 0);
         assert_eq!(app.screen(), Screen::Home);
+    }
+
+    #[test]
+    fn edge_swipe_previews_the_page_under_the_finger() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Reboot, &f, &i);
+        let mut first = Canvas::new(W, H);
+        app.compose(&mut first, &f, &i, "12:00", 1000);
+        app.touch(Touch::Down(10.0, 1600.0), &f, 0);
+        app.touch(Touch::Move(90.0, 1602.0), &f, 8);
+        app.touch(Touch::Move(240.0, 1604.0), &f, 16);
+        let turn = app.turn.as_ref().expect("the page is held under the finger");
+        assert!(turn.back && turn.drag.is_some(), "held between the pages");
+        let mut canvas = Canvas::new(W, H);
+        app.compose(&mut canvas, &f, &i, "12:00", 16);
+        app.touch(Touch::Up, &f, 24);
+        assert_eq!(app.screen(), Screen::Home, "past the edge, it goes back");
+    }
+
+    #[test]
+    fn a_back_preview_let_go_short_returns_the_page() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Reboot, &f, &i);
+        let mut first = Canvas::new(W, H);
+        app.compose(&mut first, &f, &i, "12:00", 1000);
+        app.touch(Touch::Down(10.0, 1600.0), &f, 0);
+        app.touch(Touch::Move(90.0, 1600.0), &f, 8);
+        app.touch(Touch::Move(70.0, 1600.0), &f, 16);
+        app.touch(Touch::Up, &f, 24);
+        assert_eq!(app.screen(), Screen::Reboot);
+        assert!(app.turn.is_none(), "the preview is put back");
     }
 
     #[test]

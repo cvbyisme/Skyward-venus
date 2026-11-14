@@ -5,6 +5,25 @@ use crate::dhcp::Lease;
 use crate::reach::Reach;
 use crate::supplicant::{Bss, Event, Security};
 use std::net::Ipv4Addr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// One background operation. Its identity survives cancellation until all
+/// replies are dropped, so a later WLAN session cannot reuse it by accident.
+#[derive(Clone, Debug)]
+pub struct Attempt(Arc<AtomicBool>);
+
+impl Default for Attempt {
+    fn default() -> Self { Self(Arc::new(AtomicBool::new(false))) }
+}
+
+impl Attempt {
+    pub fn cancel(&self) { self.0.store(true, Ordering::Relaxed); }
+    pub fn stop_flag(&self) -> &AtomicBool { &self.0 }
+    pub fn matches(&self, pending: Option<&Self>) -> bool {
+        !self.0.load(Ordering::Relaxed) && pending.is_some_and(|p| Arc::ptr_eq(&self.0, &p.0))
+    }
+}
 
 /// The WLAN, as the pages show it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -199,8 +218,9 @@ impl Joined {
                 Next::Forget
             }
             Event::TemporarilyDisabled { .. } | Event::Rejected if !matches!(self.stage, Stage::Connected(_)) => {
+                let addressing = matches!(self.stage, Stage::Addressing | Stage::NoAddress(_));
                 self.stage = Stage::Failed;
-                Next::Show
+                if addressing { Next::Unaddress } else { Next::Show }
             }
             Event::NotFound if self.stage == Stage::Joining || self.stage == Stage::Failed => {
                 self.stage = Stage::NotFound;
@@ -214,6 +234,30 @@ impl Joined {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_address_and_probe_results_cannot_enter_a_new_connection() {
+        let first = Attempt::default();
+        let delayed = first.clone();
+        assert!(delayed.matches(Some(&first)));
+        first.cancel();
+        assert!(!delayed.matches(Some(&first)), "a completed reply queued before cancellation is stale too");
+        let restarted = Attempt::default();
+        assert!(!delayed.matches(Some(&restarted)), "switching WLAN off/on must not reuse an operation id");
+        assert!(!delayed.matches(None));
+        assert!(restarted.clone().matches(Some(&restarted)));
+    }
+
+    #[test]
+    fn association_failure_cancels_address_work_before_disconnect_arrives() {
+        for event in [Event::Rejected, Event::TemporarilyDisabled { reason: "CONN_FAILED".into() }] {
+            let mut j = joining();
+            j.stage = Stage::Addressing;
+            assert_eq!(j.on(&event), Next::Unaddress);
+            assert_eq!(j.stage, Stage::Failed);
+            assert_eq!(j.on(&Event::Disconnected), Next::Show);
+        }
+    }
 
     fn bss(id: u32, ssid: &[u8], signal: i32, frequency: u32) -> Bss {
         Bss { id, bssid: format!("00:00:00:00:00:{id:02x}"), frequency, signal, security: Security::Psk, ssid: ssid.to_vec() }

@@ -315,6 +315,7 @@ fn no_update() -> Result<()> {
 fn backup(t: BackupTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<PathBuf> {
     let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
     let [boot, system, data, efs] = t.parts;
+    let _radio_storage = if efs {crate::venus_modem::efs_guard()?}else{None};
     if system {
         no_update()?;
     }
@@ -501,14 +502,17 @@ fn restore(t: RestoreTask, tell: &dyn Fn(Event), cancel: &AtomicBool) -> Result<
         let mut telling = Telling::new(tell, k, item.stored.size, true);
         check(&t.folder, &item.stored, cancel, &mut telling).with_context(|| format!("check {}", item.name))?;
     }
+    if system {
+        // Source release takes its own radio guard. Finish it before
+        // acquiring the guard held throughout EFS unmount and restore.
+        (t.detach)().context("take the slot's partitions off before writing over them")?;
+    }
+    let _radio_storage = if items.iter().any(|i|i.part==Part::Efs) {crate::venus_modem::efs_guard()?}else{None};
     for item in items.iter().filter(|i| matches!(i.part, Part::Boot | Part::Efs)) {
         let device = target(item, slot);
         for point in mount::points_of(skyward_block::devnum(&device)?)? {
             mount::umount(&point).with_context(|| format!("{} is in use at {}", device.display(), point.display()))?;
         }
-    }
-    if system {
-        (t.detach)().context("take the slot's partitions off before writing over them")?;
     }
     // The boot partitions are restored as the installed system's, whose
     // boot set goes back into them first, so that the second system's is

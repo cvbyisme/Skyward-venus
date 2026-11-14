@@ -385,6 +385,11 @@ pub struct Reply<'a> {
 }
 
 impl<'a> Reply<'a> {
+    /// HIDL reader whose pointers cannot escape the driver's mapped region.
+    pub fn hidl(&self) -> crate::hidl::Answer<'_> {
+        crate::hidl::Answer::bounded(self.data, self.binder.map as usize, MAP_BYTES)
+    }
+
     pub fn read(&self) -> Reader<'_> {
         Reader::new(self.data)
     }

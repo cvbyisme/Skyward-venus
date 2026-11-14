@@ -1,0 +1,23 @@
+
+# Temporary venus entryfix: init itself marks progress, even if sh cannot run.
+on early-init
+    write /dev/kmsg "VENUS_PROBE_INIT_EARLY entryfix-v1"
+
+# USB is independent of both the diagnostic program and metadata logging.
+on post-fs
+    mkdir /tmp/skyward-probe 0700 root root
+    write /dev/kmsg "VENUS_PROBE_POST_FS entryfix-v1"
+    start logd
+    setprop sys.usb.config adb
+    start adbd
+    start venus_probe_logs
+
+on boot
+    write /dev/kmsg "VENUS_PROBE_BOOT entryfix-v1"
+    start recovery
+
+service venus_probe_logs /system/bin/sh /skyward/probe-logs.sh
+    disabled
+    user root
+    group root
+    seclabel u:r:recovery:s0

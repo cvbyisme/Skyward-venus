@@ -2370,6 +2370,8 @@ dependencies = [
  "hex",
  "libc",
  "procfs",
+ "serde_json",
+ "sha2 0.10.9",
  "skyward-backup",
  "skyward-binder",
  "skyward-block",
@@ -2390,6 +2392,7 @@ dependencies = [
  "skyward-vab",
  "tempfile",
  "ureq",
+ "zeroize",
  "zip 8.6.0",
  "zstd",
 ]
@@ -2416,6 +2419,7 @@ dependencies = [
  "anyhow",
  "libc",
  "skyward-sys",
+ "zeroize",
 ]
 
 [[package]]
@@ -2437,8 +2441,13 @@ dependencies = [
  "abootimg-oxide",
  "anyhow",
  "cpio",
+ "flate2",
  "libc",
  "lz4_flex 0.14.0",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "skyward-config",
  "tempfile",
 ]
 
@@ -2465,6 +2474,8 @@ dependencies = [
  "sha2 0.10.9",
  "skyward-binder",
  "skyward-block",
+ "tempfile",
+ "zeroize",
 ]
 
 [[package]]
@@ -2635,6 +2646,7 @@ dependencies = [
  "anyhow",
  "libc",
  "skyward-block",
+ "tempfile",
 ]
 
 [[package]]
@@ -2688,6 +2700,7 @@ dependencies = [
  "skyward-info",
  "skyward-install",
  "skyward-net",
+ "skyward-sys",
  "skyward-systems",
  "skyward-vab",
  "svgtypes",
@@ -2696,6 +2709,7 @@ dependencies = [
  "ttf-parser",
  "unicode-width",
  "vt100",
+ "zeroize",
 ]
 
 [[package]]

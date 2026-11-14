@@ -4,6 +4,8 @@
 
 mod image;
 mod ramdisk;
+pub mod avb;
+pub mod capsule;
 
 pub use image::BootImage;
 pub use ramdisk::{lz4_legacy, Entry, Ramdisk};

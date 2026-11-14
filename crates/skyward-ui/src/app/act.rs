@@ -6,8 +6,19 @@ impl App {
     /// Carry out a tapped control.
     pub(super) fn act(&mut self, action: Action, now: u64) -> Vec<Effect> {
         let l = self.state.lang;
+        if let Some(job) = &self.state.maintenance {
+            let allowed = match &job.phase {
+                MaintenancePhase::Ready { .. } => matches!(action, Action::Back | Action::Confirm(Confirm::Maintenance)),
+                MaintenancePhase::Finished { .. } => action == Action::Back,
+                MaintenancePhase::Preparing | MaintenancePhase::Writing { .. } => false,
+            };
+            if !allowed { return Vec::new(); }
+        }
         match action {
             Action::Open(s) => {
+                if matches!(s, Screen::Maintenance(_)) && !self.state.venus_maintenance {
+                    return Vec::new();
+                }
                 if s == Screen::Search && self.screen() == Screen::Home {
                     // The bar moves up from where it stands unfolded: a
                     // page easing there for the keys gets there at once.
@@ -39,6 +50,14 @@ impl App {
                     self.refresh();
                 }
             }
+            Action::RefreshRate(hz) => {
+                if self.state.refresh_rate != hz {
+                    self.state.refresh_rate = hz;
+                    self.refresh();
+                    return vec![Effect::RefreshRate(hz)];
+                }
+                return Vec::new();
+            }
             // The switch moves at once; the runtime then tells how the WLAN
             // came up, or went off.
             Action::Toggle(Switch::Wlan) => {
@@ -56,14 +75,35 @@ impl App {
                     Switch::Verify => &mut self.state.verify,
                     Switch::Signature => &mut self.state.check_signature,
                     Switch::KeepRecovery => &mut self.state.keep_recovery,
+                    Switch::AlwaysOn => &mut self.state.always_on,
+                    Switch::DoubleTapWake => &mut self.state.double_tap_wake,
+                    Switch::AutoDecrypt => &mut self.state.auto_decrypt,
+                    Switch::WirelessAdb => &mut self.state.wireless_adb,
                     Switch::ShowPassword => &mut self.state.show_password,
                     Switch::Wlan => unreachable!("the WLAN switch is turned above"),
                 };
                 *on = !*on;
                 let now_on = *on;
+                if switch == Switch::AlwaysOn {
+                    self.state.aod_issue = None;
+                }
                 self.refresh();
                 if switch == Switch::FileTransfer {
                     return vec![Effect::FileTransfer(now_on)];
+                }
+                if switch == Switch::AutoDecrypt {
+                    if !now_on {
+                        self.state.saved_lock = None;
+                    } else if matches!(self.state.data, Data::Closed) {
+                        return vec![Effect::OpenData];
+                    } else if let Data::Locked { user, .. } = &self.state.data
+                        && let Some(code) = self.state.saved_lock.clone()
+                    {
+                        return vec![Effect::Unlock { user: *user, code }];
+                    }
+                }
+                if switch == Switch::WirelessAdb {
+                    return vec![Effect::WirelessAdb(now_on)];
                 }
             }
             Action::MountToggle(i) => {
@@ -388,11 +428,13 @@ impl App {
                     }];
                 }
             }
-            Action::JoinNetwork(i) => {
-                let w = self.state.wlan.as_ref().expect("networks show on a phone whose WLAN is brought up");
-                // A scan may have changed the list since the page was drawn.
-                let Some(network) = w.networks.get(i).cloned() else { return Vec::new() };
-                if w.joined.as_ref().is_some_and(|j| j.ssid == network.ssid) {
+            Action::JoinNetwork(key) => {
+                let Some(w) = self.state.wlan.as_ref().filter(|w| w.power == Power::On) else { return Vec::new() };
+                let Some(network) = w.networks.iter().find(|n| key.matches(n)).cloned() else {
+                    self.say(l.pick(["扫描结果已变化，请重新选择网络", "掃描結果已變更，請重新選擇網路", "Scan results changed; choose the network again"]), now);
+                    return Vec::new();
+                };
+                if w.joined.as_ref().is_some_and(|j| j.ssid == network.ssid && j.security == network.security) {
                     return self.act(Action::OpenJoined, now);
                 }
                 match network.security {
@@ -411,9 +453,12 @@ impl App {
                     }
                 }
             }
-            Action::NetworkDetails(i) => {
-                let w = self.state.wlan.as_ref().expect("networks show on a phone whose WLAN is brought up");
-                let Some(network) = w.networks.get(i).cloned() else { return Vec::new() };
+            Action::NetworkDetails(key) => {
+                let Some(w) = self.state.wlan.as_ref().filter(|w| w.power == Power::On) else { return Vec::new() };
+                let Some(network) = w.networks.iter().find(|n| key.matches(n)).cloned() else {
+                    self.say(l.pick(["扫描结果已变化，请重新选择网络", "掃描結果已變更，請重新選擇網路", "Scan results changed; choose the network again"]), now);
+                    return Vec::new();
+                };
                 self.state.details = Some(network);
                 self.open(Screen::WlanNetwork);
             }
@@ -421,7 +466,7 @@ impl App {
                 let w = self.state.wlan.as_ref().expect("a network is chosen on a phone whose WLAN is brought up");
                 let Some(j) = w.joined.clone() else { return Vec::new() };
                 // As found, where it still is; as it was chosen otherwise.
-                let found = w.networks.iter().find(|n| n.ssid == j.ssid).cloned();
+                let found = w.networks.iter().find(|n| n.ssid == j.ssid && n.security == j.security).cloned();
                 let network = found.unwrap_or(Network {
                     ssid: j.ssid,
                     name: j.name,
@@ -443,6 +488,19 @@ impl App {
                 return fx;
             }
             Action::Rescan => return vec![Effect::ScanWlan],
+            Action::RefreshCellular => return vec![Effect::RefreshCellular],
+            Action::CellularRadio | Action::CellularData => {
+                use skyward_net::modem::Phase;
+                if self.state.cellular_pending.is_some() { return Vec::new(); }
+                let Some(modem) = self.state.mobile.as_ref().and_then(|m| m.modem.as_ref()) else { return Vec::new(); };
+                if matches!(modem.radio, Phase::Starting | Phase::Stopping) || matches!(modem.data, Phase::Starting | Phase::Stopping) { return Vec::new(); }
+                let command = if action == Action::CellularRadio { CellularCommand::Radio(modem.radio != Phase::Ready) }
+                    else if modem.radio == Phase::Ready { CellularCommand::Data(modem.data != Phase::Ready) }
+                    else { return Vec::new(); };
+                self.state.cellular_pending = Some(PendingCellular { command, previous: modem.command.clone(), until: now + 90_000 });
+                self.refresh();
+                return vec![Effect::Cellular(command)];
+            }
             Action::AddNetwork => {
                 self.state.adding = Some(Adding { name: String::new(), security: Security::Open, field: Field::Name, choosing: false });
                 self.state.password.clear();
@@ -700,7 +758,20 @@ impl App {
     /// What a swipe-to-confirm control slid to its end does.
     pub(super) fn confirmed(&mut self, which: Confirm, now: u64) -> Vec<Effect> {
         let (l, mut fx) = (self.state.lang, Vec::new());
+        if self.state.maintenance.is_some() && which != Confirm::Maintenance {
+            return fx;
+        }
         match which {
+            Confirm::Maintenance => {
+                let same_page = self.state.maintenance.as_ref().is_some_and(|m| self.screen() == Screen::Maintenance(m.action));
+                if self.state.venus_maintenance && same_page {
+                    if let Some(job) = self.state.maintenance.as_mut().filter(|m| matches!(m.phase, MaintenancePhase::Ready { .. })) {
+                        job.phase = MaintenancePhase::Writing { done: 0, total: 0 };
+                        self.refresh();
+                        fx.push(Effect::ExecuteMaintenance);
+                    }
+                }
+            }
             Confirm::Reboot => fx.push(Effect::Reboot(TARGETS[self.state.reboot])),
             Confirm::Wipe => {
                 let chosen: Vec<Wipe> = WIPES.iter().zip(self.state.wipe).filter(|(_, on)| *on).map(|(&w, _)| w).collect();

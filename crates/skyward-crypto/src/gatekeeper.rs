@@ -14,7 +14,7 @@
 #![cfg_attr(not(target_os = "android"), allow(dead_code))]
 
 use crate::token::Token;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use skyward_binder::hidl::{Answer, Message};
 use skyward_binder::parcel::{Parcel, Reader};
 use skyward_binder::status;
@@ -115,17 +115,28 @@ fn hardware_note(read: &mut Answer) -> Result<Token> {
         bail!("the secure world answered {} bytes about the credential", answer.len());
     }
     let said = i32::from_le_bytes(answer[0..4].try_into().expect("four bytes"));
-    let wait = i32::from_le_bytes(answer[4..8].try_into().expect("four bytes"));
+    let wait = u32::from_le_bytes(answer[4..8].try_into().expect("four bytes"));
     let length = u32::from_le_bytes(answer[NOTE_LENGTH].try_into().expect("four bytes"));
     match said {
         RIGHT | RIGHT_BUT_RENEW => {}
-        HOLDING_OFF => bail!("the phone is holding off further tries for another {} seconds", (wait + 999) / 1000),
-        _ => bail!("the secure world does not recognise that credential"),
+        HOLDING_OFF => bail!(
+            "Gatekeeper HAL verification throttled: code=-2 (ERROR_RETRY_TIMEOUT), timeout_ms={wait}; no automatic retry"
+        ),
+        -1 => bail!(
+            "Gatekeeper HAL rejected verification: code=-1 (ERROR_GENERAL_FAILURE), timeout_ms={wait}; this status alone does not distinguish a wrong credential from a handle/runtime mismatch"
+        ),
+        -3 => bail!(
+            "Gatekeeper HAL verification unavailable: code=-3 (ERROR_NOT_IMPLEMENTED), timeout_ms={wait}"
+        ),
+        other => bail!(
+            "Gatekeeper HAL returned unknown verification status: code={other}, timeout_ms={wait}; not treated as wrong PIN or success"
+        ),
     }
     if length == 0 {
         bail!("the secure world took the credential but wrote no note for the key service");
     }
     let note = read.pointed().context("read the note the secure world wrote")?;
+    ensure!(note.len() == length as usize, "Gatekeeper token length disagrees with its frame");
     Token::of(note)
 }
 
@@ -138,6 +149,14 @@ pub enum Gatekeeper<'a> {
 
 #[cfg(target_os = "android")]
 impl<'a> Gatekeeper<'a> {
+    /// Select the existing HIDL service explicitly. Does not require an AIDL
+    /// service manager, enroll, verify, delete, or submit a dummy credential.
+    pub fn open_hidl(hardware: &'a skyward_binder::driver::Binder) -> Result<Self> {
+        let device = skyward_binder::hidl::find(hardware, HARDWARE_SERVICE, INSTANCE)?
+            .context("Gatekeeper 1.0 service is not running")?;
+        Ok(Self::Older(device))
+    }
+
     /// Reach the running credential service: the newer kind through
     /// `binder` where the phone describes one, the older kind through
     /// `hardware` otherwise. Say so where it is not running.
@@ -189,7 +208,7 @@ impl<'a> Gatekeeper<'a> {
             }
             Gatekeeper::Older(device) => {
                 let reply = device.transact(HARDWARE_VERIFY, &ask_hardware(slot, enrolled, password)).context(what)?;
-                hardware_note(&mut Answer::new(reply.bytes()))
+                hardware_note(&mut reply.hidl())
             }
         }
     }
@@ -271,4 +290,73 @@ mod tests {
         assert!(format!("{waiting:#}").starts_with("the phone is holding off further tries"));
         assert!(note(&mut Reader::new(&answered(&[]))).is_err(), "a right answer with no note");
     }
+    fn hardware_answer(code:i32, wait:u32, size:u32, payload:Vec<u8>) -> Message {
+        let mut m=Message::default();m.u32(0);
+        let mut raw=vec![0u8;24];raw[..4].copy_from_slice(&code.to_le_bytes());
+        raw[4..8].copy_from_slice(&wait.to_le_bytes());raw[16..20].copy_from_slice(&size.to_le_bytes());
+        let p=m.buffer(raw);m.embedded_buffer(p,8,payload).unwrap();m
+    }
+    #[test]
+    fn hidl_token_length_and_retry_timeout_are_checked() {
+        use skyward_binder::parcel::Payload;
+        let mut raw=vec![0;69];raw[25..29].copy_from_slice(&1i32.to_be_bytes());
+        raw[37..].fill(0xab);
+        let good=hardware_answer(0,0,69,raw.clone());
+        assert!(hardware_note(&mut Answer::new(good.values())).is_ok());
+        let reenroll=hardware_answer(1,0,69,raw.clone());
+        assert!(hardware_note(&mut Answer::new(reenroll.values())).is_ok());
+        let bad=hardware_answer(0,0,70,raw);
+        assert!(hardware_note(&mut Answer::new(bad.values())).is_err());
+        let timeout=hardware_answer(-2,u32::MAX,0,vec![]);
+        let e=hardware_note(&mut Answer::new(timeout.values())).unwrap_err();
+        assert!(e.to_string().contains("timeout_ms=4294967295"));
+    }
+    #[test]
+    fn hidl_wrong_credential_is_not_reinterpreted_as_success() {
+        use skyward_binder::parcel::Payload;
+        let bad=hardware_answer(-1,0,0,vec![]);
+        assert!(hardware_note(&mut Answer::new(bad.values())).is_err());
+    }
+
+    #[test]
+    fn hidl_general_failure_is_not_mislabeled_as_wrong_pin() {
+        use skyward_binder::parcel::Payload;
+        let bad = hardware_answer(-1, 0, 0, vec![]);
+        let e = hardware_note(&mut Answer::new(bad.values())).unwrap_err().to_string();
+        assert!(e.contains("code=-1 (ERROR_GENERAL_FAILURE)"));
+        assert!(e.contains("does not distinguish"));
+        assert!(!e.contains("does not recognise that credential"));
+    }
+    #[test]
+    fn hidl_unsupported_and_unknown_statuses_remain_distinct() {
+        use skyward_binder::parcel::Payload;
+        for (code, label) in [(-3, "ERROR_NOT_IMPLEMENTED"), (-19, "unknown verification status"), (2, "unknown verification status")] {
+            let bad = hardware_answer(code, 0, 0, vec![]);
+            let e = hardware_note(&mut Answer::new(bad.values())).unwrap_err().to_string();
+            assert!(e.contains(label));
+            assert!(e.contains(&format!("code={code}")));
+        }
+    }
+    #[test]
+    fn hidl_verify_matches_installed_vndk30_native_parcel_fixture() {
+        use skyward_binder::parcel::Payload;
+        let call = ask_hardware(100000, &[0xa1; 58], &[0xb2; 64]);
+        assert_eq!(call.addresses(), &[60, 100, 140, 180]);
+        assert_eq!(call.pointed(), 160);
+        let mut normalized = call.values().to_vec();
+        for &offset in call.addresses() {
+            normalized[offset as usize + 8..offset as usize + 16].fill(0);
+        }
+        let hex: String = normalized.iter().map(|v| format!("{v:02x}")).collect();
+        // Captured using only Parcel writers in installed libhidlbase.so;
+        // no Gatekeeper/Keymaster or other hardware transaction was sent.
+        assert_eq!(hex, "616e64726f69642e68617264776172652e676174656b656570657240312e303a3a49476174656b656570657200000000a08601000000000000000000852a7470000000000000000000000000100000000000000000000000000000000000000000000000852a74700100000000000000000000003a0000000000000000000000000000000000000000000000852a7470000000000000000000000000100000000000000000000000000000000000000000000000852a7470010000000000000000000000400000000000000002000000000000000000000000000000");
+        // Check both vector payloads as well, using only owned fixture memory.
+        for (&offset, expected) in call.addresses().iter().zip([16usize, 58, 16, 64]) {
+            let off = offset as usize;
+            let length = u64::from_le_bytes(call.values()[off + 16..off + 24].try_into().unwrap()) as usize;
+            assert_eq!(length, expected);
+        }
+    }
+
 }

@@ -125,7 +125,7 @@ impl App {
     /// A page sliding over another comes to rest at once.
     pub(super) fn end_turn(&mut self) {
         if let Some(turn) = self.turn.take() {
-            self.backdrop = Some(turn.left);
+            self.backdrop = Some(turn.behind.unwrap_or(turn.left));
             self.dirty = true;
         }
     }

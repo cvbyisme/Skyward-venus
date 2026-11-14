@@ -21,6 +21,9 @@ pub struct Shell {
     child: Child,
     /// Readable once the shell has ended.
     ended: OwnedFd,
+    // A terminal session includes background jobs with their own PGIDs.
+    // Its receipt remains after this shell exits until those jobs are dead.
+    _task: skyward_install::task_scope::Task,
 }
 
 impl Shell {
@@ -67,13 +70,15 @@ impl Shell {
                 Ok(())
             });
         }
-        let child = command.spawn().with_context(|| format!("start {SHELL}"))?;
+        let (child, task) = skyward_install::task_scope::Task::spawn(
+            &mut command, skyward_install::task_scope::Kind::TerminalSession,
+        ).with_context(|| format!("start {SHELL}"))?;
         let ended = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
         if ended < 0 {
             return Err(io::Error::last_os_error()).context("watch the shell");
         }
         let ended = unsafe { OwnedFd::from_raw_fd(ended as RawFd) };
-        Ok(Shell { master: File::from(master), child, ended })
+        Ok(Shell { master: File::from(master), child, ended, _task: task })
     }
 
     /// What to wait on: the shell writing, and the shell ending.

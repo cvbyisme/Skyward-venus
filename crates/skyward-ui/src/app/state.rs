@@ -25,6 +25,32 @@ pub struct State {
     pub vibration: f32,
     /// A computer connected over USB is offered internal storage.
     pub file_transfer: bool,
+    /// A dark panel keeps the clock and the phone's readings on the glass in
+    /// the panel's own doze, rather than being put out.
+    pub always_on: bool,
+    /// The native AOD request failed. Kept on the settings page until the
+    /// user explicitly tries the switch again; never persisted as capability.
+    pub aod_issue: Option<String>,
+    /// Only the matched Venus runtime offers these partition-maintenance tools.
+    pub venus_maintenance: bool,
+    pub maintenance: Option<Maintenance>,
+    /// This phone's panel has a doze of its own, which the settings page then
+    /// offers a switch for.
+    pub panel_dozes: bool,
+    pub hardware_double_tap: bool,
+    pub double_tap_wake: bool,
+    pub double_tap_issue: Option<String>,
+    /// Open the data partition as the recovery starts.
+    pub auto_decrypt: bool,
+    /// The WLAN joined successfully, for the next start.
+    pub saved_wlan: Option<SavedWlan>,
+    /// The owner's screen-lock credential, kept only for auto-unlocking
+    /// the encrypted user storage on this recovery.
+    pub saved_lock: Option<String>,
+    /// adbd listens on the WLAN address for wireless debugging.
+    pub wireless_adb: bool,
+    /// The panel refresh rate, among those it reports.
+    pub refresh_rate: u32,
     pub reboot: usize,
     /// What the wipe page has chosen, by place in [`WIPES`].
     pub wipe: [bool; WIPES.len()],
@@ -158,6 +184,8 @@ pub struct State {
     /// The WLAN, as the runtime last told it; none on a phone whose WLAN the
     /// recovery does not bring up.
     pub wlan: Option<Wlan>,
+    pub mobile: Option<skyward_net::mobile::Mobile>,
+    pub cellular_pending: Option<PendingCellular>,
     /// The network the password page is for, and what is typed there.
     pub joining: Option<Network>,
     /// The network the details page is of, as it was found.
@@ -183,6 +211,15 @@ pub struct State {
     pub traffic: Traffic,
 }
 
+/// A WLAN that joined successfully, kept for the next start.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SavedWlan {
+    pub ssid: Vec<u8>,
+    pub name: String,
+    pub security: String,
+    pub password: String,
+}
+
 impl Default for State {
     fn default() -> Self {
         State {
@@ -196,6 +233,19 @@ impl Default for State {
             vibrate: true,
             vibration: SLIDER_START,
             file_transfer: true,
+            always_on: true,
+            aod_issue: None,
+            venus_maintenance: false,
+            maintenance: None,
+            panel_dozes: false,
+            hardware_double_tap: false,
+            double_tap_wake: true,
+            double_tap_issue: None,
+            auto_decrypt: false,
+            saved_wlan: None,
+            saved_lock: None,
+            wireless_adb: false,
+            refresh_rate: 120,
             reboot: 0,
             wipe: [false; WIPES.len()],
             cache_partition: false,
@@ -254,6 +304,8 @@ impl Default for State {
             part_work: None,
             update: Standing::None,
             wlan: None,
+            mobile: None,
+            cellular_pending: None,
             joining: None,
             details: None,
             adding: None,
@@ -311,6 +363,8 @@ impl State {
     /// Whether a network is joined and has given an address.
     pub fn online(&self) -> bool {
         matches!(&self.wlan, Some(Wlan { joined: Some(j), .. }) if matches!(j.stage, Joining::Connected(_)))
+            || self.mobile.as_ref().and_then(|m| m.modem.as_ref()).is_some_and(|m|
+                m.radio == skyward_net::modem::Phase::Ready && m.data == skyward_net::modem::Phase::Ready && m.address.is_some())
     }
 
     /// The newest system the update server told of.
@@ -345,6 +399,7 @@ impl State {
     pub fn offers(&self, screen: Screen) -> bool {
         match screen {
             Screen::Wlan => self.wlan.is_some(),
+            Screen::Cellular => self.mobile.is_some(),
             Screen::SkywardUpdate => self.wlan.is_some() && self.recovery_partitions,
             Screen::Systems => self.dual_boot,
             _ => true,

@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tempfile = "3.27.0"
+zeroize = "1.9.1"
 anyhow = { workspace = true }
 sha2 = "0.10.9"
 aes-gcm = "0.10.3"

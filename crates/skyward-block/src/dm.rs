@@ -280,7 +280,9 @@ mod sys {
         let dev = decode(io.dev);
         let up = (|| -> Result<()> {
             let mut table = table_load(name, targets, readonly)?;
-            call(&ctl, DM_TABLE_LOAD, &mut table).with_context(|| format!("load the table of {name}"))?;
+            let loaded = call(&ctl, DM_TABLE_LOAD, &mut table);
+            table.fill(0);
+            loaded.with_context(|| format!("load the table of {name}"))?;
             let mut resume = DmIoctl::new(name)?;
             call(&ctl, DM_DEV_SUSPEND, resume.as_mut_bytes()).with_context(|| format!("activate {name}"))
         })();
@@ -304,7 +306,9 @@ mod sys {
     pub fn reload(name: &str, targets: &[Target], readonly: bool) -> Result<()> {
         let ctl = control()?;
         let mut table = table_load(name, targets, readonly)?;
-        call(&ctl, DM_TABLE_LOAD, &mut table).with_context(|| format!("load a new table for {name}"))?;
+        let loaded = call(&ctl, DM_TABLE_LOAD, &mut table);
+        table.fill(0);
+        loaded.with_context(|| format!("load a new table for {name}"))?;
         let mut resume = DmIoctl::new(name)?;
         call(&ctl, DM_DEV_SUSPEND, resume.as_mut_bytes()).with_context(|| format!("swap in the new table of {name}"))
     }

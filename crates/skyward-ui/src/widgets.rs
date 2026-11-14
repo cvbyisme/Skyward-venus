@@ -193,6 +193,7 @@ pub struct Bar<'a> {
     pub battery: Option<(u8, Option<Bolt>)>,
     /// The network joined, while it has an address.
     pub wlan: Option<WlanMark>,
+    pub mobile: Option<MobileMark>,
     /// The data partition, open or not; nothing once it is wiped, when
     /// there is nothing in it to open.
     pub data: Option<bool>,
@@ -220,6 +221,12 @@ pub struct WlanMark {
     pub sending: bool,
     pub speed: String,
     pub unit: &'static str,
+}
+
+pub struct MobileMark {
+    pub registered: bool,
+    pub level: Option<u8>,
+    pub technology: &'static str,
 }
 
 /// Below this level the battery fills red while the cable is out.
@@ -256,6 +263,9 @@ pub fn status_bar(c: &mut Canvas, t: &Theme, f: &Fonts, bar: &Bar, ink: Rgba) {
     if let Some(w) = &bar.wlan {
         left = wlan_mark(c, t, w, right, cy, ink);
     }
+    if let Some(mobile) = &bar.mobile {
+        left = mobile_mark(c,t,f,mobile,left-gap,cy,ink);
+    }
     if let Some(open) = bar.data {
         let (art, ox, oy, w) = lock_mark(t, open, left - gap, cy, ink);
         c.lay(&art, ox, oy, 1.0);
@@ -277,6 +287,27 @@ pub fn status_bar(c: &mut Canvas, t: &Theme, f: &Fonts, bar: &Bar, ink: Rgba) {
 /// Room between the marks on the bar's right, as the stock bar leaves it
 /// after its network speed and before its battery, in dp.
 const MARK_GAP_DP: f32 = 4.33;
+
+fn mobile_mark(c: &mut Canvas, t: &Theme, f: &Fonts, mobile: &MobileMark, right: f32, cy: f32, ink: Rgba) -> f32 {
+    let m = &t.m;
+    let x = right-m.dp(12.0);
+    for index in 0..4 {
+        let height = m.dp(4.0 + index as f32*2.6);
+        let lit = mobile.registered && mobile.level.is_some_and(|level| index < level.min(4));
+        c.fill_round_rect(x+m.dp(index as f32*3.0),cy+m.dp(6.0)-height,m.dp(2.0),height,m.dp(0.5),
+            if lit { ink } else { t.pal.battery.empty });
+    }
+    if !mobile.registered {
+        c.line(x,cy+m.dp(5.0),right,cy-m.dp(6.0),m.dp(1.0),ink);
+    }
+    if mobile.technology != "—" {
+        let size = m.dp(7.0);
+        let (begin,end) = f.speed.ink_span(mobile.technology,size);
+        let width = end-begin;
+        c.text(&f.speed,mobile.technology,x-m.dp(2.0)-width-begin,cy+size*0.36,size,ink,None);
+        x-m.dp(2.0)-width
+    } else { x }
+}
 
 /// The stock status bar icons' corners, which ease into their sides: from
 /// where a side starts to bend to where the next one is straight again,
@@ -1661,10 +1692,52 @@ pub fn list_toned(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, rows: &[Row], 
 
 /// Account-style card: avatar, name and detail, then optional rows. The
 /// first rect returned covers the name row.
-pub fn device_card(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, title: &str, sub: &str, rows: &[Row]) -> Block {
+/// One reading of the device card's strip: a value in the row's type over
+/// its caption, both left-aligned in the strip's column.
+pub struct Stat<'a> {
+    pub value: String,
+    pub caption: &'a str,
+}
+
+/// The room the strip asks for over its values, under them and above the
+/// rows that follow.
+const STAT_TOP: f32 = 16.0;
+const STAT_BOTTOM: f32 = 24.0;
+
+/// How tall the strip's two lines are, without the room around them.
+fn stat_height(t: &Theme, f: &Fonts) -> f32 {
+    let (vt, vb) = f.heading.ink(t.m.row_title_px);
+    let (ct, cb) = f.body.ink(t.m.label_px);
+    (vb - vt) + t.m.sub_gap + (cb - ct) + t.m.dp(STAT_BOTTOM)
+}
+
+/// The device card's strip of readings under its name row: one column per
+/// reading, the first at the card's inner edge and the rest spread evenly
+/// over the room left of the last one's value.
+fn stat_strip(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, items: &[Stat]) -> f32 {
+    let m = &t.m;
+    let (card_x, right) = (m.margin, m.w as f32 - m.margin);
+    let x = card_x + m.inner;
+    let (vt, vb) = f.heading.ink(m.row_title_px);
+    let caption_top = top + (vb - vt) + m.sub_gap;
+    let bottom = top + stat_height(t, f);
+    // The last column ends at the card's inner edge; the ones before it start
+    // where the room left of that one's value spreads them.
+    let last_w = c.text_width(&f.heading, &items[items.len() - 1].value, m.row_title_px);
+    let pitch = if items.len() > 1 { (right - m.inner - last_w - x) / (items.len() - 1) as f32 } else { 0.0 };
+    for (k, s) in items.iter().enumerate() {
+        let cx = x + pitch * k as f32;
+        c.text_top(&f.heading, &s.value, cx, top, m.row_title_px, t.pal.text, None);
+        c.text_top(&f.body, s.caption, cx, caption_top, m.label_px, t.pal.spec_label, None);
+    }
+    bottom
+}
+
+pub fn device_card(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, title: &str, sub: &str, stats: &[Stat], rows: &[Row]) -> Block {
     let m = &t.m;
     let lays: Vec<Layout> = rows.iter().map(|r| layout(c, t, f, r)).collect();
-    let h = m.account_row_h + lays.iter().map(|l| l.h).sum::<f32>();
+    let strip = if stats.is_empty() { 0.0 } else { m.dp(STAT_TOP) + stat_height(t, f) };
+    let h = m.account_row_h + strip + lays.iter().map(|l| l.h).sum::<f32>();
     let (card_x, right) = (m.margin, m.w as f32 - m.margin);
     c.fill_round_rect(card_x, top, right - card_x, h, m.card_radius, t.pal.card);
 
@@ -1686,6 +1759,9 @@ pub fn device_card(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, title: &str, 
     let tone = Tone::page(t);
     let mut rects = vec![Rect::new(card_x, top, right - card_x, m.account_row_h)];
     let mut y = top + m.account_row_h;
+    if !stats.is_empty() {
+        y = stat_strip(c, t, f, y + m.dp(STAT_TOP), stats);
+    }
     for (r, l) in rows.iter().zip(&lays) {
         draw_row(c, t, f, r, l, y, &tone);
         rects.push(Rect::new(card_x, y, right - card_x, l.h));
@@ -1719,6 +1795,8 @@ pub struct SliderBlock {
     pub bottom: f32,
     pub track: Rect,
     pub below: Option<Rect>,
+    /// Further rows drawn in the same rounded card, under the first row.
+    pub rows: Vec<Rect>,
 }
 
 /// The monochrome icon beside a slider card's caption.
@@ -1731,16 +1809,30 @@ pub enum Caption {
 
 /// Card with a monochrome icon caption, a slider, and an optional row below.
 #[allow(clippy::too_many_arguments)]
-pub fn slider_card(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, caption: Caption, label: &str, value: f32, below: Option<Row>) -> SliderBlock {
+pub fn slider_card(
+    c: &mut Canvas,
+    t: &Theme,
+    f: &Fonts,
+    top: f32,
+    caption: Caption,
+    label: &str,
+    value: f32,
+    below: Option<Row>,
+    extra: &[Row],
+) -> SliderBlock {
     let m = &t.m;
     let (card_x, right) = (m.margin, m.w as f32 - m.margin);
     let below_lay = below.as_ref().map(|r| layout(c, t, f, r));
+    let extra_lays: Vec<Layout> = extra.iter().map(|r| layout(c, t, f, r)).collect();
     let slider_top = top + m.dp(55.0);
     let slider_bottom = slider_top + m.slider_h;
     let below_gap = m.dp(16.3);
-    let h = match &below_lay {
-        Some(l) => slider_bottom - top + below_gap + l.h,
-        None => slider_bottom - top + m.dp(18.0),
+    let below_h = below_lay.as_ref().map_or(0.0, |l| l.h);
+    let extra_h = extra_lays.iter().map(|l| l.h).sum::<f32>();
+    let h = if below_h == 0.0 && extra_h == 0.0 {
+        slider_bottom - top + m.dp(18.0)
+    } else {
+        slider_bottom - top + below_gap + below_h + extra_h
     };
     c.fill_round_rect(card_x, top, right - card_x, h, m.card_radius, t.pal.card);
 
@@ -1778,7 +1870,14 @@ pub fn slider_card(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, caption: Capt
         draw_row(c, t, f, &r, &l, y, &Tone::page(t));
         below_rect = Some(Rect::new(card_x, y, right - card_x, l.h));
     }
-    SliderBlock { bottom: top + h, track, below: below_rect }
+    let mut rows = Vec::new();
+    let mut y = slider_bottom + below_gap + below_h;
+    for (r, l) in extra.iter().zip(&extra_lays) {
+        draw_row(c, t, f, r, l, y, &Tone::page(t));
+        rows.push(Rect::new(card_x, y, right - card_x, l.h));
+        y += l.h;
+    }
+    SliderBlock { bottom: top + h, track, below: below_rect, rows }
 }
 
 /// Swipe-to-confirm control in the thick-slider style; `progress` (0 to 1)
@@ -2824,7 +2923,7 @@ mod tests {
         let f = crate::font::bundled();
         let draw = |mark: WlanMark| {
             let mut c = Canvas::filled(1200, 160, t.pal.bg);
-            let bar = Bar { clock: "01:27", battery: Some((40, Some(Bolt::Charging))), wlan: Some(mark), data: None, slot: None, temp: None };
+            let bar = Bar { clock: "01:27", battery: Some((40, Some(Bolt::Charging))), wlan: Some(mark), mobile: None, data: None, slot: None, temp: None };
             status_bar(&mut c, &t, &f, &bar, t.pal.status);
             c
         };
@@ -2862,7 +2961,7 @@ mod tests {
         let f = crate::font::bundled();
         let mut c = Canvas::filled(1200, 160, t.pal.bg);
         let wlan = Some(WlanMark { level: 3, receiving: true, sending: true, speed: "0.00".into(), unit: "KB/s" });
-        let bar = Bar { clock: "01:27", battery: Some((40, None)), wlan, data: Some(false), slot: Some("B"), temp: Some(362) };
+        let bar = Bar { clock: "01:27", battery: Some((40, None)), wlan, mobile: None, data: Some(false), slot: Some("B"), temp: Some(362) };
         status_bar(&mut c, &t, &f, &bar, t.pal.status);
         // Runs of inked columns on the bar's right half, those a few pixels
         // apart taken as one mark.
@@ -2934,7 +3033,7 @@ mod tests {
         let f = crate::font::bundled();
         let draw = |kind| {
             let mut c = Canvas::filled(1200, 160, Rgba::rgb(0, 0, 0));
-            let bar = Bar { clock: "01:27", battery: Some((64, Some(kind))), wlan: None, data: None, slot: None, temp: None };
+            let bar = Bar { clock: "01:27", battery: Some((64, Some(kind))), wlan: None, mobile: None, data: None, slot: None, temp: None };
             status_bar(&mut c, &t, &f, &bar, t.pal.status);
             c
         };

@@ -1,11 +1,13 @@
 use crate::app::{
     Action, BackupAt, BackupEnd, BackupJob, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop, Field, FileKind,
     FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Place, Rows, Screen,
+    MaintenancePhase, VenusMaintenance,
     SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, Slider, Source, State, Switch, SystemsWork, Target, UsbDrive, UsbLink, Wipe, ADDABLE,
     BACKUP_PARTS, DATA_ERASED, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF, TARGETS, TIME_ZONES, USB_DRIVE_UNREADABLE,
     USB_DRIVE_WANTED, WIPES, installs, starting,
 };
 use crate::canvas::Canvas;
+use crate::app::NetworkKey;
 use crate::color::Rgba;
 use crate::editor;
 use crate::files;
@@ -80,6 +82,7 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::RestoreBackup => restore_backup(cx),
         Screen::BackupJob => backup_job(cx),
         Screen::Advanced => advanced(cx),
+        Screen::Maintenance(action) => maintenance(cx, action),
         Screen::Files => files(cx),
         Screen::FileInfo => file_info(cx),
         Screen::Permissions => permissions(cx),
@@ -106,6 +109,8 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::Clash => clash(cx),
         Screen::FileJob => file_job(cx),
         Screen::Wlan => wlan(cx),
+        Screen::Cellular => cellular(cx),
+        Screen::RefreshRate => refresh_rate(cx),
         Screen::WlanPassword => wlan_password(cx),
         Screen::WlanNetwork => wlan_network(cx),
         Screen::WlanAdd => wlan_add(cx),
@@ -117,6 +122,7 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
 pub fn confirm_label(which: Confirm, s: &State) -> (&'static str, bool) {
     const INSTALL: Text = ["滑动以安装", "滑動以安裝", "Slide to install"];
     let (label, danger) = match which {
+        Confirm::Maintenance => (["滑动确认写入", "滑動確認寫入", "Slide to confirm writing"], true),
         Confirm::Filesystem => match s.fs_action {
             FsAction::Repair => (["滑动以修复", "滑動以修復", "Slide to repair"], true),
             FsAction::Remake(_) => (["滑动以更换", "滑動以更換", "Slide to change"], true),
@@ -258,7 +264,25 @@ pub fn home(cx: &Ctx) -> Frame {
         rows.push(Row::new(l.pick(SECOND_FAILED)).icon(RED, Icon::Systems).subtitle(why).trail(Trail::Arrow));
         opens.push(Some(Action::Open(Screen::Systems)));
     }
-    let card = widgets::device_card(&mut c, t, f, y, &i.model, &sub, &rows);
+    // The strip of readings under the phone's name: the slot the recovery
+    // runs from, the data partition's lock, the room left on it and the
+    // battery's level, each as the stock settings home shows them.
+    let stats = [
+        widgets::Stat {
+            value: i.slot.map(|s| s.letter().to_string()).unwrap_or_else(|| l.pick(["未知", "不明", "Unknown"]).to_string()),
+            caption: l.pick(CURRENT_SLOT),
+        },
+        widgets::Stat { value: fmt::data(l, &cx.state.data).to_string(), caption: l.pick(DATA_STATE) },
+        widgets::Stat {
+            value: i.storage.free.map(fmt::bytes).unwrap_or_else(|| l.pick(["未知", "不明", "Unknown"]).to_string()),
+            caption: l.pick(FREE_SPACE),
+        },
+        widgets::Stat {
+            value: i.battery.as_ref().map(|b| format!("{}%", b.level)).unwrap_or_else(|| l.pick(["未知", "不明", "Unknown"]).to_string()),
+            caption: i.battery.as_ref().map(|b| fmt::charge(l, b.charge)).unwrap_or_else(|| l.pick(["无电池", "無電池", "No battery"])),
+        },
+    ];
+    let card = widgets::device_card(&mut c, t, f, y, &i.model, &sub, &stats, &rows);
     out.push(Hit { rect: card.rows[0], action: Action::Open(Screen::About) });
     out.extend(card.rows[1..].iter().zip(&opens).filter_map(|(&rect, open)| open.map(|action| Hit { rect, action })));
     y = card.bottom + t.m.card_gap;
@@ -270,6 +294,10 @@ pub fn home(cx: &Ctx) -> Frame {
     if let Some(w) = &cx.state.wlan {
         rows.push(Row::new(l.pick(WLAN)).icon(BLUE, Icon::Wlan).trail(Trail::Value(fmt::wlan_value(l, w))));
         opens.push(Action::Open(Screen::Wlan));
+    }
+    if let Some(mobile) = &cx.state.mobile {
+        rows.push(Row::new(l.pick(CELLULAR)).icon(GREEN,Icon::Phone).trail(Trail::Value(cellular_value(l,mobile))));
+        opens.push(Action::Open(Screen::Cellular));
     }
     let starts = systems_value(cx);
     if cx.state.offers(Screen::Systems) {
@@ -355,30 +383,94 @@ pub fn settings(cx: &Ctx) -> Frame {
     let top = t.m.content_top;
     let themes = widgets::theme_picker(&mut c, t, f, l, top + t.m.dp(8.9));
     out.extend(hits(&themes.rows, &[Action::Theme { dark: false }, Action::Theme { dark: true }]));
-    let mut y = widgets::section(&mut c, t, f, themes.bottom, l.pick(["亮度", "亮度", "Brightness"]));
+    let mut y = widgets::section(&mut c, t, f, themes.bottom, l.pick(["显示与亮度", "顯示與亮度", "Display & brightness"]));
     let off = fmt::screen_off(l, SCREEN_OFF[s.screen_off]);
     let below = Row::new(l.pick(SCREEN_TIMEOUT)).trail(Trail::Value(&off));
-    let slider = widgets::slider_card(&mut c, t, f, y, Caption::Sun, l.pick(["屏幕亮度", "螢幕亮度", "Screen brightness"]), s.brightness, Some(below));
+    let refresh = format!("{} Hz", s.refresh_rate);
+    let mut display_rows = vec![
+        Row::new(l.pick(["刷新率", "刷新率", "Refresh rate"]))
+            .icon(BLUE, Icon::Clock)
+            .trail(Trail::Choice(&refresh)),
+    ];
+    let mut display_actions = vec![Action::Open(Screen::RefreshRate)];
+    if s.hardware_double_tap {
+        display_rows.push(
+            Row::new(l.pick(["双击唤醒", "輕點兩下喚醒", "Double tap to wake"]))
+                .icon(ORANGE, Icon::Power)
+                .trail(Trail::Switch(s.double_tap_wake)),
+        );
+        display_actions.push(Action::Toggle(Switch::DoubleTapWake));
+    }
+    if s.panel_dozes {
+        display_rows.push(Row::new(l.pick(ALWAYS_ON)).icon(PURPLE, Icon::Clock).trail(Trail::Switch(s.always_on)));
+        display_actions.push(Action::Toggle(Switch::AlwaysOn));
+    }
+    let slider = widgets::slider_card(&mut c, t, f, y, Caption::Sun, l.pick(["屏幕亮度", "螢幕亮度", "Screen brightness"]), s.brightness, Some(below), &display_rows);
     out.push(Hit { rect: slider.track, action: Action::Slider(Slider::Brightness) });
     if let Some(r) = slider.below {
         out.push(Hit { rect: r, action: Action::Open(Screen::ScreenOff) });
     }
-    y = widgets::section(&mut c, t, f, slider.bottom, l.pick(["振动", "震動", "Vibration"]));
+    out.extend(hits(&slider.rows, &display_actions));
+    y = slider.bottom;
+    if let Some(issue) = &s.double_tap_issue {
+        y = widgets::footnote(&mut c, t, f, y, issue);
+    }
+    if s.panel_dozes {
+        let note = l.pick([
+            "屏幕熄灭后仍显示时间、电量、槽位与解密状态，背光保持关闭。",
+            "螢幕關閉後仍顯示時間、電量、槽位與解密狀態，背光保持關閉。",
+            "With the screen off, the time, the battery, the slot and the data partition stay on the glass, with the backlight out.",
+        ]);
+        y = widgets::footnote(&mut c, t, f, y, note);
+    }
+    if let Some(issue) = &s.aod_issue {
+        y = widgets::footnote(&mut c, t, f, y, issue);
+    }
+
+    y = widgets::section(&mut c, t, f, y, l.pick(["振动", "震動", "Vibration"]));
     let below = Row::new(l.pick(["触摸振动", "觸控震動", "Touch vibration"])).trail(Trail::Switch(s.vibrate));
-    let vibration = widgets::slider_card(&mut c, t, f, y, Caption::Vibrate, l.pick(["振动强度", "震動強度", "Vibration intensity"]), s.vibration, Some(below));
+    let vibration = widgets::slider_card(&mut c, t, f, y, Caption::Vibrate, l.pick(["振动强度", "震動強度", "Vibration intensity"]), s.vibration, Some(below), &[]);
     out.push(Hit { rect: vibration.track, action: Action::Slider(Slider::Vibration) });
     if let Some(r) = vibration.below {
         out.push(Hit { rect: r, action: Action::Toggle(Switch::Vibrate) });
     }
-    y = widgets::section(&mut c, t, f, vibration.bottom, l.pick(["通用", "一般", "General"]));
+    let mut y = vibration.bottom;
+    y = widgets::section(&mut c, t, f, y, l.pick(["数据与安全", "資料與安全", "Data & security"]));
+    let auto = widgets::list(&mut c, t, f, y, &[
+        Row::new(l.pick(["自动解密 Data", "自動解密 Data", "Open Data automatically"]))
+            .subtitle(l.pick(["开机后自动打开数据分区", "開機後自動開啟資料分割區", "Open the data partition at startup"]))
+            .trail(Trail::Switch(s.auto_decrypt)),
+    ]);
+    out.extend(hits(&auto.rows, &[Action::Toggle(Switch::AutoDecrypt)]));
+    y = auto.bottom;
+    y = widgets::section(&mut c, t, f, y, l.pick(["通用", "一般", "General"]));
     let general = widgets::list(&mut c, t, f, y, &[
         Row::new(l.pick(LANGUAGE)).icon(BLUE, Icon::Globe).trail(Trail::Value(l.name())),
         Row::new(l.pick(TIME_ZONE)).icon(ORANGE, Icon::Clock).trail(Trail::Value(l.pick(TIME_ZONES[s.time_zone].0))),
     ]);
-    out.extend(hits(&general.rows, &[Action::Open(Screen::Language), Action::Open(Screen::TimeZone)]));
+    out.extend(hits(&general.rows, &[
+        Action::Open(Screen::Language),
+        Action::Open(Screen::TimeZone),
+    ]));
     y = widgets::section(&mut c, t, f, general.bottom, "USB");
-    let usb = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(["文件传输", "檔案傳輸", "File transfer"])).icon(BLUE, Icon::Usb).trail(Trail::Switch(s.file_transfer))]);
-    out.extend(hits(&usb.rows, &[Action::Toggle(Switch::FileTransfer)]));
+    let adb = if s.wireless_adb {
+        match s.wlan.as_ref().and_then(|w| w.joined.as_ref()).and_then(|j| {
+            if let Joining::Connected(link) = &j.stage { Some(link.address) } else { None }
+        }) {
+            Some(address) => format!("adb connect {address}:5555"),
+            None => l.pick(["等待 WLAN 连接", "等待 Wi-Fi 連線", "Waiting for WLAN"]).to_string(),
+        }
+    } else {
+        l.pick(["关闭", "關閉", "Off"]).to_string()
+    };
+    let usb = widgets::list(&mut c, t, f, y, &[
+        Row::new(l.pick(["文件传输", "檔案傳輸", "File transfer"])).icon(BLUE, Icon::Usb).trail(Trail::Switch(s.file_transfer)),
+        Row::new(l.pick(["无线 ADB 调试", "無線 ADB 偵錯", "Wireless ADB"]))
+            .icon(SLATE, Icon::Terminal)
+            .subtitle(&adb)
+            .trail(Trail::Switch(s.wireless_adb)),
+    ]);
+    out.extend(hits(&usb.rows, &[Action::Toggle(Switch::FileTransfer), Action::Toggle(Switch::WirelessAdb)]));
     let note = l.pick([
         "开启后，可在电脑上管理内部存储中的文件，需先完成「解密」。",
         "開啟後，可在電腦上管理內部儲存空間中的檔案，需先完成「解密」。",
@@ -513,7 +605,7 @@ pub fn mount(cx: &Ctx) -> Frame {
 }
 
 /// Who made the recovery, as the About page names them under its version.
-const AUTHOR: &str = "© 2026 Kirk Lin";
+const AUTHOR: &str = "© 2026 Kirk Lin & DSL";
 
 /// About this device, modelled on the stock「我的设备」: the wordmark, the
 /// version and its author over a moving colour field, and the summary,
@@ -546,6 +638,8 @@ const RESOLUTION: Text = ["分辨率", "解析度", "Resolution"];
 const OS_VERSION: Text = ["OS 版本", "OS 版本", "OS version"];
 const ANDROID_VERSION: Text = ["Android 版本", "Android 版本", "Android version"];
 const CURRENT_SLOT: Text = ["当前槽位", "目前槽位", "Current slot"];
+const DATA_STATE: Text = ["数据分区", "資料分割區", "Data partition"];
+const FREE_SPACE: Text = ["可用空间", "可用空間", "Free space"];
 const DATA_PART: Text = ["data 分区", "data 分割區", "data partition"];
 
 /// The phone's processor by its marketing name in `l`, from the phone's
@@ -2199,7 +2293,7 @@ const STOP: Text = ["停止", "停止", "Stop"];
 /// Tools for the experienced.
 pub fn advanced(cx: &Ctx) -> Frame {
     let (t, f, l) = (cx.t, cx.f, cx.state.lang);
-    let mut c = page(cx);
+    let mut c = long_page(cx);
     let top = t.m.content_top;
     let tools = widgets::list(&mut c, t, f, top, &[
         Row::new(l.pick(FILES)).icon(BLUE, Icon::Folder),
@@ -2209,7 +2303,7 @@ pub fn advanced(cx: &Ctx) -> Frame {
         Row::new(l.pick(LOGS)).icon(ORANGE, Icon::Log),
         Row::new(l.pick(UPDATE)).icon(GREEN, Icon::Layers).trail(Trail::Value(update_value(cx))),
     ]);
-    let out = hits(&tools.rows, &[
+    let mut out = hits(&tools.rows, &[
         Action::Open(Screen::Files),
         Action::Open(Screen::Terminal),
         Action::Open(Screen::Relabel),
@@ -2217,7 +2311,87 @@ pub fn advanced(cx: &Ctx) -> Frame {
         Action::Open(Screen::Logs),
         Action::Open(Screen::Update),
     ]);
-    Frame::new(t, c, out, l.pick(ADVANCED), top)
+    let mut bottom = tools.bottom;
+    if cx.state.venus_maintenance {
+        let y = widgets::section(&mut c, t, f, bottom, l.pick(["启动维护", "啟動維護", "Boot maintenance"]));
+        let more = widgets::list(&mut c, t, f, y, &[
+            Row::new(maintenance_title(l, VenusMaintenance::DisableAvb)).icon(ORANGE, Icon::Shield),
+            Row::new(maintenance_title(l, VenusMaintenance::InstallRecovery)).icon(BLUE, Icon::Install),
+        ]);
+        out.extend(hits(&more.rows, &[
+            Action::Open(Screen::Maintenance(VenusMaintenance::DisableAvb)),
+            Action::Open(Screen::Maintenance(VenusMaintenance::InstallRecovery)),
+        ]));
+        bottom = more.bottom;
+    }
+    Frame::new(t, fit(c, t, bottom), out, l.pick(ADVANCED), top)
+}
+
+fn maintenance_title(l: Lang, action: VenusMaintenance) -> &'static str {
+    l.pick(match action {
+        VenusMaintenance::DisableAvb => ["禁用 AVB 验证", "停用 AVB 驗證", "Disable AVB verification"],
+        VenusMaintenance::InstallRecovery => ["安装当前 Recovery", "安裝目前 Recovery", "Install current Recovery"],
+    })
+}
+
+fn maintenance_body(cx: &Ctx, c: &mut Canvas) -> (Vec<Hit>, f32, bool) {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let top = t.m.content_top;
+    let mut out = Vec::new();
+    let Some(job) = &s.maintenance else {
+        let y = widgets::paragraph(c, t, f, top, l.pick(["尚未准备写入计划。", "尚未準備寫入計畫。", "No write plan is prepared."]));
+        return (out, y, true);
+    };
+    let (bottom, back) = match &job.phase {
+        MaintenancePhase::Preparing => {
+            let y = widgets::progress_card(c, t, f, top,
+                l.pick(["正在准备", "正在準備", "Preparing"]),
+                l.pick(["正在检查目标并准备备份，尚未修改目标分区。", "正在檢查目標並準備備份，尚未修改目標分割區。", "Checking targets and preparing backups. Target partitions have not been modified."]), None);
+            (y, false)
+        }
+        MaintenancePhase::Ready { summary } => {
+            let y = widgets::paragraph(c, t, f, top, summary);
+            let (label, danger) = confirm_label(Confirm::Maintenance, s);
+            let track = widgets::confirm(c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
+            out.push(Hit { rect: track, action: Action::Confirm(Confirm::Maintenance) });
+            (track.y + track.h, true)
+        }
+        MaintenancePhase::Writing { done, total } => {
+            let detail = if *total == 0 {
+                l.pick(["请等待完成，勿断电或重启。", "請等待完成，勿斷電或重新啟動。", "Wait for completion. Do not disconnect power or reboot."]).to_string()
+            } else { format!("{} / {}", fmt::file_size(*done), fmt::file_size(*total)) };
+            let y = widgets::progress_card(c, t, f, top, l.pick(["正在写入", "正在寫入", "Writing"]), &detail,
+                                          (*total != 0).then(|| share(*done, *total)));
+            (y, false)
+        }
+        MaintenancePhase::Finished { success, detail, write_started } => {
+            let title = l.pick(if *success { ["操作完成", "操作完成", "Completed"] } else { ["操作失败", "操作失敗", "Failed"] });
+            let y = widgets::section_first(c, t, f, top, title);
+            let mut y = widgets::paragraph(c, t, f, y, detail);
+            if !success && *write_started {
+                y = widgets::footnote(c, t, f, y, l.pick([
+                    "写入已开始，请查看上方结果与恢复说明。",
+                    "寫入已開始，請查看上方結果與復原說明。",
+                    "Writing had started. Review the result and recovery instructions above.",
+                ]));
+            }
+            let finished = widgets::list(c, t, f, y + t.m.card_gap, &[Row::new(l.pick(DONE)).trail(Trail::None)]);
+            out.extend(hits(&finished.rows, &[Action::Back]));
+            (finished.bottom, true)
+        }
+    };
+    (out, bottom, back)
+}
+
+pub fn maintenance(cx: &Ctx, action: VenusMaintenance) -> Frame {
+    let t = cx.t;
+    // Measure the complete backend plan, then allocate its actual height.
+    // A fixed three-screen canvas can silently cut off hashes or targets.
+    let mut measure = Canvas::band(t.m.w, 1, 0..0, 0..t.m.w, t.pal.bg);
+    let (_, bottom, _) = maintenance_body(cx, &mut measure);
+    let mut canvas = sheet(cx, fitted(t, bottom), t.pal.bg);
+    let (hits, _, back) = maintenance_body(cx, &mut canvas);
+    Frame { back, ..Frame::new(t, canvas, hits, maintenance_title(cx.state.lang, action), t.m.content_top) }
 }
 
 const RELABEL: Text = ["修复 SELinux 上下文", "修復 SELinux 上下文", "Fix SELinux contexts"];
@@ -2603,7 +2777,8 @@ pub fn update(cx: &Ctx) -> Frame {
 
 /// What downloading or checking for updates needs first, while the phone
 /// has joined no network that reaches the internet.
-const WLAN_FIRST: Text = ["需先连接 WLAN", "需先連接 Wi-Fi", "Connect to Wi-Fi first"];
+const WLAN_FIRST: Text = ["需先连接网络", "需先連接網路", "Connect to a network first"];
+const ALWAYS_ON: Text = ["息屏显示", "螢幕關閉顯示", "Always-on display"];
 const CHECKING: Text = ["正在检查更新", "正在檢查更新", "Checking for updates"];
 const CHECK_FOR_UPDATES: Text = ["检查更新", "檢查更新", "Check for updates"];
 const DOWNLOADING: Text = ["正在下载", "正在下載", "Downloading"];
@@ -2873,6 +3048,132 @@ fn skyward_online(c: &mut Canvas, cx: &Ctx, y: f32, out: &mut Vec<Hit>) -> f32 {
 
 /// The WLAN switch; then the network chosen and how joining it goes, and
 /// the networks in range, strongest first.
+const CELLULAR: Text = ["SIM 卡与移动网络", "SIM 卡與行動網路", "SIM & mobile network"];
+
+fn cellular_value(l: Lang, mobile: &skyward_net::mobile::Mobile) -> &'static str {
+    use skyward_net::modem::Phase;
+    if let Some(modem) = &mobile.modem {
+        match modem.radio {
+            Phase::Off => return l.pick(["已关闭", "已關閉", "Off"]),
+            Phase::Starting => return l.pick(["正在开启", "正在開啟", "Starting"]),
+            Phase::Stopping => return l.pick(["正在关闭", "正在關閉", "Stopping"]),
+            Phase::Failed => return l.pick(["连接失败", "連線失敗", "Failed"]),
+            Phase::Ready => {}
+        }
+    }
+    if mobile.checking { l.pick(["正在读取", "正在讀取", "Reading"]) }
+    else if !mobile.available { l.pick(["未就绪", "未就緒", "Not ready"]) }
+    else if mobile.registered() { l.pick(["已注册", "已註冊", "Registered"]) }
+    else { l.pick(["未注册", "未註冊", "Not registered"]) }
+}
+
+pub fn cellular(cx: &Ctx) -> Frame {
+    let (t,f,l) = (cx.t,cx.f,cx.state.lang);
+    let mobile = cx.state.mobile.as_ref().expect("SIM page requires a real modem reader");
+    let mut c = long_page(cx);
+    let top = t.m.content_top;
+    let mut y = top;
+    let mut out = Vec::new();
+    if let Some(modem) = &mobile.modem {
+        use skyward_net::modem::Phase;
+        let phase = |p: &Phase| match p {
+            Phase::Off => l.pick(["已关闭", "已關閉", "Off"]),
+            Phase::Starting => l.pick(["正在开启", "正在開啟", "Starting"]),
+            Phase::Ready => l.pick(["已开启", "已開啟", "On"]),
+            Phase::Stopping => l.pick(["正在关闭", "正在關閉", "Stopping"]),
+            Phase::Failed => l.pick(["失败，可重试", "失敗，可重試", "Failed; retry available"]),
+        };
+        let waiting = l.pick(["正在处理", "正在處理", "Working"]);
+        let pending = cx.state.cellular_pending.as_ref();
+        let radio_note = if pending.is_some_and(|p| matches!(p.command,crate::app::CellularCommand::Radio(_))) { waiting } else { phase(&modem.radio) };
+        let data_note = if pending.is_some_and(|p| matches!(p.command,crate::app::CellularCommand::Data(_))) { waiting } else { phase(&modem.data) };
+        let busy = pending.is_some() || matches!(modem.radio,Phase::Starting|Phase::Stopping) || matches!(modem.data,Phase::Starting|Phase::Stopping);
+        let controls = widgets::list(&mut c,t,f,y,&[
+            Row::new(l.pick(["移动网络", "行動網路", "Mobile network"])).subtitle(radio_note).trail(Trail::Switch(matches!(modem.radio,Phase::Ready|Phase::Starting))),
+            Row::new(l.pick(["移动数据", "行動數據", "Mobile data"])).subtitle(data_note).trail(Trail::Switch(matches!(modem.data,Phase::Ready|Phase::Starting))),
+        ]);
+        if !busy {
+            out.push(Hit { rect:controls.rows[0],action:Action::CellularRadio });
+            if modem.radio == Phase::Ready { out.push(Hit { rect:controls.rows[1],action:Action::CellularData }); }
+        }
+        y = controls.bottom;
+        y = widgets::footnote(&mut c,t,f,y,l.pick(["移动数据使用当前默认订阅，可能产生流量费用。WLAN 连接可用时优先使用 WLAN。", "行動數據使用目前預設訂閱，可能產生數據費用。Wi-Fi 連線可用時優先使用 Wi-Fi。", "Mobile data uses the current default subscription and may incur data charges. Wi-Fi is preferred while connected."]));
+        if let Some(why) = &modem.issue { y = widgets::footnote(&mut c,t,f,y,why); }
+        if let Some(address) = modem.address.filter(|_| modem.data == Phase::Ready) {
+            y = widgets::list(&mut c,t,f,y,&[Row::new(l.pick(["数据地址", "數據位址", "Data address"])).trail(Trail::Text(&address.to_string()))]).bottom;
+        }
+    }
+    let (next,refresh) = widgets::section_action(&mut c,t,f,y,l.pick(["当前网络", "目前網路", "Current network"]),l.pick(["刷新", "重新整理", "Refresh"]));
+    y = next;
+    out.push(Hit { rect:refresh,action:Action::RefreshCellular });
+    let unknown = l.pick(["未知", "不明", "Unknown"]);
+    let mut values: Vec<(Text,String)> = vec![(["注册状态", "註冊狀態", "Registration"],cellular_value(l,mobile).to_string())];
+    if let Some(network) = &mobile.network {
+        let state = match network.registration_state {
+            0 => unknown,1 => l.pick(["已注册", "已註冊", "Registered"]),2 => l.pick(["正在搜索", "正在搜尋", "Searching"]),
+            3 => l.pick(["注册被拒绝", "註冊遭拒", "Registration denied"]),_ => l.pick(["未注册", "未註冊", "Not registered"]),
+        };
+        values[0].1 = state.to_string();
+        values.push((["网络类型", "網路類型", "Network type"],mobile.technology().to_string()));
+        if mobile.registered() {
+            if let Some(plmn) = &network.plmn {
+                values.push((["运营商", "電信業者", "Operator"],if plmn.description.is_empty() { unknown.to_string() } else { plmn.description.clone() }));
+                let code = match plmn.three_digit_mnc {
+                    Some(true) => format!("{:03}-{:03}",plmn.mcc,plmn.mnc),
+                    Some(false) => format!("{:03}-{:02}",plmn.mcc,plmn.mnc),
+                    None => format!("MCC {} / MNC {}",plmn.mcc,plmn.mnc),
+                };
+                values.push((["网络代码", "網路代碼", "Network code"],code));
+            }
+            let signal = mobile.measured().map(|(kind,dbm)| format!("{dbm} dBm ({kind})")).unwrap_or_else(|| unknown.to_string());
+            values.push((["信号强度", "訊號強度", "Signal strength"],signal));
+            let attached = match network.packet_attach_state { 1 => l.pick(["已附着", "已附著", "Attached"]),2 => l.pick(["未附着", "未附著", "Detached"]),_ => unknown };
+            values.push((["数据网络注册", "數據網路註冊", "Packet network"],attached.to_string()));
+            let roaming = match network.roaming { Some(0) => l.pick(["漫游中", "漫遊中", "Roaming"]),Some(1) => l.pick(["本地网络", "本地網路", "Home network"]),_ => unknown };
+            values.push((["漫游状态", "漫遊狀態", "Roaming"],roaming.to_string()));
+        }
+    }
+    let rows: Vec<_> = values.iter().map(|(label,value)| Row::new(l.pick(*label)).trail(Trail::Text(value))).collect();
+    y = widgets::list(&mut c,t,f,y,&rows).bottom;
+    if let Some(why) = &mobile.issue {
+        y = widgets::footnote(&mut c,t,f,y,why);
+    } else if !mobile.available && mobile.modem.as_ref().is_none_or(|m| m.radio != skyward_net::modem::Phase::Off) {
+        y = widgets::footnote(&mut c,t,f,y,l.pick(["基带尚未就绪，卡信息将在就绪后更新。", "數據機尚未就緒，SIM 資訊將在就緒後更新。", "The modem is not ready. SIM information will update when it becomes available."]));
+    }
+    if let Some(cards) = &mobile.cards {
+        for card in cards {
+            let label = format!("SIM {}",card.slot);
+            y = widgets::section(&mut c,t,f,y,&label);
+            let state = match card.state {
+                0 => l.pick(["未插卡", "未插卡", "No SIM"]),
+                1 if card.applications.iter().any(|a| a.state == 7) => l.pick(["已就绪", "已就緒", "Ready"]),
+                1 => l.pick(["已插卡", "已插卡", "Present"]),
+                2 => l.pick(["卡片错误", "SIM 卡錯誤", "SIM error"]),
+                _ => unknown,
+            };
+            let mut values = vec![(["卡状态", "SIM 狀態", "SIM state"],state)];
+            if let Some(app) = card.applications.iter().find(|a| matches!(a.kind,1|2)).or(card.applications.first()) {
+                let kind = match app.kind { 1 => "SIM",2 => "USIM",3 => "RUIM",4 => "CSIM",5 => "ISIM",_ => unknown };
+                values.push((["卡类型", "SIM 類型", "SIM type"],kind));
+                let pin = if app.universal_pin_replaces_pin1 { card.universal_pin_state } else { app.pin1_state };
+                let pin = match pin {
+                    1 => l.pick(["需要 PIN", "需要 PIN", "PIN required"]),2 => l.pick(["已验证", "已驗證", "Verified"]),
+                    3 => l.pick(["未启用", "未啟用", "Disabled"]),4 => l.pick(["需要 PUK", "需要 PUK", "PUK required"]),
+                    5 => l.pick(["已锁定", "已鎖定", "Blocked"]),_ => unknown,
+                };
+                values.push((["PIN 状态", "PIN 狀態", "PIN state"],pin));
+            }
+            let rows: Vec<_> = values.iter().map(|(label,value)| Row::new(l.pick(*label)).trail(Trail::Text(value))).collect();
+            y = widgets::list(&mut c,t,f,y,&rows).bottom;
+        }
+    } else if mobile.available {
+        y = widgets::footnote(&mut c,t,f,y,l.pick(["暂时无法读取 SIM 卡信息。", "暫時無法讀取 SIM 卡資訊。", "SIM information is temporarily unavailable."]));
+    }
+    // Slot selection and APN editing remain absent: the owned data call
+    // uses the modem's current default subscription, without altering it.
+    Frame::new(t,fit(c,t,y),std::mem::take(&mut out),l.pick(CELLULAR),top)
+}
+
 pub fn wlan(cx: &Ctx) -> Frame {
     let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
     let w = s.wlan.as_ref().expect("the WLAN page shows on a phone whose WLAN is brought up");
@@ -2899,7 +3200,7 @@ pub fn wlan(cx: &Ctx) -> Frame {
             // The network chosen stands out in the accent, as the stock
             // page shows the one it is on.
             if let Some(j) = &w.joined {
-                let found = w.networks.iter().find(|n| n.ssid == j.ssid);
+                let found = w.networks.iter().find(|n| n.ssid == j.ssid && n.security == j.security);
                 let (signal, bands) = match (&j.stage, found) {
                     (Joining::Connected(link), found) => (Some(link.signal), found.map_or(Bands::of(link.frequency), |n| n.bands)),
                     (_, Some(n)) => (Some(n.signal), n.bands),
@@ -2921,8 +3222,9 @@ pub fn wlan(cx: &Ctx) -> Frame {
                     y = widgets::footnote(&mut c, t, f, y, &note);
                 }
             }
-            let others: Vec<(usize, &Network)> =
-                w.networks.iter().enumerate().filter(|(_, n)| w.joined.as_ref().is_none_or(|j| j.ssid != n.ssid)).collect();
+            let others: Vec<(NetworkKey, &Network)> = w.networks.iter()
+                .filter(|n| w.joined.as_ref().is_none_or(|j| j.ssid != n.ssid || j.security != n.security))
+                .filter_map(|n| NetworkKey::of(n).map(|key| (key, n))).collect();
             let nearby = l.pick(["选取附近的 WLAN", "選擇附近的 Wi-Fi 網路", "Choose a nearby network"]);
             let (below, rescan) = widgets::section_action(&mut c, t, f, y, nearby, l.pick(["刷新", "重新整理", "Refresh"]));
             out.push(Hit { rect: rescan, action: Action::Rescan });
@@ -3038,7 +3340,7 @@ pub fn wlan_network(cx: &Ctx) -> Frame {
     let mut out = Vec::new();
     let top = t.m.content_top;
     let network = s.details.as_ref().expect("the details page is of a network");
-    let joined = s.wlan.as_ref().and_then(|w| w.joined.as_ref()).filter(|j| j.ssid == network.ssid);
+    let joined = s.wlan.as_ref().and_then(|w| w.joined.as_ref()).filter(|j| j.ssid == network.ssid && j.security == network.security);
     let y = widgets::section_first(&mut c, t, f, top, &network.name);
     let detail = |icon, title, value: String| Detail { icon, title, value };
     let security = detail(Outline::Shield, l.pick(SECURITY), fmt::security(l, network.security).to_string());
@@ -3478,6 +3780,31 @@ pub fn time_zone(cx: &Ctx) -> Frame {
     let note = l.pick(["状态栏和各页面中的时间按所选时区显示。", "狀態列和各頁面中的時間按所選時區顯示。", "The status bar and the pages tell times in the zone chosen."]);
     let bottom = widgets::footnote(&mut c, t, f, list.bottom, note);
     Frame::new(t, fit(c, t, bottom), out, l.pick(TIME_ZONE), top)
+}
+
+/// The panel refresh rate.
+pub fn refresh_rate(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let mut c = page(cx);
+    let top = t.m.content_top;
+    let rates = [60u32, 90, 120];
+    let labels = ["60 Hz", "90 Hz", "120 Hz"];
+    let rows: Vec<Row> = rates
+        .iter()
+        .zip(labels)
+        .map(|(&hz, label)| {
+            let note = match hz {
+                60 => l.pick(["更省电", "更省電", "Most power efficient"]),
+                90 => l.pick(["平衡", "平衡", "Balanced"]),
+                _ => l.pick(["最流畅", "最流暢", "Smoothest"]),
+            };
+            Row::new(label).subtitle(note).trail(Trail::Check(s.refresh_rate == hz))
+        })
+        .collect();
+    let list = widgets::list(&mut c, t, f, top, &rows);
+    let picks: Vec<Action> = rates.iter().copied().map(Action::RefreshRate).collect();
+    let out = hits(&list.rows, &picks);
+    Frame::new(t, c, out, l.pick(["刷新率", "刷新率", "Refresh rate"]), top)
 }
 
 /// Saving the logs, as a bug report asks for them.

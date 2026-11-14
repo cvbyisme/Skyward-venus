@@ -5,7 +5,7 @@
 //! a time zone, a part or a place by its name, so a later version that lists
 //! them otherwise reads them the same.
 
-use crate::app::{Place, State, SCREEN_OFF, TIME_ZONES};
+use crate::app::{Place, SavedWlan, State, SCREEN_OFF, TIME_ZONES};
 use crate::Lang;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -49,6 +49,21 @@ pub struct Settings {
     pub vibration: f32,
     /// A computer connected over USB is offered internal storage.
     pub file_transfer: bool,
+    /// A dark panel keeps the clock and the phone's readings on the glass in
+    /// the panel's own doze, rather than being put out.
+    pub always_on: bool,
+    pub double_tap_wake: bool,
+    /// Open the data partition as the recovery starts.
+    pub auto_decrypt: bool,
+    /// The network saved once a join succeeded, for the next start.
+    pub saved_wlan: Option<SavedWlan>,
+    /// The owner's screen-lock credential, kept for auto-unlocking the
+    /// encrypted user storage. The settings file is root-only on /metadata.
+    pub saved_lock: Option<String>,
+    /// adbd listens on the WLAN address for wireless debugging.
+    pub wireless_adb: bool,
+    /// The panel refresh rate.
+    pub refresh_rate: u32,
     pub install: Install,
     pub backup: Backup,
     pub logs: Logs,
@@ -126,6 +141,13 @@ impl Settings {
             vibrate: state.vibrate,
             vibration: state.vibration,
             file_transfer: state.file_transfer,
+            always_on: state.always_on,
+            double_tap_wake: state.double_tap_wake,
+            auto_decrypt: state.auto_decrypt,
+            saved_wlan: state.saved_wlan.clone(),
+            saved_lock: state.saved_lock.clone(),
+            wireless_adb: state.wireless_adb,
+            refresh_rate: state.refresh_rate,
             install: Install { check_signature: state.check_signature, keep_recovery: state.keep_recovery },
             backup: Backup {
                 parts: names(&state.backup, &PARTS),
@@ -184,6 +206,13 @@ impl Settings {
             state.vibration = self.vibration;
         }
         state.file_transfer = self.file_transfer;
+        state.always_on = self.always_on;
+        state.double_tap_wake = self.double_tap_wake;
+        state.auto_decrypt = self.auto_decrypt;
+        state.saved_wlan = self.saved_wlan.clone();
+        state.saved_lock = self.saved_lock.clone();
+        state.wireless_adb = self.wireless_adb;
+        state.refresh_rate = match self.refresh_rate { 60 | 90 | 120 => self.refresh_rate, _ => 120 };
         state.check_signature = self.install.check_signature;
         state.keep_recovery = self.install.keep_recovery;
         state.backup = picked(&self.backup.parts, &PARTS);
@@ -308,6 +337,15 @@ mod tests {
             vibrate: false,
             vibration: 0.4,
             file_transfer: false,
+            auto_decrypt: true,
+            wireless_adb: true,
+            saved_wlan: Some(SavedWlan {
+                ssid: b"Skyward".to_vec(),
+                name: "Skyward".into(),
+                security: "psk".into(),
+                password: "correct horse".into(),
+            }),
+            saved_lock: Some("1234".into()),
             check_signature: true,
             keep_recovery: false,
             backup: [false, true, true, false],
@@ -323,6 +361,10 @@ mod tests {
         kept.apply(&mut back);
         assert_eq!(Settings::of(&back), Settings::of(&state));
         assert_eq!((back.lang, back.screen_off, back.time_zone), (Lang::En, 6, 7));
+        assert!(back.auto_decrypt);
+        assert!(back.wireless_adb);
+        assert_eq!(back.saved_wlan.as_ref().map(|w| w.name.as_str()), Some("Skyward"));
+        assert_eq!(back.saved_lock.as_deref(), Some("1234"));
     }
 
     #[test]

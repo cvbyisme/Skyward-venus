@@ -1,0 +1,61 @@
+[
+  {
+    "name": "venus-official",
+    "repository": "https://github.com/TeamWin/android_device_xiaomi_venus.git",
+    "branch": "android-11",
+    "commit": "30f2f2cd4d187dab64cc89fa98bc25fd18de05fa",
+    "commit_date": "2021-12-21",
+    "local_path": "/home/abc/SKYWARD/twrp-reference.quQzxF/venus-official",
+    "files": {}
+  },
+  {
+    "name": "sm8350-common",
+    "repository": "https://github.com/TeamWin/android_device_xiaomi_sm8350-common.git",
+    "branch": "android-11",
+    "commit": "696cf9fdf563f83830e99a04dedb9e61d9746546",
+    "commit_date": "2022-02-07",
+    "local_path": "/home/abc/SKYWARD/twrp-reference.quQzxF/sm8350-common",
+    "files": {
+      "BoardConfigCommon.mk": "b1ebc561e9f4c47d26209eaf163377c364e9d1f81264e4bf22d36ffd8797005c",
+      "twrp/recovery/root/system/etc/recovery.fstab": "70660ccf122d3684d976a7a5840ecdf353841d2f023262c02407f4fb34d0934e"
+    }
+  },
+  {
+    "name": "venus-sekai",
+    "repository": "https://github.com/sekaiacg/android_device_xiaomi_venus_TWRP.git",
+    "branch": "android-13",
+    "commit": "0fcc985756e69b68c8d5eef988ca22b1ee1a3186",
+    "commit_date": "2024-11-02",
+    "local_path": "/home/abc/SKYWARD/twrp-reference.quQzxF/venus-sekai",
+    "files": {
+      "BoardConfig.mk": "7819f940f0ca6ba67ab9b561665b55b6630495b8f6482fab3aad827200b26132",
+      "recovery/root/init.recovery.qcom.rc": "485bcf022da2a7ff5c72ce623cc368e73c91b0ad161c9e428e77085e6f8a2698",
+      "recovery/root/system/etc/recovery.fstab": "2b6331166b9d93cebceef1347a3d1c1dbfba15cf5b82165391ed9fe762723ed5"
+    }
+  },
+  {
+    "name": "recovery-core",
+    "repository": "https://github.com/TeamWin/android_bootable_recovery.git",
+    "branch": "android-12.1",
+    "commit": "5c3d206a5eeb3d446bcda8248a405a4b278bab5c",
+    "commit_date": "2025-09-02",
+    "local_path": "/home/abc/SKYWARD/twrp-reference.quQzxF/recovery-core",
+    "files": {
+      "partitionmanager.cpp": "755538163751ee7e0c5a614e6016de0bf456a2f8f4f011c4089cf20f14e250d9",
+      "partition.cpp": "a3918ab68581bff78d000f4cc6f05d6acd60f29f410a0b035b6e9c7e367c3f01"
+    }
+  },
+  {
+    "name": "vold",
+    "repository": "https://github.com/TeamWin/android_system_vold.git",
+    "branch": "android-12.1",
+    "commit": "a164ba05c5fef288059774a776b2e6e1119957cf",
+    "commit_date": "2025-02-22",
+    "local_path": "/home/abc/SKYWARD/twrp-reference.quQzxF/vold",
+    "files": {
+      "MetadataCrypt.cpp": "f348fadb4f96a0e924611860565fd98b7c80c3ca51fc518300b10a3236a3ee8f",
+      "KeyStorage.cpp": "13014df0b7abcc4eab679f6a5a6ef0bdcfae9889224a1bee2c3a112f819bfc1d",
+      "KeyUtil.cpp": "20cdf4122e33d13f32eeac128583b1379b9185e435d5825b94042e2e3f00fcad"
+    }
+  }
+]

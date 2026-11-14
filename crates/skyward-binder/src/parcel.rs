@@ -5,6 +5,17 @@ use anyhow::{bail, Context, Result};
 /// the recovery's own programs are built from is the recovery copy.
 const HEADER: i32 = i32::from_be_bytes(*b"RECO");
 
+// A port may run the installed system's service manager and AIDL HALs in
+// an isolated runtime. Those binaries use the system libbinder ABI, not
+// the recovery libbinder ABI. The runtime sets this only after selecting
+// its actual binaries; there is no transaction retry with another ABI.
+fn header_for(domain: Option<&str>) -> i32 {
+    match domain {
+        Some("system") => i32::from_be_bytes(*b"SYST"),
+        _ => HEADER,
+    }
+}
+
 /// Strict mode gathers violations rather than acting on them; a caller with
 /// no policy of its own still sets that bit.
 const STRICT_MODE_PENALTY_GATHER: i32 = i32::MIN;
@@ -76,7 +87,7 @@ impl Parcel {
         let mut p = Parcel::default();
         p.i32(STRICT_MODE_PENALTY_GATHER);
         p.i32(UNSET_WORK_SOURCE);
-        p.i32(HEADER);
+        p.i32(header_for(skyward_sys::prop("skyward.binder.domain").as_deref()));
         p.string(interface);
         p
     }
@@ -305,6 +316,13 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_and_recovery_binder_headers_are_distinct() {
+        assert_eq!(header_for(Some("system")), i32::from_be_bytes(*b"SYST"));
+        assert_eq!(header_for(None), HEADER);
+        assert_eq!(header_for(Some("recovery")), HEADER);
+    }
 
     #[test]
     fn a_call_opens_with_the_header_and_the_interface_name() {

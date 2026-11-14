@@ -7,6 +7,11 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 mod avb;
+use skyward_bootimg as ramdisk;
+mod venus_first_stage;
+mod venus_probe;
+mod venus_ui;
+mod venus_recovery;
 mod described;
 
 use skyward_bootimg::{BootImage, Ramdisk};
@@ -28,6 +33,8 @@ enum Cmd {
     /// Unpack and pack an image's ramdisk unchanged, to check that a rebuilt
     /// archive keeps every entry.
     Repack { image: PathBuf, out: PathBuf },
+    /// Reconstruct the normal installer image from RAM contents and compare every byte.
+    CapsuleVerify { image: PathBuf, normal: PathBuf },
     /// Join a kernel and another image's ramdisk into one boot image.
     Boot {
         /// Image holding the kernel (the device's boot partition).
@@ -48,6 +55,33 @@ enum Cmd {
         /// phone or a full update package holds it, ending in its AVB footer.
         #[arg(long)]
         stock: PathBuf,
+        /// AVB target: dedicated recovery or Recovery-as-Boot.
+        #[arg(long, default_value = "recovery")]
+        partition: String,
+        /// TEMPORARY venus probe: patch the known init to retain recovery root.
+        /// Never flash this as a daily-use boot; CLI only unless --venus-ui is added.
+        #[arg(long)]
+        venus_probe: bool,
+        /// Start the isolated, non-destructive menus in the temporary venus probe.
+        #[arg(long, requires = "venus_probe")]
+        venus_ui: bool,
+        /// Enable the venus basic read-only tools and persistent UI settings.
+        #[arg(long, requires = "venus_ui")]
+        venus_basic: bool,
+        /// Bundle the proven venus HAL runtime and use real RW Data/UI backend.
+        #[arg(long, requires = "venus_basic")]
+        venus_recovery_assets: Option<PathBuf>,
+        /// Keep stock first-stage init for the normal-boot-compatible candidate.
+        #[arg(long, requires = "venus_recovery_assets")]
+        venus_normal_entry: bool,
+        /// Embed a finite capsule able to reinstall this exact build with original init.
+        #[arg(long, requires = "venus_recovery_assets")]
+        venus_install_capsule: bool,
+        /// Write a standalone fastboot-bootable REC image: v3 header, device
+        /// kernel, and a ramdisk that forces Skyward Recovery, without the
+        /// full-partition AVB footer/padding or normal-entry installer capsule.
+        #[arg(long)]
+        standalone: bool,
         /// Skyward built for the device (aarch64-linux-android).
         #[arg(long)]
         binary: PathBuf,
@@ -120,15 +154,57 @@ fn main() -> Result<()> {
             img.ramdisk = Ramdisk::decode(&img.ramdisk)?.encode()?;
             write(&out, &img, &img.to_bytes()?)
         }
+        Cmd::CapsuleVerify { image, normal } => {
+            let bytes = std::fs::read(&image)?;
+            ensure!(bytes.len() == skyward_bootimg::capsule::PARTITION_SIZE, "wrong capsule carrier size");
+            let rd = Ramdisk::decode_bounded(&BootImage::parse(&bytes)?.ramdisk, 512 * 1024 * 1024, 8192)?;
+            let get = |name: &str| rd.find(name).with_context(|| format!("missing capsule input {name}"));
+            let rebuilt = skyward_bootimg::capsule::rebuild(
+                &get(skyward_bootimg::capsule::TEMPLATE_PATH)?.data,
+                &get(skyward_bootimg::capsule::MANIFEST_PATH)?.data,
+                &get(paths::RECOVERY)?.data, |p| Ok(get(&p.path)?.data.clone()))?;
+            ensure!(rebuilt == std::fs::read(&normal)?, "RAM capsule does not reconstruct the complete normal image byte-for-byte");
+            println!("PASS capsule_normal_byte_identity size={} sha256={}", rebuilt.len(), skyward_bootimg::capsule::sha256(&rebuilt));
+            Ok(())
+        }
         Cmd::Boot { kernel, ramdisk, out } => {
             let mut img = BootImage::read(&ramdisk)?;
             img.kernel = BootImage::read(&kernel)?.kernel;
             write(&out, &img, &img.to_bytes()?)
         }
-        Cmd::Recovery { stock, binary, system_init, config, font, mono, mono_license, out } => {
+        Cmd::Recovery { stock, partition, binary, system_init, config, font, mono, mono_license, out, venus_probe, venus_ui, venus_basic, venus_recovery_assets, venus_normal_entry, venus_install_capsule, standalone } => {
+            if venus_probe {
+                ensure!(partition == "boot", "--venus-probe requires --partition boot");
+                ensure!(skyward_config::DeviceConfig::load(&config)?.device.codename == "venus",
+                        "--venus-probe is only for venus");
+            }
+            if venus_ui {
+                let display = skyward_config::DeviceConfig::load(&config)?.display;
+                ensure!(venus_probe, "--venus-ui requires --venus-probe");
+                ensure!((display.width, display.height) == (1440, 3200)
+                        && (160..=800).contains(&display.density),
+                        "venus UI requires observed 1440x3200 geometry and a valid density");
+            }
+            ensure!(
+                matches!(partition.as_str(), "recovery" | "boot"),
+                "target partition must be recovery or boot, not {partition}"
+            );
+            ensure!(
+                !standalone || (partition == "boot"
+                    && venus_probe
+                    && venus_recovery_assets.is_some()
+                    && !venus_normal_entry
+                    && !venus_install_capsule),
+                "standalone REC requires a forced-recovery Venus build with integrated assets, and cannot include normal-entry or installer-capsule content"
+            );
             let size = partition_size(&stock)?;
             let mut img = BootImage::read(&stock)?;
+            ensure!(partition != "boot" || !img.kernel.is_empty(),
+                    "--partition boot requires a kernel");
             let mut rd = Ramdisk::decode(&img.ramdisk)?;
+            let native_init = if venus_recovery_assets.is_some() {
+                rd.find("system/bin/init").context("original first-stage init missing")?.data.clone()
+            } else { Vec::new() };
             // A stock recovery ramdisk has no third-party tree; refuse to build
             // on top of another custom recovery.
             if let Some(e) = rd.entries.iter().find(|e| e.name == "FFiles" || e.name.starts_with("twres")) {
@@ -154,7 +230,19 @@ fn main() -> Result<()> {
             if rd.find(paths::TASK_PROFILES).is_none() {
                 rd.add(paths::TASK_PROFILES, 0o644, TASK_PROFILES.to_vec())?;
             }
-            rd.add(paths::MTP_RC, 0o644, MTP_RC.to_vec())?;
+            if venus_probe {
+                ensure!(img.header.header_version() == 3, "venus probe requires boot header v3");
+                venus_probe::prepare(&mut rd)?;
+                if venus_ui {
+                    venus_ui::prepare(&mut rd)?;
+                    if venus_basic { venus_ui::enable_basic(&mut rd)?; }
+                }
+            } else {
+                rd.add(paths::MTP_RC, 0o644, MTP_RC.to_vec())?;
+            }
+            if let Some(assets) = &venus_recovery_assets {
+                venus_recovery::prepare(&mut rd, assets, venus_normal_entry, &native_init)?;
+            }
             // On an unlocked device adbd keeps root when ro.secure is 0 and
             // lets any computer in without authorization when ro.adb.secure is
             // 0; init lets a later line of a property file override an earlier
@@ -168,9 +256,30 @@ fn main() -> Result<()> {
             let mut props = without(stock_props, &BUILD_VERSION);
             props.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n");
             rd.replace(paths::PROP_DEFAULT, props)?;
+            if venus_install_capsule {
+                ensure!(venus_recovery_assets.is_some() && partition == "boot" && size == skyward_bootimg::capsule::PARTITION_SIZE,
+                    "Venus capsule requires the complete integrated boot partition");
+                // The temporary carrier differs only in its init entry and entry marker.
+                // Build the capsule from the normal counterpart, then restore this carrier.
+                let selected_init = rd.find("system/bin/init").context("first-stage init missing")?.data.clone();
+                let selected_marker = rd.find("skyward/venus-recovery.txt").context("Recovery marker missing")?.data.clone();
+                let marker = std::str::from_utf8(&selected_marker)?.replace(
+                    "entry=temporary_forced_recovery\n", "entry=original_init\n");
+                rd.replace("system/bin/init", native_init.clone())?;
+                rd.replace("skyward/venus-recovery.txt", marker.into_bytes())?;
+                img.ramdisk = rd.encode()?;
+                let capsule = skyward_bootimg::capsule::create(&img)?;
+                rd.replace("system/bin/init", selected_init)?;
+                rd.replace("skyward/venus-recovery.txt", selected_marker)?;
+                skyward_bootimg::capsule::attach(&mut rd, &capsule)?;
+            }
             img.ramdisk = rd.encode()?;
             let bytes = img.to_bytes()?;
-            write(&out, &img, &avb::footed(&bytes, "recovery", size, &Sha256::digest(&bytes))?)
+            if standalone {
+                write(&out, &img, &bytes)
+            } else {
+                write(&out, &img, &avb::footed(&bytes, &partition, size, &Sha256::digest(&bytes))?)
+            }
         }
         Cmd::Stock { config, out } => {
             let stock = skyward_config::DeviceConfig::load(&config)?.stock.with_context(|| format!("{} names no stock build", config.display()))?;
@@ -304,6 +413,34 @@ fn list(image: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn basic_features_require_ui_and_probe() {
+        let args = ["skyward-pack", "recovery", "--stock", "stock", "--binary", "binary", "--system-init", "system-init", "--config", "config", "--font", "font", "--mono", "mono", "--mono-license", "license", "--out", "out", "--venus-basic"];
+        assert!(Cli::try_parse_from(args).is_err());
+        let mut args = args.to_vec(); args.extend(["--venus-ui", "--venus-probe"]);
+        assert!(Cli::try_parse_from(args).is_ok());
+    }
+
+
+    #[test]
+    fn ui_autostart_requires_an_explicit_probe_flag() {
+        let mut args = vec!["skyward-pack", "recovery", "--stock", "boot.img", "--binary", "skyward", "--system-init", "system-init",
+            "--config", "venus.toml", "--font", "font", "--mono", "mono", "--mono-license", "license",
+            "--out", "new.img", "--partition", "boot", "--venus-ui"];
+        assert!(Cli::try_parse_from(&args).is_err());
+        args.push("--venus-probe");
+        assert!(Cli::try_parse_from(&args).is_ok());
+    }
+
+    #[test]
+    fn ui_autostart_is_off_by_default() {
+        let cli = Cli::try_parse_from(["skyward-pack", "recovery", "--stock", "boot.img", "--binary", "skyward", "--system-init", "system-init",
+            "--config", "venus.toml", "--font", "font", "--mono", "mono", "--mono-license", "license",
+            "--out", "new.img", "--partition", "boot", "--venus-probe"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Recovery { venus_probe: true, venus_ui: false, .. }));
+    }
+
 
     #[test]
     fn the_lines_that_set_a_name_are_the_only_ones_left_out() {

@@ -23,7 +23,7 @@ const MAC_BYTES: usize = 32;
 const BYTES: usize = MAC + MAC_BYTES;
 
 /// The note itself, read out into the fields the key service is given.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Token {
     /// What the note was asked for, where something asked for one.
     pub challenge: i64,
@@ -39,6 +39,19 @@ pub struct Token {
     pub when: i64,
     /// The signature the rest of the secure world checks.
     pub mac: Vec<u8>,
+}
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        f.write_str("Token(<authentication material redacted>)")
+    }
+}
+impl Drop for Token {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.mac.zeroize(); self.user.zeroize(); self.authenticator.zeroize();
+        self.challenge.zeroize(); self.kind.zeroize(); self.when.zeroize();
+    }
 }
 
 impl Token {

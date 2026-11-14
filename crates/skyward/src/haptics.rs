@@ -1,11 +1,10 @@
-use crate::waveform::{made, share, ticks, RATE, TICKS_RATE};
 use anyhow::{anyhow, ensure, Context, Result};
 use evdev::raw_stream::RawDevice;
 use skyward_config::Strength;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,25 +12,36 @@ use std::time::{Duration, Instant};
 const EV_FF: u16 = 0x15;
 const FF_PERIODIC: u16 = 0x51;
 const FF_CUSTOM: u16 = 0x5d;
+const FF_SINE: u16 = 0x5a;
 
-/// The ticks play at this share of the drive the driver gives samples at in
-/// full, whatever the slider says: the 17 Ultra's own system plays them at
-/// 3527 mV of the 8500 mV its device tree gives.
+/// What a motor swings at when its driver says the frequency nowhere: the
+/// one the 17 Ultra's motor has, and the usual one of the linear motors
+/// these phones carry.
+const NOMINAL_HZ: f32 = 172.4;
+
+/// How long a click runs. The driver plays a sine for the effect's replay
+/// length, and a waveform it keeps for as long as that one is; either way
+/// the click is taken away once this has passed.
+const NOMINAL_CLICK: Duration = Duration::from_millis(30);
+
+/// How strongly the phone's own system plays the two ticks of the screen
+/// going off, whatever the slider says.
 const TICKS_STRENGTH: f32 = 0.415;
-/// How long the ticks stay loaded once their samples have run out, as the
-/// phone's own system leaves them: the motor comes to rest on its own
-/// before taking them away brakes it.
-const TICKS_REST: Duration = Duration::from_millis(40);
 
-/// The vibration motor, played through the kernel's force-feedback
-/// events. The driver fills its queue with a made click's samples as the
-/// click is loaded, refilling it for no second play, and keeps the click
-/// playing after its samples have run out, even when told to stop, until
-/// the click is taken away. So each click is loaded as it is played, at the
-/// strength the slider gives, and taken away once it has played out.
+/// How long between the two ticks.
+const TICK_GAP: Duration = Duration::from_millis(55);
+
+/// How much lighter the second tick is than the first.
+const TICK_SECOND: f32 = 0.79;
+
+/// The vibration motor, played through the kernel's force-feedback events.
+/// Each click is loaded as it is played, at the strength the slider gives,
+/// and taken away once it has run.
 pub struct Haptics {
     dev: File,
     click: Click,
+    /// What the two ticks of the screen going off are made of: swings at the
+    /// motor's own frequency, whatever the click is.
     ticks: Click,
     strength: Strength,
     /// The click playing, by its slot and its count, until it is taken
@@ -41,13 +51,16 @@ pub struct Haptics {
 }
 
 /// What a click is.
+#[derive(Clone, Copy)]
 enum Click {
-    /// A waveform the driver keeps, by its number. The driver says how long
-    /// it plays as it loads it.
+    /// A waveform the driver keeps, by its number: a bank and a number are
+    /// handed over, and the driver plays that waveform.
     Kept(i16),
-    /// Samples made at the motor's resonant frequency, which the driver
-    /// plays as they are, at `rate` a second.
-    Samples { data: Vec<i8>, rate: u32 },
+    /// AW8697 takes an effect ID followed by two writable duration fields.
+    Aw8697(i16),
+    /// Swings of the motor at `hz`, which the driver makes up as a sine and
+    /// drives at the strength it is given.
+    Made(f32),
 }
 
 impl Haptics {
@@ -55,8 +68,27 @@ impl Haptics {
     /// fills the driver's queue with what it plays, so the click is loaded
     /// only as it is played.
     pub fn open(cfg: &skyward_config::Haptics) -> Result<Haptics> {
-        let (path, dev) = motor()?;
-        let hz = resonance(&cfg.resonance)?;
+        let (path, dev) = motor(cfg.driver)?;
+        if cfg.driver == skyward_config::HapticDriver::Aw8697 {
+            let id = cfg.click.context("AW8697 needs a predefined effect ID")?;
+            ensure!(id >= 0, "AW8697 effect ID must be nonnegative");
+            let click = Click::Aw8697(id);
+            return Ok(Haptics { dev, click, ticks: click, strength: cfg.strength, playing: Arc::new(Mutex::new(None)), clicks: 0 });
+        }
+        // A driver that says its motor's frequency nowhere, as Cirrus Logic's
+        // CS40L26 does not, still takes a click made for the frequency these
+        // motors swing at; the reason goes to the log and the motor is not
+        // left out over it.
+        let hz = match &cfg.resonance {
+            Some(file) => match resonance(file) {
+                Ok(hz) => hz,
+                Err(e) => {
+                    let _ = skyward_sys::kmsg(&format!("the motor's resonant frequency is not read, so {} Hz is used: {e:#}", NOMINAL_HZ));
+                    NOMINAL_HZ
+                }
+            },
+            None => NOMINAL_HZ,
+        };
         let click = match cfg.click {
             Some(id) => {
                 eprintln!("haptics {}: clicks with waveform {id}, ticks made for a motor swinging at {hz} Hz", path.display());
@@ -64,44 +96,45 @@ impl Haptics {
             }
             None => {
                 eprintln!("haptics {}: clicks and ticks made for a motor swinging at {hz} Hz", path.display());
-                Click::Samples { data: made(hz), rate: RATE }
+                Click::Made(hz)
             }
         };
-        let ticks = Click::Samples { data: ticks(hz), rate: TICKS_RATE };
-        Ok(Haptics { dev, click, ticks, strength: cfg.strength, playing: Arc::new(Mutex::new(None)), clicks: 0 })
+        Ok(Haptics { dev, click, ticks: Click::Made(hz), strength: cfg.strength, playing: Arc::new(Mutex::new(None)), clicks: 0 })
     }
 
     /// One short click at the strength the slider's `position` gives, after
     /// taking away one still playing. Gives how long it plays.
     pub fn click(&mut self, position: f32) -> Result<Duration> {
-        self.start(false, share(&self.strength, position))
+        self.start(self.click, share(&self.strength, position))
     }
 
-    /// The ticks of the screen going off, as strong as the phone's own
-    /// system plays them whatever the slider says. Gives how long they play.
+    /// The two ticks of the screen going off, as strongly as the phone's own
+    /// system plays them whatever the slider says, the second lighter. Gives
+    /// how long they take.
     pub fn ticks(&mut self) -> Result<Duration> {
-        self.start(true, TICKS_STRENGTH)
+        let first = self.start(self.ticks, TICKS_STRENGTH)?;
+        std::thread::sleep(TICK_GAP);
+        let second = self.start(self.ticks, TICKS_STRENGTH * TICK_SECOND)?;
+        Ok(first + TICK_GAP + second)
     }
 
-    /// Play the ticks, or else the click, at `share` of its full strength,
-    /// after taking away what still plays.
-    fn start(&mut self, ticks: bool, share: f32) -> Result<Duration> {
+    /// Play `click` at `share` of its full strength, after taking away what
+    /// still plays, and take it away again once it has run out.
+    fn start(&mut self, click: Click, share: f32) -> Result<Duration> {
         let mut playing = self.playing.lock().expect("no thread panics while it holds the click playing");
         if let Some((slot, _)) = playing.take() {
             erase(&self.dev, slot).context("take away the click still playing")?;
         }
-        let effect = if ticks { &self.ticks } else { &self.click };
-        let loaded = upload(&self.dev, effect, share).context("load the click")?;
+        let loaded = upload(&self.dev, &click, share).context("load the click")?;
         play(&mut self.dev, loaded.slot).context("play the click")?;
         self.clicks += 1;
         let this = (loaded.slot, self.clicks);
         *playing = Some(this);
         drop(playing);
         let dev = self.dev.try_clone().context("share the motor")?;
-        let length = loaded.length + if ticks { TICKS_REST } else { Duration::ZERO };
+        let (playing, length) = (self.playing.clone(), loaded.length);
         // Timed from now: a thread may wait a while before it first runs.
         let until = Instant::now() + length;
-        let playing = self.playing.clone();
         std::thread::spawn(move || {
             std::thread::sleep(until.saturating_duration_since(Instant::now()));
             let mut playing = playing.lock().expect("no thread panics while it holds the click playing");
@@ -133,10 +166,111 @@ pub fn probe(cfg: &skyward_config::Haptics, position: f32, ticks: bool) -> Resul
     Ok(())
 }
 
+/// Bring the motor's driver up: put the firmware it asks the kernel's loader
+/// for where the loader looks, then load the modules it is in. A driver the
+/// phone's own init loaded already has spent its probe on the empty folder
+/// its recovery leaves; putting the firmware there does not try it again, so
+/// the device is unbound from its driver and bound back to it, which probes
+/// it afresh with the file now in place.
+pub fn bring_up(cfg: &skyward_config::Haptics, sources: &[String]) -> Result<()> {
+    for file in &cfg.firmware {
+        if cfg.driver == skyward_config::HapticDriver::Aw8697 {
+            crate::wlan::place_firmware_at(file, Path::new("/lib/firmware"))?;
+        } else {
+            crate::wlan::place_firmware(file)?;
+        }
+    }
+    if !cfg.modules.is_empty() {
+        let dirs = sources.iter().map(|s| skyward_modules::source_dir(s)).collect::<Result<Vec<_>>>()?;
+        for path in skyward_modules::load(&dirs, &cfg.modules)? {
+            skyward_sys::kmsg(&format!("loaded {} for the motor", path.display()))?;
+        }
+    }
+    if cfg.driver == skyward_config::HapticDriver::Aw8697 && !cfg.firmware.is_empty() {
+        let (path, dev) = motor(cfg.driver)?;
+        let id = cfg.click.context("AW8697 needs a predefined effect ID")?;
+        ensure!(id >= 0, "AW8697 effect ID must be nonnegative");
+        let event = path.file_name().context("the motor has no event node name")?;
+        let reload = Path::new("/sys/class/input").join(event).join("device/device/ram_update");
+        fs::write(&reload, "1\n").with_context(|| format!("reload the motor's waveform through {}", reload.display()))?;
+        // ram_update queues work. Wait for a real successful upload, without
+        // playing it, rather than treating the sysfs write as readiness.
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            match upload(&dev, &Click::Aw8697(id), 0.0) {
+                Ok(loaded) => {
+                    erase(&dev, loaded.slot)?;
+                    skyward_sys::kmsg("AW8697_RAM_READY; waveform upload/erase verified without playback")?;
+                    break;
+                }
+                Err(e) if e.downcast_ref::<io::Error>().and_then(io::Error::raw_os_error) == Some(libc::EAGAIN) && Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => return Err(e).context("wait for AW8697 waveform firmware"),
+            }
+        }
+    }
+    // Only a driver that asked for firmware and went without it has to be
+    // prodded; one that probed cleanly made its device already.
+    if !cfg.firmware.is_empty() && !any_motor() {
+        reprobe(cfg)?;
+    }
+    Ok(())
+}
+
+/// Unbind each of the configured drivers from its device and bind it back,
+/// so the driver probes the motor again now its firmware is where the loader
+/// looks. The drivers are found by the names the kernel gives them under
+/// /sys/bus/i2c/drivers, which drop the suffix a module's file name carries:
+/// cs40l26-i2c is the driver cs40l26.
+fn reprobe(cfg: &skyward_config::Haptics) -> Result<()> {
+    for module in &cfg.modules {
+        let driver = driver_name(module);
+        let at = Path::new("/sys/bus/i2c/drivers").join(&driver);
+        let Ok(listing) = fs::read_dir(&at) else { continue };
+        let bound: Vec<_> = listing.flatten().map(|e| e.file_name()).filter(|n| n.to_string_lossy().contains('-')).collect();
+        for name in &bound {
+            let name = name.to_string_lossy();
+            let _ = fs::write(at.join("unbind"), name.as_ref());
+            let _ = fs::write(at.join("bind"), name.as_ref());
+            skyward_sys::kmsg(&format!("bound {driver} to {name} again so it probes the motor with its firmware"))?;
+        }
+    }
+    // The device node and its force-feedback device appear as the probe
+    // runs, which is not synchronous with the write above.
+    let until = std::time::Instant::now() + PROBE_WAIT;
+    while std::time::Instant::now() < until {
+        if any_motor() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+/// The kernel's name for the driver a module is in: the module's own name
+/// without the bus it sits on, as cs40l26-i2c is the driver cs40l26 and
+/// cs40l26-core is none.
+fn driver_name(module: &str) -> String {
+    module.trim_end_matches("-core").trim_end_matches("-i2c").replace('_', "-")
+}
+
+/// Whether any input device takes periodic force-feedback effects yet.
+fn any_motor() -> bool {
+    evdev::raw_stream::enumerate().any(|(_, dev)| takes_periodic(&dev))
+}
+
+/// How long a driver may take to make its force-feedback device once bound
+/// to the motor again.
+const PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The first input device under /dev/input that takes periodic
 /// force-feedback effects, opened for writing.
-fn motor() -> Result<(PathBuf, File)> {
+fn motor(driver: skyward_config::HapticDriver) -> Result<(PathBuf, File)> {
     for (path, dev) in evdev::raw_stream::enumerate() {
+        if driver == skyward_config::HapticDriver::Aw8697 && dev.name() != Some("aw8697_haptic") {
+            continue;
+        }
         if takes_periodic(&dev) {
             let file = OpenOptions::new().read(true).write(true).open(&path).with_context(|| format!("open {}", path.display()))?;
             return Ok((path, file));
@@ -149,13 +283,52 @@ fn takes_periodic(dev: &RawDevice) -> bool {
     dev.supported_ff().is_some_and(|ff| ff.contains(evdev::FFEffectCode::FF_PERIODIC))
 }
 
+/// The share of the click's full strength at the slider's `position`.
+fn share(strength: &Strength, position: f32) -> f32 {
+    strength.lightest * (strength.strongest / strength.lightest).powf(position.clamp(0.0, 1.0))
+}
+
+/// What these motors swing at, from the slowest to the fastest a linear
+/// motor of this kind has. A frequency read as a number outside it was not
+/// in hertz in the first place.
+const SWINGS_BETWEEN: (f32, f32) = (20.0, 400.0);
+
 /// The motor's resonant frequency in hertz, from the file the driver says
-/// it in, in tenths of a hertz.
+/// it in. A driver that says it nowhere, as Cirrus Logic's CS40L26 does not,
+/// still takes a click made for a frequency near the one these motors swing
+/// at.
+///
+/// The files differ in what they count in. Qualcomm's says tenths of a
+/// hertz in plain decimal. Cirrus Logic's `f0_stored` says it in ten
+/// thousandths of a hertz, as hexadecimal: `00202CAB` is 210.859 Hz. What a
+/// file counts in is not something the recovery can ask it, so both readings
+/// are tried and the one that comes out a frequency these motors have is
+/// taken; neither is, and the click is made at the nominal one rather than at
+/// a frequency no motor swings at.
 fn resonance(file: &str) -> Result<f32> {
     let text = fs::read_to_string(file).with_context(|| format!("read {file}"))?;
-    let tenths: u32 = text.split_whitespace().next().and_then(|n| n.parse().ok()).with_context(|| format!("{file} holds {text:?}"))?;
-    ensure!(tenths > 0, "{file} says the motor swings at 0 Hz");
-    Ok(tenths as f32 / 10.0)
+    let raw = text.split_whitespace().next().with_context(|| format!("{file} is empty"))?;
+    // A leading zero is how the driver stamps the hexadecimal it writes, and
+    // plain decimal never needs one.
+    let hex = raw.strip_prefix("0x").or_else(|| raw.starts_with('0').then_some(raw));
+    let counted = match hex {
+        Some(hex) => u32::from_str_radix(hex, 16),
+        None => raw.parse(),
+    }
+    .with_context(|| format!("{file} holds {text:?}"))?;
+    ensure!(counted > 0, "{file} says the motor swings at 0 Hz");
+    // The two counts the drivers use, ten thousandths and tenths of a hertz,
+    // and whichever of them lands in range.
+    let swept = [counted as f32 / 10_000.0, counted as f32 / 10.0]
+        .into_iter()
+        .find(|hz| (SWINGS_BETWEEN.0..=SWINGS_BETWEEN.1).contains(hz));
+    swept.with_context(|| format!("{file} says {counted}, which is no frequency these motors swing at"))
+}
+
+/// The period, in whole microseconds, of a swing at `hz`: what a periodic
+/// effect gives the driver to make the swing from, and never zero.
+fn period_of(hz: f32) -> u16 {
+    (1_000_000.0 / hz.max(1.0)).round().clamp(1.0, f32::from(u16::MAX)) as u16
 }
 
 /// A click as the driver loaded it: the slot the kernel keeps it in, and
@@ -165,43 +338,34 @@ struct Loaded {
     length: Duration,
 }
 
-/// Samples handed to the driver to play as they are, as its
-/// `custom_fifo_data` lays them out.
-#[repr(C)]
-struct Samples {
-    /// Unused by the driver.
-    index: u32,
-    length: u32,
-    rate: u32,
-    data: *const i8,
-}
-
-/// Load `click` at `share` of its full strength as a custom periodic
-/// effect in a slot of its own. The driver drives the motor at the click's
-/// highest voltage times the magnitude.
+/// Load `click` at `share` of its full strength as a periodic effect in a
+/// slot of its own.
+///
+/// The driver tells what it is given by the effect's waveform: a waveform it
+/// keeps comes as two values, a bank and a number, and a sine comes from the
+/// period and the strength. Samples handed over as FIFO data are read as a
+/// wavetable the driver makes up itself, which this motor's firmware refuses
+/// ("Invalid OWT index: -1" in the kernel log), so none are handed over.
 fn upload(dev: &File, click: &Click, share: f32) -> Result<Loaded> {
-    // The driver tells the two kinds apart by the length in bytes of what
-    // the effect points to, and loads nothing for any other length, though
-    // the upload still succeeds. For a waveform it keeps it reads the
-    // waveform's number from the first of three values and writes how long
-    // it plays into the other two, in whole seconds and then milliseconds.
-    let mut kept: [i16; 3] = [0; 3];
-    let mut samples = Samples { index: 0, length: 0, rate: RATE, data: std::ptr::null() };
-    let (len, data) = match click {
+    let mut kept: [i16; 2] = [0; 2];
+    let mut aw: [i16; 3] = [0; 3];
+    let (waveform, period, len, data) = match click {
         Click::Kept(id) => {
-            kept[0] = *id;
-            (std::mem::size_of_val(&kept), kept.as_mut_ptr())
+            // The RAM waveforms are the bank before the number: 0 is the one
+            // the phone's own HAL plays when it starts.
+            kept[0] = 0;
+            kept[1] = *id;
+            (FF_CUSTOM, 0u16, std::mem::size_of_val(&kept), kept.as_mut_ptr())
         }
-        Click::Samples { data, rate } => {
-            samples.length = u32::try_from(data.len())?;
-            samples.rate = *rate;
-            samples.data = data.as_ptr();
-            (std::mem::size_of::<Samples>(), (&mut samples as *mut Samples).cast::<i16>())
+        Click::Aw8697(id) => {
+            aw[0] = *id;
+            (FF_CUSTOM, 0u16, aw.len(), aw.as_mut_ptr())
         }
+        Click::Made(hz) => (FF_SINE, period_of(*hz), 0, std::ptr::null_mut()),
     };
     let periodic = libc::ff_periodic_effect {
-        waveform: FF_CUSTOM,
-        period: 0,
+        waveform,
+        period,
         magnitude: (share.clamp(0.0, 1.0) * f32::from(i16::MAX)).round() as i16,
         offset: 0,
         phase: 0,
@@ -214,7 +378,7 @@ fn upload(dev: &File, click: &Click, share: f32) -> Result<Loaded> {
         id: -1,
         direction: 0,
         trigger: libc::ff_trigger { button: 0, interval: 0 },
-        replay: libc::ff_replay { length: 0, delay: 0 },
+        replay: libc::ff_replay { length: NOMINAL_CLICK.as_millis() as u16, delay: 0 },
         u: [0; 4],
     };
     // The union holds the periodic effect; it is exactly as large.
@@ -226,16 +390,10 @@ fn upload(dev: &File, click: &Click, share: f32) -> Result<Loaded> {
     if unsafe { libc::ioctl(dev.as_raw_fd(), request as _, &mut effect) } < 0 {
         return Err(io::Error::last_os_error().into());
     }
-    let length = match click {
-        Click::Kept(id) => {
-            let [_, seconds, millis] = kept;
-            let length = Duration::from_secs(u64::try_from(seconds)?) + Duration::from_millis(u64::try_from(millis)?);
-            ensure!(!length.is_zero(), "the driver loaded waveform {id} without saying how long it plays");
-            length
-        }
-        // The queue is full before the samples start playing.
-        Click::Samples { data, rate } => Duration::from_secs_f64(data.len() as f64 / f64::from(*rate)),
-    };
+    let length = if matches!(click, Click::Aw8697(_)) {
+        let millis = u64::try_from(aw[1]).unwrap_or(0) * 1000 + u64::try_from(aw[2]).unwrap_or(0);
+        Duration::from_millis(millis.clamp(1, 2000))
+    } else { NOMINAL_CLICK };
     Ok(Loaded { slot: effect.id, length })
 }
 
@@ -254,4 +412,26 @@ fn erase(dev: &File, id: i16) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sine_is_asked_for_at_the_motors_own_period() {
+        assert_eq!(period_of(200.0), 5_000);
+        assert_eq!(period_of(1_000.0), 1_000);
+        assert_eq!(period_of(1_000_000.0), 1, "never zero microseconds");
+        assert_eq!(period_of(0.0), 1, "a frequency of nothing is still a period");
+    }
+
+    #[test]
+    fn the_slider_spans_the_strengths_each_step_the_same_factor() {
+        let s = Strength { lightest: 0.25, strongest: 1.0 };
+        assert_eq!((share(&s, 0.0), share(&s, 1.0)), (0.25, 1.0));
+        assert!((share(&s, 0.5) - 0.5).abs() < 1e-6);
+        assert!((share(&s, 0.25) / share(&s, 0.0) - share(&s, 1.0) / share(&s, 0.75)).abs() < 1e-6, "each step the same factor");
+        assert_eq!((share(&s, -1.0), share(&s, 2.0)), (0.25, 1.0), "no further than its ends");
+    }
 }

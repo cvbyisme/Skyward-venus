@@ -1,0 +1,37 @@
+<manifest version="1.0" type="framework">
+    <hal format="hidl">
+        <name>android.system.net.netd</name>
+        <transport>hwbinder</transport>
+        <fqname>@1.1::INetd/default</fqname>
+    </hal>
+    <hal format="hidl">
+        <name>android.system.suspend</name>
+        <transport>hwbinder</transport>
+        <fqname>@1.0::ISystemSuspend/default</fqname>
+    </hal>
+    <hal format="hidl">
+        <name>android.hidl.manager</name>
+        <transport>hwbinder</transport>
+        <fqname>@1.2::IServiceManager/default</fqname>
+    </hal>
+    <hal format="hidl">
+        <name>android.hardware.keymaster</name>
+        <transport>hwbinder</transport>
+        <fqname>@4.1::IKeymasterDevice/default</fqname>
+    </hal>
+    <hal format="hidl">
+        <name>android.hardware.gatekeeper</name>
+        <transport>hwbinder</transport>
+        <fqname>@1.0::IGatekeeper/default</fqname>
+    </hal>
+    <hal format="hidl">
+        <name>android.hardware.wifi.supplicant</name>
+        <transport>hwbinder</transport>
+        <fqname>@1.3::ISupplicant/default</fqname>
+    </hal>
+    <hal format="hidl">
+        <name>vendor.qti.hardware.wifi.supplicant</name>
+        <transport>hwbinder</transport>
+        <fqname>@2.2::ISupplicantVendor/default</fqname>
+    </hal>
+</manifest>

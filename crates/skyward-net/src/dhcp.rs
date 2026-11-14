@@ -143,7 +143,8 @@ fn natural_mask(address: Ipv4Addr) -> Ipv4Addr {
 #[cfg(target_os = "android")]
 pub use client::{obtain, keep, Kept};
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 mod client {
     use super::{discover, extend, reply, request, Lease, Reply};
     use anyhow::{bail, Context, Result};
@@ -191,6 +192,7 @@ mod client {
             return Err(std::io::Error::last_os_error()).context("take the DHCP client port");
         }
         s.set_read_timeout(Some(LOOK)).context("time the DHCP socket")?;
+        s.set_write_timeout(Some(LOOK)).context("time DHCP sends")?;
         Ok(s)
     }
 
@@ -202,22 +204,26 @@ mod client {
 
     /// Send `question` to `to` and wait for an answer to transaction `xid`,
     /// sending it again as long as none comes; give up after the last wait.
-    fn exchange(s: &UdpSocket, to: SocketAddrV4, question: &[u8], xid: u32, mac: [u8; 6], stop: &AtomicBool) -> Result<Option<Reply>> {
+    fn exchange(s: &UdpSocket, to: SocketAddrV4, question: &[u8], xid: u32, mac: [u8; 6], stop: &AtomicBool,
+                accepts: impl Fn(&Reply) -> bool) -> Result<Option<Reply>> {
         let mut buf = [0u8; 1500];
         for wait in WAITS {
+            if stop.load(Ordering::Relaxed) { bail!(crate::Stopped); }
             s.send_to(question, to).context("send a DHCP question")?;
             let until = Instant::now() + Duration::from_secs(wait);
             while Instant::now() < until {
                 if stop.load(Ordering::Relaxed) {
                     bail!(crate::Stopped);
                 }
-                match s.recv(&mut buf) {
-                    Ok(n) => {
+                match s.recv_from(&mut buf) {
+                    Ok((n, from)) => {
+                        if stop.load(Ordering::Relaxed) { bail!(crate::Stopped); }
+                        if from.port() != to.port() { continue; }
                         if let Some(r) = reply(&buf[..n], xid, mac) {
-                            return Ok(Some(r));
+                            if accepts(&r) { return Ok(Some(r)); }
                         }
                     }
-                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
+                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted) => {}
                     Err(e) => return Err(e).context("read a DHCP answer"),
                 }
             }
@@ -236,12 +242,13 @@ mod client {
         let s = socket(interface)?;
         for _ in 0..3 {
             let id = xid();
-            let (address, server) = match exchange(&s, broadcast(), &discover(id, mac)?, id, mac, stop)? {
+            let (address, server) = match exchange(&s, broadcast(), &discover(id, mac)?, id, mac, stop, |r| matches!(r, Reply::Offer { .. }))? {
                 Some(Reply::Offer { address, server }) => (address, server),
                 Some(_) => continue,
                 None => bail!("no DHCP server offered an address"),
             };
-            match exchange(&s, broadcast(), &request(id, mac, address, server)?, id, mac, stop)? {
+            match exchange(&s, broadcast(), &request(id, mac, address, server)?, id, mac, stop,
+                |r| matches!(r, Reply::Nak) || matches!(r, Reply::Ack(l) if l.address == address && l.server == server))? {
                 Some(Reply::Ack(lease)) => return Ok(lease),
                 Some(_) => continue,
                 None => bail!("the DHCP server at {server} did not give the address it offered"),
@@ -265,11 +272,52 @@ mod client {
         let s = socket(interface)?;
         let id = xid();
         let to = if anyone { broadcast() } else { SocketAddrV4::new(lease.server, SERVER_PORT) };
-        Ok(match exchange(&s, to, &extend(id, mac, lease.address)?, id, mac, stop)? {
+        Ok(match exchange(&s, to, &extend(id, mac, lease.address)?, id, mac, stop,
+            |r| matches!(r, Reply::Nak) || matches!(r, Reply::Ack(l) if l.address == lease.address && (anyone || l.server == lease.server)))? {
             Some(Reply::Ack(kept)) => Kept::Kept(kept),
             Some(_) => Kept::Refused,
             None => Kept::Unanswered,
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use dhcproto::v4::MessageType;
+        use std::thread;
+
+        #[test]
+        fn repeated_offer_does_not_hide_the_ack_for_a_request() {
+            let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let to = match server.local_addr().unwrap() { std::net::SocketAddr::V4(v) => v, _ => unreachable!() };
+            server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            client.set_read_timeout(Some(LOOK)).unwrap();
+            let worker = thread::spawn(move || {
+                let mut question = [0; 1500];
+                let (_, peer) = server.recv_from(&mut question).unwrap();
+                for kind in [MessageType::Offer, MessageType::Ack] {
+                    let packet = super::super::tests::answer(kind, 7, super::super::tests::MAC, &[]);
+                    server.send_to(&packet, peer).unwrap();
+                }
+            });
+            let got = exchange(&client, to, b"request fixture", 7, super::super::tests::MAC,
+                &AtomicBool::new(false), |r| matches!(r, Reply::Ack(_) | Reply::Nak)).unwrap();
+            worker.join().unwrap();
+            assert!(matches!(got, Some(Reply::Ack(_))));
+        }
+
+        #[test]
+        fn cancelled_exchange_sends_nothing_and_releases_promptly() {
+            let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            server.set_nonblocking(true).unwrap();
+            let to = match server.local_addr().unwrap() { std::net::SocketAddr::V4(v) => v, _ => unreachable!() };
+            let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let error = exchange(&client, to, b"must not be sent", 7, super::super::tests::MAC,
+                &AtomicBool::new(true), |_| true).unwrap_err();
+            assert!(error.is::<crate::Stopped>());
+            assert_eq!(server.recv(&mut [0; 64]).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        }
     }
 }
 
@@ -277,10 +325,10 @@ mod client {
 mod tests {
     use super::*;
 
-    const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x04];
+    pub(super) const MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x04];
 
     /// What a home router answers, put together as one would.
-    fn answer(kind: MessageType, xid: u32, mac: [u8; 6], with: &[DhcpOption]) -> Vec<u8> {
+    pub(super) fn answer(kind: MessageType, xid: u32, mac: [u8; 6], with: &[DhcpOption]) -> Vec<u8> {
         let server = Ipv4Addr::new(192, 168, 1, 1);
         let mut m = Message::new_with_id(xid, Ipv4Addr::UNSPECIFIED, Ipv4Addr::new(192, 168, 1, 23), server, Ipv4Addr::UNSPECIFIED, &mac);
         m.set_opcode(Opcode::BootReply);

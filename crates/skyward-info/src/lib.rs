@@ -7,12 +7,16 @@ use std::ffi::CStr;
 use std::fs;
 use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
 
 /// Version of this build, shown on the About page.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Who made this build, shown beside its version on the About page's list of
+/// everything the recovery can read.
+pub const BUILT_BY: &str = "澪洛依";
 
 const CPU: &str = "/sys/devices/system/cpu";
 const POWER_SUPPLY: &str = "/sys/class/power_supply";
@@ -138,13 +142,22 @@ pub struct Boot {
 }
 
 pub fn collect(cfg: &DeviceConfig) -> Result<DeviceInfo> {
-    collect_with(cfg, battery_now()?)
+    collect_props(cfg, SystemProps::current()?, battery_now()?)
 }
 
 /// The phone's details with `battery` for the battery, read apart: by one
 /// who reads it oftener than the rest, or who goes on without it where it
 /// cannot be read, as the pages do when they come up.
 pub fn collect_with(cfg: &DeviceConfig, battery: Option<Battery>) -> Result<DeviceInfo> {
+    collect_props(cfg, SystemProps::current()?, battery)
+}
+
+/// Read the phone using build properties from a port's isolated mounts.
+pub fn collect_with_installed_props(cfg: &DeviceConfig, props: HashMap<String, String>) -> Result<DeviceInfo> {
+    collect_props(cfg, SystemProps::Installed(props), battery_now()?)
+}
+
+fn collect_props(cfg: &DeviceConfig, system: SystemProps, battery: Option<Battery>) -> Result<DeviceInfo> {
     let d = &cfg.display;
     let unlocked = match skyward_block::boot_param("androidboot.vbmeta.device_state")?.as_deref() {
         None => None,
@@ -152,11 +165,10 @@ pub fn collect_with(cfg: &DeviceConfig, battery: Option<Battery>) -> Result<Devi
         Some("unlocked") => Some(true),
         Some(other) => bail!("androidboot.vbmeta.device_state {other:?}"),
     };
-    let system = SystemProps::current()?;
     Ok(DeviceInfo {
         // The system names the exact edition; the configured model covers a
         // system whose partitions are not mounted.
-        model: system.get("ro.product.marketname").unwrap_or_else(|| cfg.device.model.clone()),
+        model: market_name(&system, &cfg.device.model),
         codename: cfg.device.codename.clone(),
         soc: cfg.device.soc.clone(),
         cpu: cpu(Path::new(CPU))?,
@@ -174,6 +186,17 @@ pub fn collect_with(cfg: &DeviceConfig, battery: Option<Battery>) -> Result<Devi
         snapshot: skyward_vab::snapshot_state()?,
         boot: Boot { unlocked, verified: skyward_block::boot_param("androidboot.verifiedbootstate")? },
     })
+}
+
+/// The product partition names the market edition in its own Android
+/// property namespace. The shorter property is the system-wide fallback,
+/// while the configured model is only for a phone whose partitions cannot
+/// be read at all.
+fn market_name(system: &SystemProps, fallback: &str) -> String {
+    system
+        .get("ro.product.product.marketname")
+        .or_else(|| system.get("ro.product.marketname"))
+        .unwrap_or_else(|| fallback.to_owned())
 }
 
 /// Build properties of the system the About page describes.
@@ -230,20 +253,26 @@ const BOOT_PROPS: &str = "ro.boot.";
 /// after them, as Xiaomi's odm imports what each hardware version sets; so
 /// they come first here too, the same in a recovery as in the system.
 pub fn installed_props(slot: Slot) -> Result<HashMap<String, String>> {
-    let base = |m: &skyward_vab::Mounted| -> String {
-        m.partition.strip_suffix(slot.suffix()).expect("mounted partitions carry the slot suffix").to_string()
-    };
-    let mut parts = skyward_vab::mounted_partitions(slot)?;
-    parts.sort_by_key(|m| PROP_ORDER.iter().position(|b| *b == base(m)).unwrap_or(PROP_ORDER.len()));
+    let parts = skyward_vab::mounted_partitions(slot)?.into_iter().map(|m| {
+        (m.partition.strip_suffix(slot.suffix()).expect("mounted partitions carry the slot suffix").to_string(), m.mount_point)
+    }).collect::<Vec<_>>();
+    installed_props_from_mounts(&parts)
+}
+
+/// Read build.prop in init order from logical partitions already mounted
+/// by the caller. This neither maps partitions nor releases any mounts.
+pub fn installed_props_from_mounts(parts: &[(String, PathBuf)]) -> Result<HashMap<String, String>> {
+    let mut parts = parts.to_vec();
+    parts.sort_by_key(|(base, _)| PROP_ORDER.iter().position(|b| *b == base).unwrap_or(PROP_ORDER.len()));
     let mut props: HashMap<String, String> = skyward_sys::props(BOOT_PROPS).into_iter().collect();
-    for m in &parts {
-        let files: &[&str] = match base(m).as_str() {
+    for (base, mount_point) in &parts {
+        let files: &[&str] = match base.as_str() {
             "system" => &["system/build.prop"],
             "vendor" => &["default.prop", "build.prop"],
             _ => &["etc/build.prop"],
         };
         for f in files {
-            let path = m.mount_point.join(f);
+            let path = mount_point.join(f);
             match fs::metadata(&path) {
                 Err(e) if e.kind() == ErrorKind::NotFound => continue,
                 Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
@@ -453,6 +482,20 @@ mod tests {
         assert!("2026-13-01".parse::<PatchLevel>().is_err());
         assert!("2026-10".parse::<PatchLevel>().is_err());
         assert!("October 2026".parse::<PatchLevel>().is_err());
+    }
+
+    #[test]
+    fn product_marketname_wins_over_the_short_property_and_config() {
+        let props = HashMap::from([
+            ("ro.product.product.marketname".to_string(), "Xiaomi 11".to_string()),
+            ("ro.product.marketname".to_string(), "Mi 11".to_string()),
+        ]);
+        assert_eq!(market_name(&SystemProps::Installed(props), "Xiaomi Mi 11"), "Xiaomi 11");
+
+        let props = HashMap::from([("ro.product.marketname".to_string(), "Mi 11".to_string())]);
+        assert_eq!(market_name(&SystemProps::Installed(props), "Xiaomi Mi 11"), "Mi 11");
+
+        assert_eq!(market_name(&SystemProps::Installed(HashMap::new()), "Xiaomi 11"), "Xiaomi 11");
     }
 
     #[test]

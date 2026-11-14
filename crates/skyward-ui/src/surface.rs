@@ -14,6 +14,33 @@ pub trait Surface {
     fn settle(&mut self) -> Result<()>;
 }
 
+/// AOD updates stay in the driver's low-power lifecycle. Only an explicit
+/// wake leaves AOD; presenting its next clock frame must never request ON.
+#[cfg(any(target_os = "android", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Power {
+    On,
+    Resting,
+    Off,
+    AodUpdating,
+    AodSleeping,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl Power {
+    fn is_aod(self) -> bool {
+        matches!(self, Self::AodUpdating | Self::AodSleeping)
+    }
+
+    fn after_present(self) -> Self {
+        if self.is_aod() { Self::AodUpdating } else { Self::On }
+    }
+
+    fn present_wakes(self) -> bool {
+        matches!(self, Self::Resting | Self::Off)
+    }
+}
+
 /// How Qualcomm's display driver drives a mode, from the text of the
 /// connector's mode_properties blob: key=value lines, a block per mode_name.
 #[cfg(any(target_os = "android", test))]
@@ -197,12 +224,27 @@ mod tests {
         assert_eq!(SdeMode::find(ISHTAR, "1080x2400x60cmd").unwrap(), SdeMode { mixers: 1, dsc: false });
         assert!(SdeMode::find(ISHTAR, "1440x3200x90cmd").is_err());
     }
+
+    #[test]
+    fn presenting_an_aod_frame_never_requests_normal_power() {
+        for power in [Power::AodUpdating, Power::AodSleeping] {
+            assert!(power.is_aod());
+            assert!(!power.present_wakes());
+            assert_eq!(power.after_present(), Power::AodUpdating);
+        }
+        for power in [Power::Resting, Power::Off] {
+            assert!(power.present_wakes());
+            assert_eq!(power.after_present(), Power::On);
+        }
+        assert!(!Power::On.present_wakes());
+        assert_eq!(Power::On.after_present(), Power::On);
+    }
 }
 
 #[cfg(target_os = "android")]
 pub mod kms {
     use super::*;
-    use anyhow::{anyhow, Context};
+    use anyhow::{anyhow, ensure, Context};
     use drm::buffer::{self, DrmFourcc, DrmModifier, PlanarBuffer};
     use drm::control::dumbbuffer::DumbBuffer;
     use drm::control::{
@@ -272,6 +314,59 @@ pub mod kms {
 
     /// A KMS object's properties by name, with their current values.
     struct Props(HashMap<String, (property::Handle, u64)>);
+
+    /// Read-only dump of every connector, CRTC and plane property, for
+    /// matching the phone's own display colour pipeline.
+    pub fn dump_properties(path: &str) -> Result<String> {
+        let card = open_card(path)?;
+        let res = card.resource_handles().context("read KMS resources")?;
+        let mut out = String::new();
+        for &h in res.connectors() {
+            let info = card.get_connector(h, true).context("read connector")?;
+            out.push_str(&format!("connector {} {:?} {:?}\n", u32::from(h), info.interface(), info.state()));
+            out.push_str(&format!("  {}\n", Props::read(&card, h)?.line()));
+        }
+        for &h in res.crtcs() {
+            out.push_str(&format!("crtc {}\n", u32::from(h)));
+            out.push_str(&format!("  {}\n", Props::read(&card, h)?.line()));
+        }
+        for h in card.plane_handles().context("list planes")? {
+            let props = Props::read(&card, h)?;
+            out.push_str(&format!("plane {} type {}\n", u32::from(h), props.value("type")?));
+            out.push_str(&format!("  {}\n", props.line()));
+        }
+        Ok(out)
+    }
+
+    /// Dump the active CRTC colour blobs the phone's composer wrote.
+    pub fn dump_color_blobs(path: &str, out: &std::path::Path) -> Result<String> {
+        std::fs::create_dir_all(out)?;
+        let card = open_card(path)?;
+        let res = card.resource_handles().context("read KMS resources")?;
+        let mut report = String::new();
+        for &crtc in res.crtcs() {
+            let props = Props::read(&card, crtc)?;
+            if props.0.get("ACTIVE").map(|(_, v)| *v).unwrap_or(0) != 1 {
+                continue;
+            }
+            for (name, (_, id)) in &props.0 {
+                let blob_name = ["SDE_DSPP_GAMUT", "SDE_DSPP_IGC", "SDE_DSPP_PA_HSIC", "SDE_DSPP_PCC", "SDE_DSPP_VLUT", "SDE_DSPP_GC"]
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix));
+                if !blob_name {
+                    continue;
+                }
+                if *id == 0 {
+                    continue;
+                }
+                let Ok(bytes) = card.get_property_blob(*id) else { continue };
+                let file = out.join(format!("{name}.bin"));
+                std::fs::write(&file, &bytes)?;
+                report.push_str(&format!("{name} {} {}\n", bytes.len(), file.display()));
+            }
+        }
+        Ok(report)
+    }
 
     impl Props {
         fn read<T: ResourceHandle>(card: &Card, handle: T) -> Result<Self> {
@@ -467,14 +562,12 @@ pub mod kms {
     /// Direct scanout on the built-in panel: its fastest mode on the CRTC
     /// driving it, three dumb buffers taken in turn on its primary planes,
     /// and every other connector and plane taken off that CRTC.
-    /// How the display stands.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Power {
-        On,
-        /// The panel rests in its low-power mode, the display processor
-        /// stopped.
-        Resting,
-        Off,
+    #[derive(Clone, Copy)]
+    struct LowPower {
+        property: property::Handle,
+        on: u64,
+        lp1: Option<u64>,
+        lp2: u64,
     }
 
     pub struct KmsSurface {
@@ -495,6 +588,10 @@ pub mod kms {
         /// The panel's preferred mode, which it comes up in, and its
         /// fastest, which it switches to after, where that is another.
         preferred: property::Value<'static>,
+        /// Every refresh at the panel's own size, with its mode blob.
+        refresh_modes: Vec<(u32, property::Value<'static>)>,
+        preferred_refresh: u32,
+        refresh: u32,
         fastest: Option<property::Value<'static>>,
         /// The sub-pixel rendering setup the CRTC takes with each mode,
         /// where the panel leaves its sub-pixel rendering to the display.
@@ -503,7 +600,7 @@ pub mod kms {
         /// display driver has one, and the switch's values for running and
         /// for resting.
         conn: connector::Handle,
-        lp: Option<(property::Handle, u64, u64)>,
+        lp: Option<LowPower>,
         power: Power,
         /// The display came on again in the panel's preferred mode, and the
         /// panel has yet to switch to its fastest.
@@ -533,6 +630,12 @@ pub mod kms {
                 .iter()
                 .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
                 .ok_or_else(|| anyhow!("the panel reports no preferred mode"))?;
+            let preferred_refresh = preferred.vrefresh();
+            let mut refresh_modes = Vec::new();
+            for m in conn.modes().iter().filter(|m| m.size() == preferred.size()) {
+                let blob = card.create_property_blob(m).context("create refresh mode blob")?;
+                refresh_modes.push((m.vrefresh(), blob));
+            }
             // The fastest refresh at the preferred size, the first listed among
             // equals: Android scrolls at it, and the 13 Ultra's touch reports
             // come at the same 120 Hz.
@@ -643,7 +746,11 @@ pub mod kms {
                 }
             }
             let crtc_props = Props::read(&card, crtc)?;
-            let blob = card.create_property_blob(&mode).context("create mode blob")?;
+            let blob = refresh_modes
+                .iter()
+                .find(|(hz, _)| *hz == mode.vrefresh())
+                .map(|(_, blob)| *blob)
+                .context("the selected mode has no blob")?;
             let first = card.create_property_blob(preferred).context("create mode blob")?;
             req.add_property(conn.handle(), conn_props.handle("CRTC_ID")?, property::Value::CRTC(Some(crtc)));
             // The mode is DSC-compressed: select its DSC variant, as Android's
@@ -724,7 +831,12 @@ pub mod kms {
             );
             let spr = spr.map(|(id, setup, _)| (id, setup));
             let lp = match conn_props.get("LP") {
-                Ok((id, _)) => Some((id, enum_value(&card, id, "ON")?, enum_value(&card, id, "LP2")?)),
+                Ok((id, _)) => Some(LowPower {
+                    property: id,
+                    on: enum_value(&card, id, "ON")?,
+                    lp1: enum_value(&card, id, "LP1").ok(),
+                    lp2: enum_value(&card, id, "LP2")?,
+                }),
                 Err(_) => None,
             };
             let conn = conn.handle();
@@ -738,6 +850,9 @@ pub mod kms {
                 active,
                 mode_id,
                 preferred: first,
+                refresh_modes,
+                preferred_refresh,
+                refresh: mode.vrefresh(),
                 fastest,
                 spr,
                 conn,
@@ -765,6 +880,102 @@ pub mod kms {
             self.power == Power::Off
         }
 
+        pub fn supports_aod(&self) -> bool {
+            self.lp.is_some_and(|lp| lp.lp1.is_some())
+        }
+
+        pub fn is_aod(&self) -> bool {
+            self.power.is_aod()
+        }
+
+        /// True after a settled frame and a synchronous LP2 request. The UI
+        /// may permit system suspend once its wake alarm and inputs are armed.
+        pub fn is_aod_sleeping(&self) -> bool {
+            self.power == Power::AodSleeping && !self.flipping
+        }
+
+        /// The DRM connector's requested LP value, read directly from KMS.
+        /// Some vendor kernels discard panel-command errors, so this is not
+        /// independent proof that the physical panel accepted the command.
+        pub fn requested_lp(&self) -> Result<Option<u64>> {
+            match self.lp {
+                Some(_) => Ok(Some(Props::read(&self.card, self.conn)?.value("LP")?)),
+                None => Ok(None),
+            }
+        }
+
+        fn low_power(&mut self, value: u64, power: Power, phase: &str) -> Result<()> {
+            let lp = self.lp.ok_or_else(|| anyhow!("the connector has no LP property"))?;
+            self.settle()?;
+            let mut req = atomic::AtomicModeReq::new();
+            req.add_property(self.conn, lp.property, property::Value::UnsignedRange(value));
+            self.card.atomic_commit(AtomicCommitFlags::empty(), req).with_context(|| phase.to_owned())?;
+            // The commit succeeded; retain this state even if readback fails,
+            // so error recovery can explicitly wake or power off the panel.
+            self.power = power;
+            let held = self.requested_lp()?;
+            if held != Some(value) {
+                return Err(anyhow!("{phase}: LP property holds {held:?}, requested {value}"));
+            }
+            Ok(())
+        }
+
+        /// Begin or resume an AOD update with a synchronous LP1 transition.
+        /// Present and settle the initial AOD frame before this call, then set
+        /// and verify native doze brightness, then call sleep_aod(). Never
+        /// write ordinary backlight zero after setting native doze brightness.
+        /// From AOD LP2 this only requests LP1, never ON/NOLP.
+        pub fn begin_aod(&mut self) -> Result<()> {
+            let lp1 = self.lp.and_then(|lp| lp.lp1).ok_or_else(|| anyhow!("the connector does not offer AOD LP1/LP2"))?;
+            if self.power == Power::Off {
+                return Err(anyhow!("present an initialized frame before entering AOD"));
+            }
+            if self.power == Power::AodUpdating {
+                return Ok(());
+            }
+            self.low_power(lp1, Power::AodUpdating, "enter AOD LP1")
+        }
+
+        /// Finish an AOD update. Native doze brightness must already be set
+        /// and verified by the caller. LP2 preserves the frame and does not
+        /// deactivate the CRTC or send normal ON/NOLP commands.
+        pub fn sleep_aod(&mut self) -> Result<()> {
+            if self.power == Power::AodSleeping {
+                return Ok(());
+            }
+            if self.power != Power::AodUpdating {
+                return Err(anyhow!("AOD LP2 requires an AOD LP1 session"));
+            }
+            let lp = self.lp.ok_or_else(|| anyhow!("the connector has no LP property"))?;
+            self.low_power(lp.lp2, Power::AodSleeping, "enter AOD LP2")
+        }
+
+        /// Refresh an already configured AOD face: LP2 -> LP1 -> settled
+        /// frame -> LP2. Native doze brightness is left to its existing mode.
+        /// An error leaves the tracked state available for explicit recovery;
+        /// it never silently restores full brightness or requests ON.
+        pub fn present_aod(&mut self, canvas: &Canvas) -> Result<()> {
+            if !self.power.is_aod() {
+                return Err(anyhow!("configure an AOD session before presenting its next frame"));
+            }
+            self.present(canvas)?;
+            self.sleep_aod()
+        }
+
+        /// Explicitly leave LP1/LP2 through the driver's normal ON/NOLP
+        /// transition. Present normal content and settle it before restoring
+        /// ordinary brightness. A fully off display is resumed by present().
+        pub fn wake(&mut self) -> Result<()> {
+            if self.power == Power::On {
+                return Ok(());
+            }
+            if self.power == Power::Off {
+                return Err(anyhow!("present a frame to initialize a fully off display"));
+            }
+            let lp = self.lp.ok_or_else(|| anyhow!("the connector has no LP property"))?;
+            self.low_power(lp.on, Power::On, "leave low-power display mode")
+        }
+
         /// Let the panel rest, ready to light again at once: in its
         /// low-power mode, as Android rests it while dozing, with the
         /// display processor stopped. The 13 Ultra's lights from there in
@@ -777,10 +988,10 @@ pub mod kms {
             if self.power != Power::On {
                 return Ok(());
             }
-            let Some((id, _, rest)) = self.lp else { return self.turn_off() };
+            let Some(lp) = self.lp else { return self.turn_off() };
             self.settle()?;
             let mut req = atomic::AtomicModeReq::new();
-            req.add_property(self.conn, id, property::Value::UnsignedRange(rest));
+            req.add_property(self.conn, lp.property, property::Value::UnsignedRange(lp.lp2));
             self.card.atomic_commit(AtomicCommitFlags::empty(), req).context("rest the panel")?;
             self.power = Power::Resting;
             Ok(())
@@ -807,7 +1018,39 @@ pub mod kms {
         /// Switch a panel that came on again in its preferred mode to its
         /// fastest. It is called once the backlight is on, which need not
         /// wait the frames the switch takes.
+        pub fn refresh_hz(&self) -> u32 {
+            self.refresh
+        }
+
+        /// Switch the running panel to `hz`, one of the modes it reports at
+        /// the current size.
+        pub fn set_refresh(&mut self, hz: u32) -> Result<()> {
+            if hz == self.refresh {
+                return Ok(());
+            }
+            ensure!(self.power == Power::On, "refresh-rate changes require normal display power");
+            let blob = self
+                .refresh_modes
+                .iter()
+                .find(|(mode_hz, _)| *mode_hz == hz)
+                .map(|(_, blob)| *blob)
+                .with_context(|| format!("the panel has no {hz} Hz mode at its size"))?;
+            self.settle()?;
+            let mut req = atomic::AtomicModeReq::new();
+            req.add_property(self.crtc, self.mode_id, blob);
+            req.add_property(self.crtc, self.active, property::Value::Boolean(true));
+            commit(&self.card, req, AtomicCommitFlags::ALLOW_MODESET)
+                .with_context(|| format!("switch the panel to {hz} Hz"))?;
+            self.refresh = hz;
+            self.fastest = (hz != self.preferred_refresh).then_some(blob);
+            self.slow = false;
+            Ok(())
+        }
+
         pub fn speed_up(&mut self) -> Result<()> {
+            if self.power.is_aod() {
+                return Err(anyhow!("refresh-rate changes require normal display power"));
+            }
             if self.slow {
                 self.settle()?;
                 self.to_fastest()?;
@@ -859,6 +1102,12 @@ pub mod kms {
             if (canvas.w, canvas.h) != (self.w, self.h) {
                 return Err(anyhow!("canvas {}x{} does not match the display {}x{}", canvas.w, canvas.h, self.w, self.h));
             }
+            if self.power == Power::AodSleeping {
+                // AOD updates must resume the display engine through LP1,
+                // preserving doze. Combining the frame with ON would flash
+                // normal content and run the driver's NOLP sequence.
+                self.begin_aod()?;
+            }
             let order = self.order;
             let buf = &self.bufs[self.back];
             let pitch = buffer::Buffer::pitch(&buf.db) as usize;
@@ -881,11 +1130,11 @@ pub mod kms {
                 req.add_property(plane, fb_prop, property::Value::Framebuffer(Some(buf.fb)));
             }
             let mut flags = AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT;
-            if self.power != Power::On {
+            if self.power.present_wakes() {
                 // The panel runs again, and coming on from off it would
                 // otherwise rest again as it last did.
-                if let Some((id, run, _)) = self.lp {
-                    req.add_property(self.conn, id, property::Value::UnsignedRange(run));
+                if let Some(lp) = self.lp {
+                    req.add_property(self.conn, lp.property, property::Value::UnsignedRange(lp.on));
                 }
             }
             if self.power == Power::Off {
@@ -901,7 +1150,7 @@ pub mod kms {
             if self.power == Power::Off {
                 self.slow = self.fastest.is_some();
             }
-            self.power = Power::On;
+            self.power = self.power.after_present();
             self.flipping = true;
             self.back = (self.back + 1) % self.bufs.len();
             Ok(())

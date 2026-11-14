@@ -23,7 +23,7 @@ pub fn add_key(mount: &Path, raw: &[u8], wrapped: bool) -> Result<[u8; NAME_BYTE
     const HARDWARE_WRAPPED: u32 = 1;
     const ADD_KEY: u32 = 0xc050_6617;
 
-    let mut arg = vec![0u8; HEADER_BYTES + raw.len()];
+    let mut arg = zeroize::Zeroizing::new(vec![0u8; HEADER_BYTES + raw.len()]);
     arg[0..4].copy_from_slice(&BY_IDENTIFIER.to_ne_bytes());
     arg[40..44].copy_from_slice(&(raw.len() as u32).to_ne_bytes());
     if wrapped {
@@ -81,6 +81,21 @@ pub fn unlocked(dir: &Path) -> Result<bool> {
         return Err(std::io::Error::last_os_error()).with_context(|| format!("ask whether the key for {} is in", dir.display()));
     }
     Ok(u32::from_ne_bytes(status[64..68].try_into().expect("four bytes")) == PRESENT)
+}
+
+/// Inspect a v2 policy identifier without adding keys or reading filenames.
+#[cfg(target_os = "android")]
+pub fn v2_policy_identifier(dir: &Path) -> Result<Option<[u8; NAME_BYTES]>> {
+    use std::os::fd::AsRawFd;
+    let f=std::fs::File::open(dir)?;
+    let mut p=[0u8;32];p[..8].copy_from_slice(&24u64.to_ne_bytes());
+    if unsafe{libc::ioctl(f.as_raw_fd(),0xc009_6616u32 as libc::Ioctl,p.as_mut_ptr())} != 0 {
+        let e=std::io::Error::last_os_error();
+        if e.raw_os_error()==Some(libc::ENODATA){return Ok(None);}
+        return Err(e).context("query CE directory encryption policy");
+    }
+    anyhow::ensure!(p[8]==2,"CE directory does not use fscrypt v2");
+    let mut id=[0;NAME_BYTES];id.copy_from_slice(&p[16..32]);Ok(Some(id))
 }
 
 /// Whether what a phone says about how it encrypts its files means the

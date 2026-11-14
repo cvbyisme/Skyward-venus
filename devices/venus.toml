@@ -1,0 +1,54 @@
+# venus integrated Recovery. Owner PIN/password through HIDL Keymaster 4.1.
+# Data is mounted read/write; original system partitions remain read-only.
+# Logical density is a UI choice, not measured physical PPI.
+[device]
+codename = "venus"
+brand = "Xiaomi"
+model = "Xiaomi 11"
+ab = true
+os_version_prop = "ro.build.version.incremental"
+
+[device.soc]
+en = "Qualcomm Snapdragon 888"
+hans = "高通骁龙 888"
+hant = "高通驍龍 888"
+
+[display]
+width = 1440
+height = 3200
+density = 560
+diagonal = 6.81
+corner_radius = 196
+
+[status_bar]
+height = 100
+left = 247
+right = 43
+bolt_right = 29
+
+[modules]
+sources = ["vendor_boot", "vendor"]
+load = []
+
+[touch]
+hardware_double_tap = "xiaomi_fts"
+
+[backup]
+efs = ["modemst1", "modemst2", "fsg", "fsc", "persist"]
+data_skipped = ["vendor/tzstorage", "vendor/qtee", "vendor/fingerprint", "vendor/fpc", "vendor/goodix"]
+
+[haptics]
+driver = "aw8697"
+click = 0
+strength = { lightest = 0.3, strongest = 0.8 }
+firmware = [{ name = "aw8697_haptic.bin", path = "/mnt/skyward-ro/vendor/firmware/aw8697_haptic.bin" }]
+
+# QCACLD/CNSS are built into this phone's original kernel. The Venus
+# runtime owns CNSS and the fixed ON/OFF controls; firmware is published
+# read-only from the verified installed vendor/modem RAM trees.
+[wlan]
+modules = []
+interface = "wlan0"
+supplicant = "/vendor/bin/hw/wpa_supplicant"
+service = "android.hardware.wifi.supplicant@1.3::ISupplicant/default"
+probe = "http://connect.rom.miui.com/generate_204"

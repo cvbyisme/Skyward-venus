@@ -121,7 +121,15 @@ impl Lock {
     /// order the network uses, which is what the phone's own writer does.
     pub fn of(raw: &[u8]) -> Result<Lock> {
         let mut record = Record { raw, at: 0 };
-        let kind = record.i32()?;
+        // AOSP briefly used the upper 16 bits as a PasswordData version.
+        // Modern readers use the signed low 16 bits; accept only the known
+        // old sign extensions and the documented development layout 2.
+        let field = record.i32()?;
+        let upper = (field as u32 >> 16) as u16;
+        ensure!(matches!(upper, 0 | 2 | 0xffff), "unsupported password-data header");
+        let kind = i32::from(field as i16);
+        ensure!(matches!(kind, Self::NONE | Self::PATTERN | Self::PIN | Self::PASSWORD),
+            "unsupported credential type");
         let cost = [record.u8()?, record.u8()?, record.u8()?];
         let salt = record.counted()?.to_vec();
         let enrolled = record.counted()?.to_vec();
@@ -132,7 +140,12 @@ impl Lock {
     /// from. The work is deliberately slow, and the phone chose how slow.
     pub fn stretched(&self, credential: &[u8]) -> Result<Vec<u8>> {
         let [log_n, log_r, log_p] = self.cost;
-        let cost = scrypt::Params::new(log_n, 1 << log_r, 1 << log_p, STRETCHED_BYTES)
+        ensure!((1..=20).contains(&log_n) && log_r <= 10 && log_p <= 10,
+            "credential stretching cost exceeds supported limits");
+        let (n, r, p) = (1u64 << log_n, 1u64 << log_r, 1u64 << log_p);
+        ensure!(128 * n * r <= 64 * 1024 * 1024 && n * r * p <= 16 * 1024 * 1024,
+            "credential stretching exceeds bounded memory/work limits");
+        let cost = scrypt::Params::new(log_n, r as u32, p as u32, STRETCHED_BYTES)
             .map_err(|e| anyhow::anyhow!("the phone asks for stretching this code cannot do: {e}"))?;
         let mut out = vec![0u8; STRETCHED_BYTES];
         scrypt::scrypt(credential, &self.salt, &cost, &mut out).map_err(|e| anyhow::anyhow!("stretch the credential: {e}"))?;
@@ -148,7 +161,7 @@ struct Record<'a> {
 
 impl<'a> Record<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self.at + n;
+        let end = self.at.checked_add(n).ok_or_else(|| anyhow::anyhow!("record length overflow"))?;
         if end > self.raw.len() {
             bail!("the phone's record holds {} bytes, {n} more were read at {}", self.raw.len(), self.at);
         }
@@ -430,4 +443,31 @@ mod tests {
         let lock = Lock { kind: Lock::PIN, cost: [64, 3, 1], salt: b"salt".to_vec(), enrolled: Vec::new() };
         assert!(lock.stretched(b"1234").is_err());
     }
+    #[test]
+    fn android14_development_header_retains_the_signed_credential_kind() {
+        let mut raw = recorded(Lock::PIN, &[3; 16], &[4; 58]);
+        raw[..2].copy_from_slice(&2u16.to_be_bytes());
+        assert_eq!(Lock::of(&raw).unwrap().kind, Lock::PIN);
+        raw[..2].copy_from_slice(&99u16.to_be_bytes());
+        assert!(Lock::of(&raw).is_err());
+    }
+    #[test]
+    fn invalid_shift_and_memory_exhaustion_costs_are_refused() {
+        for cost in [[11,255,1], [11,3,255], [20,10,1], [0,0,0]] {
+            let lock = Lock {kind:Lock::PIN,cost,salt:vec![0;16],enrolled:vec![0;58]};
+            assert!(lock.stretched(b"test-fixture").is_err());
+        }
+    }
+
+    #[test]
+    fn current_rom_gatekeeper_derivation_matches_independent_public_fixture() {
+        // Public fixture, not a user's credential. Cross-checked with Python
+        // OpenSSL scrypt and SHA-512, and installed services.jar bytecode.
+        let lock = Lock { kind: Lock::PIN, cost: [11, 3, 1], salt: (0u8..16).collect(), enrolled: vec![] };
+        let stretched = lock.stretched(b"24681357").unwrap();
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(hex(&stretched), "f3b7394e91fca7909be9db36b045753fc3865f2157d4a01bb06109e89223d49b");
+        assert_eq!(hex(&gatekeeper_password(&stretched)), "6891adc81d32680ed860bdd647bf52836ca7151ee8aebe246780642495e3aee0ba2509653891c9f0e3cb752bee98c9b2871d592b9eef4359c74f4059d6147b77");
+    }
+
 }

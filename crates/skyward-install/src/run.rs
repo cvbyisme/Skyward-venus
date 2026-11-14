@@ -109,6 +109,8 @@ impl Installer {
         options: Options,
         work: impl FnOnce(&mut Context) -> Outcome + Send + 'static,
     ) -> Result<Installer> {
+        crate::task_scope::ensure_installers_quiet()
+            .context("a previous installer still has unconfirmed descendants")?;
         let (commands, command_rx) = mpsc::channel();
         let shared = Arc::new(Shared::default());
         let theirs = shared.clone();
@@ -856,6 +858,8 @@ fn run_script(ctx: &mut Context, size: u64) -> Result<Done> {
     };
     let mounted = skyward_block::mount::mount_ids()?;
     let ran = run_binary(ctx);
+    crate::task_scope::ensure_installers_quiet()
+        .context("installer descendants are not confirmed stopped; preserving mounts and withholding reflash")?;
     if let Err(e) = clean_up(&mounted, &mapped) {
         let _ = kmsg(&format!("install: not all the script left behind was taken away: {e:#}"));
     }
@@ -925,13 +929,30 @@ enum Said {
     Output(String),
 }
 
-/// A process group, all that is still in it ended once this is let go.
-struct Group(libc::pid_t);
+/// Keep the leader unreaped until group shutdown has been observed. A failed
+/// shutdown retains its RAM task receipt for the maintenance entry point.
+struct Group {
+    child: std::process::Child,
+    task: crate::task_scope::Task,
+    stopped: bool,
+}
+
+impl Group {
+    fn stop(&mut self) -> Result<()> {
+        if !self.stopped {
+            // At most one bounded shutdown attempt, including error unwind.
+            self.stopped = true;
+            self.task.stop_installer(&mut self.child)?;
+        }
+        Ok(())
+    }
+}
 
 impl Drop for Group {
     fn drop(&mut self) {
-        // A group that has ended already is no one's to end.
-        unsafe { libc::kill(-self.0, libc::SIGKILL) };
+        if let Err(error) = self.stop() {
+            let _ = kmsg(&format!("install: background group shutdown unconfirmed: {error:#}"));
+        }
     }
 }
 
@@ -945,7 +966,7 @@ fn run_binary(ctx: &Context) -> Result<(i32, bool)> {
     let (output_read, output_write) = pipe()?;
     let fd = requests_write.as_raw_fd();
     let mut command = std::process::Command::new(BINARY);
-    command.args([API_VERSION, &fd.to_string(), fuse::PACKAGE]);
+    command.args([API_VERSION, &crate::shell_pipe::REQUEST_FD.to_string(), fuse::PACKAGE]);
     // A script started again after a restart cut it off is told so, as
     // Android's own recovery tells it, to pick up where it was.
     if ctx.origin == (Origin::Asked { retry: true }) {
@@ -963,14 +984,15 @@ fn run_binary(ctx: &Context) -> Result<(i32, bool)> {
     unsafe {
         command.pre_exec(move || {
             libc::umask(0o022);
-            if libc::setpgid(0, 0) == -1 || libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+            if libc::setpgid(0, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
-            Ok(())
+            crate::shell_pipe::inherit(fd)
         });
     }
-    let mut child = command.spawn().with_context(|| format!("start {BINARY}"))?;
-    let group = Group(child.id() as libc::pid_t);
+    let (child, task) = crate::task_scope::Task::spawn(&mut command, crate::task_scope::Kind::InstallerGroup)
+        .with_context(|| format!("start {BINARY}"))?;
+    let mut group = Group { child, task, stopped: false };
     ctx.send(Event::Running);
     // The outputs close once only the script and what it runs hold them.
     drop(command);
@@ -1020,7 +1042,8 @@ fn run_binary(ctx: &Context) -> Result<(i32, bool)> {
             Ok(Said::Unknown(line)) => writeln!(log, "[unknown request] {line}").context("write the log")?,
             Ok(Said::Output(line)) => writeln!(log, "{line}").context("write the log")?,
             Err(RecvTimeoutError::Timeout) => {}
-            // Every output has closed: the script, and all it ran, are done.
+            // Output closure is not process completion: a background task
+            // may have redirected every fd. The group is checked below.
             Err(RecvTimeoutError::Disconnected) => break,
         }
         if let Some(now) = thousandths(&bar).filter(|&now| shown != Some(now) && told.elapsed() >= PROGRESS_EVERY) {
@@ -1029,11 +1052,11 @@ fn run_binary(ctx: &Context) -> Result<(i32, bool)> {
             ctx.send(Event::Progress(Stage::Script { thousandths: now }));
         }
         if ended.is_none() {
-            ended = child.try_wait().context("see whether the install script has ended")?.map(|status| (status, Instant::now()));
+            ended = crate::task_scope::observed_exit(&group.child)?.map(|status| (status, Instant::now()));
         }
         if let Some((_, at)) = ended {
             if at.elapsed() >= LINGER && !others_ended {
-                unsafe { libc::kill(-group.0, libc::SIGKILL) };
+                group.stop()?;
                 others_ended = true;
             }
             if at.elapsed() >= LINGER * 2 {
@@ -1049,8 +1072,12 @@ fn run_binary(ctx: &Context) -> Result<(i32, bool)> {
     }
     let status = match ended {
         Some((status, _)) => status,
-        None => child.wait().context("wait for the install script")?,
+        None => loop {
+            if let Some(status) = crate::task_scope::observed_exit(&group.child)? { break status; }
+            thread::sleep(PROGRESS_EVERY);
+        },
     };
+    group.stop()?;
     writeln!(log, "[ended: {status}]").context("write the log")?;
     Ok((status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)), wipe_cache))
 }

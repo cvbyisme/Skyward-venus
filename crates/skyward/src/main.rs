@@ -39,6 +39,34 @@ mod settings;
 mod systems;
 #[cfg(target_os = "android")]
 mod ui;
+#[cfg(any(target_os = "android", test))]
+mod venus_basic;
+#[cfg(target_os = "android")]
+mod venus_keymaster;
+#[cfg(target_os = "android")]
+mod venus_ce;
+#[cfg(any(target_os = "android", test))]
+mod venus_data_ro;
+#[cfg(any(target_os = "android", test))]
+mod venus_data_session;
+#[cfg(any(target_os = "android", test))]
+mod venus_rw;
+#[cfg(target_os = "android")]
+mod venus_runtime;
+#[cfg(target_os = "android")]
+mod venus_firmware;
+#[cfg(target_os = "android")]
+mod venus_wlan;
+#[cfg(any(target_os = "android", test))]
+mod venus_wlan_mac;
+#[cfg(target_os = "android")]
+mod mobile;
+#[cfg(target_os = "android")]
+mod venus_modem;
+#[cfg(any(target_os = "android", test))]
+mod venus_maintenance;
+#[cfg(target_os = "android")]
+mod ui_probe;
 #[cfg(target_os = "android")]
 mod updates;
 #[cfg(any(target_os = "android", test))]
@@ -66,6 +94,40 @@ enum Cmd {
     /// Print the suffix of the slot the phone runs from and, where the
     /// phone's boot control runs, what it holds of each slot.
     Slot,
+    /// Read SIM readiness and registration through QRTR/QMI, without
+    /// subscriber identifiers, credential attempts or modem state changes.
+    #[cfg(target_os = "android")]
+    CellularStatus,
+    /// Explicitly enable the temporary Recovery's modem radio.
+    #[cfg(target_os = "android")]
+    CellularRadioOnline,
+    /// Publish current-boot verified RAM firmware for the kernel loader.
+    #[cfg(target_os = "android")]
+    VenusFirmware,
+    /// Independent init owner for Venus modem and packet data.
+    #[cfg(target_os = "android")]
+    VenusModem,
+    /// Internal read-only HIDL query, isolated from the modem owner.
+    #[cfg(target_os = "android")]
+    #[command(hide = true)]
+    VenusSuspendCheck,
+    #[cfg(target_os = "android")]
+    #[command(hide = true)]
+    VenusNetdCheck,
+    /// Request a radio/data transition or read its verified state.
+    #[cfg(target_os = "android")]
+    VenusModemControl { command: Option<String> },
+    /// Read-only current-slot maintenance plan; --execute commits the same backend.
+    #[cfg(target_os = "android")]
+    VenusMaintenance {
+        #[arg(value_parser = ["disable-avb", "install-recovery"])]
+        action: String,
+        #[arg(long, requires = "expect_plan")]
+        execute: bool,
+        /// review_token printed by the immediately preceding read-only plan.
+        #[arg(long)]
+        expect_plan: Option<String>,
+    },
     /// List modules in dependency load order from a source directory.
     Modules {
         #[arg(long, default_value = "/vendor/lib/modules")]
@@ -118,7 +180,7 @@ enum Cmd {
     Merge,
     /// Keep the configuration's programs that this phone runs, and those
     /// its partitions name for its keys, going until stopped.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", test))]
     Services {
         #[arg(long, default_value = "/skyward/device.toml")]
         config: String,
@@ -168,8 +230,62 @@ enum Cmd {
     Clock,
     /// Say whether a service has registered with the phone's service
     /// directory, such as android.hardware.security.keymint.IKeyMintDevice/default.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", test))]
     Service { name: String },
+    /// Query venus HIDL Keymaster 4.1, optionally test metadata key unwrap in RAM.
+    #[cfg(target_os = "android")]
+    Keymaster41 {
+        #[arg(long)]
+        metadata: bool,
+        /// Permit one key upgrade in RAM; never persist the upgraded blob.
+        #[arg(long, requires = "metadata")]
+        memory_upgrade: bool,
+        /// Verify a read-only F2FS mount; choose retention or explicitly acknowledge teardown risk.
+        #[arg(long, requires = "metadata")]
+        data_ro: bool,
+        /// Retain/reuse the owned read-only session for later DE; never automatically unmount.
+        #[arg(long, requires = "data_ro", conflicts_with = "allow_teardown_test")]
+        keep_data_ro: bool,
+        /// Explicitly allow a teardown test which has reset this test kernel.
+        #[arg(long, requires = "data_ro", conflicts_with = "keep_data_ro")]
+        allow_teardown_test: bool,
+        /// Also load device-encrypted fscrypt keys into the temporary read-only mount.
+        #[arg(long, requires = "data_ro")]
+        de: bool,
+    },
+    /// Run the integrated venus Recovery with hardware-authenticated writable Data.
+    #[cfg(target_os = "android")]
+    VenusRecovery {
+        #[arg(long, default_value = "/skyward/device.toml")]
+        config: PathBuf,
+        /// Draw one frame and exit before any input or data-opening effect.
+        #[arg(long)]
+        dump: Option<PathBuf>,
+    },
+    /// Inspect the owned writable Data session, or run an explicit small write test.
+    #[cfg(any(target_os = "android", test))]
+    VenusDataRw {
+        #[arg(long, conflicts_with = "close_session")]
+        write_test: bool,
+        /// Sync and close the owned session after stopping the UI and MTP.
+        #[arg(long)]
+        close_session: bool,
+    },
+    /// Verify the current-boot RAM HAL runtime; optionally release only
+    /// its owned source mappings without stopping any security service.
+    #[cfg(any(target_os = "android", test))]
+    VenusRuntime {
+        #[arg(long)]
+        release_sources: bool,
+    },
+    /// Inspect owner CE on the existing read-only session; unlock is explicit.
+    #[cfg(target_os = "android")]
+    VenusCe {
+        #[arg(long)]
+        unlock_stdin: bool,
+        #[arg(long, requires = "unlock_stdin")]
+        accept_credential_check: bool,
+    },
     /// Report the phone's key service and, given a key directory Android
     /// wrote, unwrap the key it holds and say how long it is.
     #[cfg(target_os = "android")]
@@ -184,7 +300,11 @@ enum Cmd {
     /// Say what the phone's credential service answers, which takes no
     /// credential and changes nothing.
     #[cfg(target_os = "android")]
-    Gatekeeper,
+    Gatekeeper {
+        /// Query the HIDL 1.0 descriptor without submitting any credential.
+        #[arg(long)]
+        hidl: bool,
+    },
     /// Say what the phone's weaver says of itself, which reads no slot and
     /// changes nothing.
     #[cfg(target_os = "android")]
@@ -203,6 +323,30 @@ enum Cmd {
         /// it erases it: every other program holding it ends first.
         #[arg(long, conflicts_with = "credential")]
         close: bool,
+    },
+    /// Bring up real menus and touch without executing system effects (venus probe only).
+    #[cfg(target_os = "android")]
+    UiProbe {
+        #[arg(long, default_value = "/tmp/venus-ui-probe.toml")]
+        config: PathBuf,
+        #[arg(long, default_value_t = 900, conflicts_with = "until_stopped")]
+        seconds: u64,
+        /// Remain in the guarded automatic-UI image until the service is stopped.
+        #[arg(long)]
+        until_stopped: bool,
+        /// Enable verified basic operations, but not flashing/wipe/crypto.
+        #[arg(long)]
+        basic_features: bool,
+    },
+    /// Diagnose venus basic operations without entering the full recovery workflow.
+    #[cfg(target_os = "android")]
+    VenusBasic {
+        #[arg(value_parser = ["status", "mount", "unmount", "list", "clock", "logs", "settings-test", "selftest"])]
+        action: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, default_value = "/skyward/device.toml")]
+        config: PathBuf,
     },
     /// Drive the panel and touchscreen with the recovery UI.
     #[cfg(target_os = "android")]
@@ -223,6 +367,163 @@ enum Cmd {
     },
 }
 
+/// A Binder peer can stop replying forever. Keep the read-only query in
+/// a disposable process, with ordinary-file output so reading its result
+/// cannot wait for a pipe writer. No modem/NV helper uses this termination.
+#[cfg(any(target_os = "android", all(test, unix)))]
+mod suspend_query {
+    use anyhow::{ensure, Context, Result};
+    use std::{fs::File, io::{Read, Seek, SeekFrom}, process::{Child, Command, Stdio},
+        thread, time::{Duration, Instant}};
+
+    fn terminate(child: &mut Child) -> Result<()> {
+        if child.try_wait()?.is_some() { return Ok(()); }
+        unsafe extern "C" { fn kill(pid: i32, signal: i32) -> i32; }
+        // This exact Child is still unreaped, so its PID cannot be reused.
+        // TERM gives normal query teardown a brief chance; unlike NV
+        // writers, this read-only Binder process may safely be killed.
+        unsafe { kill(child.id() as i32, 15); }
+        let until = Instant::now() + Duration::from_millis(200);
+        while child.try_wait()?.is_none() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if child.try_wait()?.is_none() {
+            child.kill().context("kill stalled read-only suspend query")?;
+        }
+        child.wait().context("reap read-only suspend query")?;
+        Ok(())
+    }
+
+    pub fn run(mut command: Command, output: &mut File, timeout: Duration,
+        cancelled: impl Fn() -> bool) -> Result<bool> {
+        ensure!(output.metadata()?.is_file(), "suspend query output must be a regular file");
+        output.set_len(0)?;
+        output.seek(SeekFrom::Start(0))?;
+        command.stdin(Stdio::null()).stdout(output.try_clone()?);
+        let until = Instant::now() + timeout;
+        let mut child = command.spawn().context("start read-only suspend query")?;
+        let result = (|| -> Result<bool> {
+            let status = loop {
+                ensure!(!cancelled(), "read-only suspend query cancelled");
+                ensure!(Instant::now() < until, "read-only suspend query timed out");
+                if let Some(status) = child.try_wait()? { break status; }
+                thread::sleep(Duration::from_millis(20));
+            };
+            ensure!(status.success(), "read-only suspend query failed: {status}");
+            ensure!(output.metadata()?.len() <= 32, "oversize suspend query result");
+            output.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            output.take(33).read_to_end(&mut bytes)?;
+            match bytes.as_slice() {
+                b"present\n" => Ok(true),
+                b"absent\n" => Ok(false),
+                _ => anyhow::bail!("invalid suspend query result"),
+            }
+        })();
+        // Every error also reaps the query. It must never be interpreted
+        // as 'absent', nor leave a blocked Binder call in the owner.
+        if result.is_err() {
+            terminate(&mut child).context("terminate unsuccessful suspend query")?;
+        }
+        result
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn shell(script: &str) -> Command {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]).stderr(Stdio::null());
+            command
+        }
+        #[test]
+        fn only_successful_exact_absence_is_absent() {
+            for (script, expected) in [("printf 'present\\n'", Some(true)),
+                ("printf 'absent\\n'", Some(false)), ("printf 'absent\\n'; exit 7", None),
+                ("printf 'absent\\nextra\\n'", None), ("exit 0", None)] {
+                let mut output = tempfile::tempfile().unwrap();
+                let result = run(shell(script), &mut output, Duration::from_secs(2), || false);
+                assert_eq!(result.ok(), expected, "script={script}");
+            }
+        }
+        #[test]
+        fn stalled_query_ignoring_term_is_killed_and_reaped() {
+            let temp = tempfile::tempdir().unwrap();
+            let pid_path = temp.path().join("pid");
+            let mut command = shell("echo $$ > \"$1\"; trap '' TERM; while :; do :; done");
+            command.arg("probe").arg(&pid_path);
+            let mut output = tempfile::tempfile().unwrap();
+            let started = Instant::now();
+            assert!(run(command, &mut output, Duration::from_millis(250), || false).is_err());
+            assert!(started.elapsed() < Duration::from_secs(2));
+            let pid = std::fs::read_to_string(pid_path).unwrap();
+            assert!(!std::path::Path::new(&format!("/proc/{}", pid.trim())).exists());
+        }
+        #[test]
+        fn cancellation_never_reports_absence() {
+            let mut output = tempfile::tempfile().unwrap();
+            assert!(run(shell("printf 'absent\\n'"), &mut output,
+                Duration::from_secs(5), || true).is_err());
+        }
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn needs_maintenance_lease(command: &Cmd) -> bool {
+    match command {
+        Cmd::Reboot { .. } | Cmd::Mount | Cmd::Umount => true,
+        #[cfg(target_os = "android")]
+        Cmd::Discard { .. } | Cmd::Mkfs { .. } | Cmd::Merge | Cmd::Data { .. } => true,
+        Cmd::Services { .. }
+        | Cmd::VenusRuntime { release_sources: true }
+        | Cmd::VenusDataRw { close_session: true, .. }
+        | Cmd::VenusDataRw { write_test: true, .. } => true,
+        // `service` is a directory query used by boot-runtime.sh while the
+        // UI owns the lease. Only `services` launches a service runner.
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod maintenance_command_tests {
+    use super::*;
+
+    fn exclusive(arguments: &[&str]) -> bool {
+        let parsed = Cli::try_parse_from(std::iter::once("skyward").chain(arguments.iter().copied()))
+            .expect("valid production CLI arguments");
+        needs_maintenance_lease(&parsed.cmd)
+    }
+
+    #[test]
+    fn boot_queries_and_runtime_cooperation_can_run_while_ui_holds_lease() {
+        for arguments in [
+            vec!["service", "android.hardware.boot.IBootControl/default"],
+            vec!["slot"],
+            vec!["bcb"],
+            vec!["update"],
+            vec!["venus-runtime"],
+            vec!["venus-data-rw"],
+        ] {
+            assert!(!exclusive(&arguments), "query or cooperating runtime command: {arguments:?}");
+        }
+    }
+
+    #[test]
+    fn service_runner_and_explicit_storage_changes_remain_exclusive() {
+        for arguments in [
+            vec!["services"],
+            vec!["venus-runtime", "--release-sources"],
+            vec!["venus-data-rw", "--write-test"],
+            vec!["venus-data-rw", "--close-session"],
+            vec!["mount"],
+            vec!["umount"],
+            vec!["reboot", "recovery"],
+        ] {
+            assert!(exclusive(&arguments), "mutating command: {arguments:?}");
+        }
+    }
+}
+
 fn main() -> Result<()> {
     // init starts the recovery service by path with no arguments.
     let started_as = std::env::args_os().next().unwrap_or_default();
@@ -232,12 +533,52 @@ fn main() -> Result<()> {
     }
     // Install scripts run the commands linked to this binary by their names.
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    // The legacy AVB writer must not cross maintenance or a live UI installer.
+    #[cfg(target_os = "android")]
+    let _legacy_lease = if name == "avbctl" && venus_rw::enabled() { Some(venus_maintenance::legacy_lease()?) } else { None };
     if let Some(code) = skyward_install::commands::run(name, &args) {
         std::process::exit(code);
     }
-    match Cli::parse().cmd {
+    let command = Cli::parse().cmd;
+    #[cfg(target_os = "android")]
+    let _command_lease = if venus_rw::enabled() && needs_maintenance_lease(&command) {
+        Some(venus_maintenance::lease()?)
+    } else { None };
+    match command {
+        // These variants are present on a host only so the production parser
+        // and lease classification can be exercised together by unit tests.
+        #[cfg(all(test, not(target_os = "android")))]
+        Cmd::Service { .. } | Cmd::Services { .. } | Cmd::VenusDataRw { .. } | Cmd::VenusRuntime { .. } => {
+            anyhow::bail!("Android-only command")
+        }
         Cmd::Info { config } => info(&config),
         Cmd::Slot => slot(),
+        #[cfg(target_os = "android")]
+        Cmd::CellularStatus => {
+            println!("{}", skyward_net::cellular::status_json()?);
+            Ok(())
+        },
+        #[cfg(target_os = "android")]
+        Cmd::CellularRadioOnline => {
+            anyhow::ensure!(unsafe { libc::geteuid() } == 0 && std::path::Path::new("/skyward/venus-recovery.txt").is_file(), "requires temporary Venus Recovery");
+            skyward_net::cellular::radio_online()
+        },
+        #[cfg(target_os = "android")]
+        Cmd::VenusFirmware => venus_firmware::publish(),
+        #[cfg(target_os = "android")]
+        Cmd::VenusModem => venus_modem::run(),
+        #[cfg(target_os = "android")]
+        Cmd::VenusSuspendCheck => venus_modem::suspend_check(),
+        #[cfg(target_os = "android")]
+        Cmd::VenusNetdCheck => venus_modem::netd_check(),
+        #[cfg(target_os = "android")]
+        Cmd::VenusModemControl { command } => {
+            if let Some(command)=command { venus_modem::request(&command)?; }
+            println!("{}",serde_json::to_string_pretty(&venus_modem::snapshot()?)?);
+            Ok(())
+        },
+        #[cfg(target_os = "android")]
+        Cmd::VenusMaintenance { action, execute, expect_plan } => venus_maintenance::cli(&action, execute, expect_plan.as_deref()),
         Cmd::Modules { source } => modules(&source),
         Cmd::Load { config, names } => {
             let cfg = DeviceConfig::load(&config)?;
@@ -250,6 +591,8 @@ fn main() -> Result<()> {
         Cmd::Recovery => recovery(),
         Cmd::Reboot { target } => {
             let p = Power::parse(&target).ok_or_else(|| anyhow!("unknown target {target:?}"))?;
+            #[cfg(target_os = "android")]
+            venus_modem::quiesce()?;
             skyward_sys::power(p)
         }
         Cmd::Bcb => {
@@ -345,6 +688,21 @@ fn main() -> Result<()> {
             Ok(())
         }
         #[cfg(target_os = "android")]
+        Cmd::Keymaster41 { metadata, memory_upgrade, data_ro, de, keep_data_ro, allow_teardown_test } => venus_keymaster::run(metadata, memory_upgrade, data_ro, de, keep_data_ro, allow_teardown_test),
+        #[cfg(target_os = "android")]
+        Cmd::VenusRecovery { config, dump } => venus_rw::run_ui(&config, dump.as_deref()),
+        #[cfg(target_os = "android")]
+        Cmd::VenusDataRw { write_test, close_session } => if close_session { venus_rw::close_session() } else if write_test { venus_rw::write_test() } else { venus_rw::status() },
+        #[cfg(target_os = "android")]
+        Cmd::VenusRuntime { release_sources } => {
+            if release_sources { venus_runtime::release_sources()?; }
+            venus_runtime::verified()?;
+            println!("VENUS_RUNTIME_CACHE_VERIFIED services=6 source_release={release_sources}");
+            Ok(())
+        },
+        #[cfg(target_os = "android")]
+        Cmd::VenusCe { unlock_stdin, accept_credential_check } => venus_ce::run(unlock_stdin, accept_credential_check),
+        #[cfg(target_os = "android")]
         Cmd::Keymint { key, alias } => {
             let binder = skyward_binder::driver::Binder::open()?;
             let service = skyward_crypto::keymint::KeyMint::open(&binder)?;
@@ -371,22 +729,15 @@ fn main() -> Result<()> {
             Ok(())
         }
         #[cfg(target_os = "android")]
-        Cmd::Gatekeeper => {
-            let (binder, hardware) = (skyward_binder::driver::Binder::open()?, skyward_binder::driver::Binder::hardware()?);
-            let gatekeeper = skyward_crypto::gatekeeper::Gatekeeper::open(&binder, &hardware)?;
-            println!("the credential service answers for {}", gatekeeper.serves()?);
-            match gatekeeper.version() {
-                Ok(Some(version)) => println!("it serves version {version} of that interface"),
-                Ok(None) => println!("it numbers its version in its own name"),
-                Err(e) => println!("it will not say which version it serves: {e:#}"),
-            }
-            // A credential belonging to no one, which the secure world
-            // cannot recognise and counts against nobody. What comes back
-            // says whether the service takes a check at all, apart from
-            // whether it recognises what it is given.
-            match gatekeeper.verify(NOBODY, &[], &[]) {
-                Ok(_) => println!("it took a credential belonging to no one"),
-                Err(e) => println!("asked about a credential belonging to no one it says: {e:#}"),
+        Cmd::Gatekeeper { hidl } => {
+            let hardware = skyward_binder::driver::Binder::hardware()?;
+            if hidl {
+                let g = skyward_crypto::gatekeeper::Gatekeeper::open_hidl(&hardware)?;
+                println!("GATEKEEPER_HIDL_READY interface={} credential_submitted=false", g.serves()?);
+            } else {
+                let binder = skyward_binder::driver::Binder::open()?;
+                let g = skyward_crypto::gatekeeper::Gatekeeper::open(&binder, &hardware)?;
+                println!("GATEKEEPER_READY interface={} credential_submitted=false", g.serves()?);
             }
             Ok(())
         }
@@ -435,6 +786,10 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        #[cfg(target_os = "android")]
+        Cmd::UiProbe { config, seconds, until_stopped, basic_features } => ui_probe::run(&config, seconds, until_stopped, basic_features),
+        #[cfg(target_os = "android")]
+        Cmd::VenusBasic { action, name, config } => venus_basic::runtime::cli(&config, &action, name.as_deref()),
         #[cfg(target_os = "android")]
         Cmd::Ui { config, font, mono, unlock, dump } => {
             let cfg = DeviceConfig::load(&config)?;
@@ -669,11 +1024,6 @@ fn agree_on_the_notes_key(registered: &[String]) -> Result<()> {
     skyward_sys::kmsg(&format!("{agreed} of the secure world agreed on the key it signs its notes with"))
 }
 
-/// A slot of the credential service that belongs to no user, which the
-/// phone numbers its own from nothing upwards.
-#[cfg(target_os = "android")]
-const NOBODY: u32 = u32::MAX;
-
 /// The switch that has the kernel pass the firmware requests it cannot
 /// answer itself on to ueventd.
 #[cfg(target_os = "android")]
@@ -733,6 +1083,8 @@ fn adopt_installed_version(props: &std::collections::HashMap<String, String>) ->
 /// once, so that any reboot from here boots the system. Failures go to the
 /// kernel log and still end the process, which init then starts again.
 fn recovery() -> Result<()> {
+    #[cfg(target_os = "android")]
+    let _recovery_lease = if venus_rw::enabled() { Some(venus_maintenance::lease()?) } else { None };
     use std::os::unix::fs::PermissionsExt;
     let run = || -> Result<()> {
         // Open to the programs the recovery runs as other users, the
@@ -857,6 +1209,9 @@ fn prepare(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<Vec<skyward_co
 
 fn info(config: &str) -> Result<()> {
     let cfg = DeviceConfig::load(config)?;
+    #[cfg(target_os = "android")]
+    let i = ui::collect_info(&cfg)?;
+    #[cfg(not(target_os = "android"))]
     let i = skyward_info::collect(&cfg)?;
     println!("model         = {} ({})", i.model, i.codename);
     println!("soc           = {:?}", i.soc);

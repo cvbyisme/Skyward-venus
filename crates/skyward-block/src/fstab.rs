@@ -54,7 +54,12 @@ pub fn entries(text: &str) -> Vec<Entry> {
 /// Every entry of the phone's own table, read from wherever the table is.
 fn table() -> Result<Vec<Entry>> {
     let mut out = Vec::new();
-    for file in FILES {
+    let venus = std::fs::read_to_string("/skyward/venus-recovery.txt")
+        .is_ok_and(|s| s.starts_with("venus-recovery-rw-v1\n"));
+    let files: &[&str] = if venus {
+        &["/mnt/skyward-ro/vendor/etc/fstab.default"]
+    } else { &FILES };
+    for file in files {
         let text = match std::fs::read_to_string(file) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,

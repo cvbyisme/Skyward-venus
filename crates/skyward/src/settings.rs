@@ -20,6 +20,7 @@ const WRITING: &str = "/metadata/skyward/settings.json.new";
 /// What the file holds. The recovery starts as well where it cannot be
 /// read, as with /metadata damaged, so why goes to the kernel log.
 pub fn read() -> Result<Kept> {
+    if crate::venus_rw::enabled() { return Ok(crate::venus_basic::runtime::kept()); }
     match with_metadata(read_file) {
         Ok(kept) => Ok(kept),
         Err(e) => {
@@ -46,6 +47,9 @@ fn read_file() -> Result<Kept> {
 /// Write `settings` whole: into a file beside theirs, flushed, then moved
 /// over it, with /metadata writable only meanwhile.
 pub fn write(settings: &Settings) -> Result<()> {
+    // The DEBUG logger owns a writable /metadata mount. Do not remount it
+    // read-only behind the logger or other hardware-service diagnostics.
+    if crate::venus_rw::enabled() { return crate::venus_basic::runtime::save(settings); }
     with_metadata(|| {
         skyward_vab::metadata_writable(true)?;
         let wrote = write_file(settings);

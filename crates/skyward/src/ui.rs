@@ -30,8 +30,10 @@ use skyward_block::usb::{self, Drive};
 use skyward_net::download::{self, Failure};
 use skyward_net::http::Servers;
 use skyward_net::release::{Installed, Release, Unanswered};
+use skyward_net::supplicant::Security;
 use skyward_net::wlan::{Power as WlanPower, Stage as Joining, Wlan};
-use skyward_sys::sleep::{Sleeper, Slept};
+use skyward_sys::alarm::{AlarmEvent, WakeAlarm};
+use skyward_sys::sleep::{Sleeper, Slept, Wakeful};
 use skyward_sys::uevent;
 use skyward_systems::Who;
 use skyward_ui::app::{
@@ -40,7 +42,7 @@ use skyward_ui::app::{
     RenameRefused, Screen, Shot, SkywardEnd, SkywardStage, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION, DOWNLOADS,
     INSTALL_UNFINISHED, USB_DRIVE,
 };
-use skyward_ui::settings::Keeper;
+use skyward_ui::settings::{Keeper, Kept};
 use skyward_ui::surface::kms::KmsSurface;
 use skyward_ui::{Canvas, Fonts, Lang, Surface};
 use skyward_vab::{Merge, Standing};
@@ -110,7 +112,21 @@ impl Backlight {
                 .parse()
                 .with_context(|| format!("parse {name}"))
         };
-        let top = normal_max(read("max_brightness")?)?;
+        let max = read("max_brightness")?;
+        // The panel's normal maximum is read from the node the display
+        // driver booted with, which not every panel gives the same way. A
+        // panel whose node says it as none of them still shows the pages,
+        // at the whole of the backlight's range, and the reason goes to the
+        // kernel log rather than ending the recovery.
+        let top = if crate::venus_rw::enabled() { (max / 4).clamp(1, 600) } else { match normal_max(max) {
+            Ok(top) => top,
+            Err(e) => {
+                let _ = skyward_sys::kmsg(&format!(
+                    "the panel's normal maximum brightness is not known, so the backlight's own maximum is used: {e:#}"
+                ));
+                max
+            }
+        }};
         let level = read("brightness")?;
         Ok(Backlight { path: dir.join("brightness"), top, level })
     }
@@ -126,6 +142,88 @@ impl Backlight {
         }
         Ok(())
     }
+}
+
+const VENUS_DOZE: &str = "/sys/class/mi_display/disp-DSI-0/doze_brightness";
+const VENUS_DOZE_LOW: u32 = 2;
+
+/// A one-shot wall-clock alarm, protected from firing between the suspend
+/// check and the next poll. Drop closes both fds, including on error recovery.
+struct NativeAod {
+    alarm: WakeAlarm,
+    wakeful: Wakeful,
+    armed: bool,
+}
+
+impl NativeAod {
+    fn open() -> Result<Self> {
+        // EPOLLWAKEUP is silently ignored without this capability. Fail the
+        // AOD request instead of claiming a suspend-safe minute refresh.
+        let status = fs::read_to_string("/proc/self/status")?;
+        let caps = status.lines().find_map(|line| line.strip_prefix("CapEff:"))
+            .context("read effective capabilities for AOD")?;
+        let caps = u64::from_str_radix(caps.trim(), 16)?;
+        ensure!(caps & (1u64 << 36) != 0, "AOD requires CAP_BLOCK_SUSPEND for wakeful alarm processing");
+        let alarm = WakeAlarm::new().context("create AOD wake alarm")?;
+        let wakeful = Wakeful::new()?;
+        wakeful.add(alarm.fd())?;
+        Ok(Self { alarm, wakeful, armed: false })
+    }
+
+    fn changed(&mut self) -> Result<bool> {
+        match self.alarm.drain().context("read AOD wake alarm")? {
+            AlarmEvent::Pending => Ok(false),
+            AlarmEvent::Fired(_) | AlarmEvent::ClockChanged => {
+                self.armed = false;
+                Ok(true)
+            }
+        }
+    }
+
+    fn arm(&mut self, shown_unix: i64) -> Result<()> {
+        // Arm the minute AFTER THE FRAME'S TIME, not after rendering ended.
+        let minute = u64::try_from(shown_unix).context("negative AOD wall clock")? / 60;
+        let due = minute.checked_add(1).and_then(|m| m.checked_mul(60_000))
+            .context("AOD minute deadline overflow")?;
+        self.alarm.arm_at(due).context("arm the next AOD minute")?;
+        self.armed = true;
+        Ok(())
+    }
+}
+
+fn verify_native_doze(expected: u32) -> Result<()> {
+    let value: u32 = fs::read_to_string(VENUS_DOZE).context("read native AOD brightness")?
+        .trim().parse().context("parse native AOD brightness")?;
+    ensure!(value == expected, "native AOD brightness is {value}, requested {expected}");
+    Ok(())
+}
+
+fn set_native_doze(value: u32) -> Result<()> {
+    fs::write(VENUS_DOZE, format!("{value}\n")).context("set native AOD brightness")?;
+    verify_native_doze(value)
+}
+
+/// Release the alarm only after restoring normal panel power.
+fn leave_native_aod(surface: &mut KmsSurface, native: &mut Option<NativeAod>) -> Result<()> {
+    let held = native.take();
+    let alarm_error = held.as_ref().and_then(|n| n.alarm.disarm().err());
+    let wake_error = if surface.is_aod() {
+        match surface.wake() {
+            Ok(()) => None,
+            Err(error) => {
+                surface.turn_off().with_context(|| format!("AOD wake failed ({error:#}); full-off recovery also failed"))?;
+                Some(error)
+            }
+        }
+    } else { None };
+    set_native_doze(0)?;
+    if let Some(error) = wake_error {
+        return Err(error).context("AOD wake required full-off recovery");
+    }
+    if let Some(error) = alarm_error {
+        return Err(error).context("disarm AOD alarm");
+    }
+    Ok(())
 }
 
 /// How a panel's node in the device tree may give its normal maximum: the
@@ -179,6 +277,7 @@ fn normal_max(max: u32) -> Result<u32> {
 
 /// Leave recovery for the chosen target.
 fn power(target: Target) -> Result<()> {
+    if crate::venus_rw::enabled() { crate::venus_modem::quiesce()?; }
     skyward_sys::power(match target {
         Target::System => Power::System,
         Target::Recovery => Power::Recovery,
@@ -890,7 +989,12 @@ fn show_closed(app: &mut App, closed: &[Closed]) -> Result<()> {
 /// links to folders first, then by name ignoring case, each folder with how
 /// many entries it holds. An entry gone by the time it is looked at, as
 /// processes in /proc go, is left out.
-fn read_folder(path: &Path) -> Result<Vec<FileRow>> {
+/// Collect from the port's actual mounts, without remounting the system.
+pub(crate) fn collect_info(cfg: &DeviceConfig) -> Result<skyward_info::DeviceInfo> {
+    if crate::venus_rw::enabled() { crate::venus_rw::info(cfg) } else { skyward_info::collect(cfg) }
+}
+
+pub(crate) fn read_folder(path: &Path) -> Result<Vec<FileRow>> {
     let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
     let mut rows = Vec::new();
     for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
@@ -935,6 +1039,16 @@ fn read_folder(path: &Path) -> Result<Vec<FileRow>> {
 /// `services` this phone's build of the hardware runs is run from it: those
 /// are started again from there whenever they end.
 fn read_mounts(services: &[Service]) -> Result<Vec<skyward_ui::app::MountRow>> {
+    if crate::venus_rw::enabled() {
+        let mut rows = crate::venus_basic::runtime::mounts()?;
+        let cached = crate::venus_runtime::verified().is_ok();
+        for row in &mut rows {
+            if !cached && row.mounted && matches!(row.base.as_str(), "system" | "system_ext" | "vendor" | "odm" | "product") {
+                row.holders.push("venus security HAL runtime".into());
+            }
+        }
+        return Ok(rows);
+    }
     use skyward_ui::app::MountRow;
     let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
     let shown = skyward_vab::mounted_partitions(slot)?;
@@ -999,6 +1113,9 @@ fn set_slot(slot: skyward_vab::Slot) -> Result<skyward_vab::BootSlots, String> {
 /// and the booted slot's partitions come off.
 fn detach(services: Vec<Service>) -> Detach {
     Box::new(move || {
+        if crate::venus_rw::enabled() {
+            return crate::venus_runtime::release_sources();
+        }
         let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
         let mounted = skyward_vab::mounted_partitions(slot)?;
         let busy = services::pin(&services, &mounted)?;
@@ -1011,7 +1128,10 @@ fn detach(services: Vec<Service>) -> Detach {
 /// on a phone that has them, and checks a zip's signature before its
 /// install script runs.
 fn install_options(app: &App) -> Options {
-    Options { keep: app.state.keep_recovery && app.state.recovery_partitions, signed: app.state.check_signature }
+    Options {
+        keep: app.state.keep_recovery && app.state.recovery_partitions,
+        signed: app.state.check_signature,
+    }
 }
 
 /// How often the WLAN page scans while it shows.
@@ -1019,6 +1139,31 @@ const SCAN_EVERY: Duration = Duration::from_secs(10);
 
 fn wlan_worker(w: &Option<wlan::Worker>) -> Result<&wlan::Worker> {
     w.as_ref().context("the phone's WLAN is not brought up")
+}
+
+fn security_tag(security: Security) -> &'static str {
+    match security {
+        Security::Open => "open",
+        Security::Owe => "owe",
+        Security::Wep => "wep",
+        Security::Psk => "psk",
+        Security::Sae => "sae",
+        Security::PskSae => "psk_sae",
+        Security::Enterprise => "enterprise",
+    }
+}
+
+fn security_from_tag(tag: &str) -> Option<Security> {
+    Some(match tag {
+        "open" => Security::Open,
+        "owe" => Security::Owe,
+        "wep" => Security::Wep,
+        "psk" => Security::Psk,
+        "sae" => Security::Sae,
+        "psk_sae" => Security::PskSae,
+        "enterprise" => Security::Enterprise,
+        _ => return None,
+    })
 }
 
 /// The installed system, as the update server is told of it.
@@ -1128,6 +1273,19 @@ struct Pages<'a> {
     control: Option<Control>,
     haptics: Option<Haptics>,
     backlight: Backlight,
+    /// Venus's native doze on its own panel, and the face drawn on it.
+    venus_aod: bool,
+    native_aod: Option<NativeAod>,
+    faced: String,
+    /// The hardware double-tap mode the controller has acknowledged.
+    double_tap_applied: Option<bool>,
+    double_tap_request: Option<(bool, Instant)>,
+    double_tap_retry: Instant,
+    /// The integrated-runtime lease and the maintenance worker it covers.
+    maintenance_lease: Option<std::fs::File>,
+    maintenance: Option<crate::venus_maintenance::Worker>,
+    /// The Venus mobile network reader.
+    mobile: Option<crate::mobile::Worker>,
     keeper: Keeper,
     shown_clock: String,
     /// The page shown first, until it has been told it shows.
@@ -1207,6 +1365,25 @@ struct Pages<'a> {
     servers: Servers,
     /// The WLAN, on a phone whose driver the recovery brings up.
     wlan: Option<wlan::Worker>,
+    /// The DNS servers the WLAN worker's DHCP gave, kept apart from the
+    /// resolver list downloads use so stopping WLAN cannot erase cellular DNS.
+    wlan_servers: Servers,
+    /// When the Venus device services were not ready for the WLAN yet.
+    wlan_waiting: Option<Instant>,
+    /// When a failed automatic WLAN start should be tried again.
+    wlan_retry_at: Option<Instant>,
+    /// Auto-decrypt asked for before the Venus security runtime was ready.
+    auto_decrypt_pending: bool,
+    /// The settings file was not readable yet when the pages opened.
+    settings_pending: bool,
+    /// The credentials a join is being attempted with, saved once it connects.
+    pending_wlan: Option<(Vec<u8>, String, Security, String)>,
+    /// Whether the saved network still has to be joined this start.
+    auto_join: bool,
+    /// The credential being checked, saved once it opens the owner's files.
+    unlock_credential: Option<String>,
+    /// The credential came from the saved auto-unlock setting.
+    unlock_from_saved: bool,
     scanned_at: Instant,
     /// Asking the update server, and downloading the full package.
     checker: Option<updates::Worker>,
@@ -1255,7 +1432,26 @@ impl<'a> Pages<'a> {
         let inputs = Inputs::open(w, h, cfg.touch.writes.clone())?;
         let started = Instant::now();
         let control = Control::open()?;
-        let haptics = cfg.haptics.as_ref().map(Haptics::open).transpose()?;
+        if crate::venus_rw::enabled() {
+            if let Some(motor) = &cfg.haptics {
+                let prepare = || -> Result<()> {
+                    if crate::venus_rw::cache_root()?.is_none() {
+                        crate::venus_basic::runtime::mount_one("vendor")?;
+                    }
+                    crate::haptics::bring_up(motor, &cfg.modules.sources)
+                };
+                if let Err(e) = prepare() {
+                    let _ = skyward_sys::kmsg(&format!("the motor's driver is not brought up: {e:#}"));
+                }
+            }
+        }
+        let haptics = match cfg.haptics.as_ref().map(Haptics::open).transpose() {
+            Ok(haptics) => haptics,
+            Err(e) => {
+                let _ = skyward_sys::kmsg(&format!("the motor is not used: {e:#}"));
+                None
+            }
+        };
         let backlight = Backlight::open()?;
         let first = match &request.work {
             Work::Fastboot => Screen::Fastboot,
@@ -1273,17 +1469,31 @@ impl<'a> Pages<'a> {
             | Work::SwitchSystem { .. }
             | Work::SystemStopped => start,
         };
+        let kept = settings::read()?;
+        let settings_pending = crate::venus_rw::enabled() && matches!(kept, Kept::Unreadable);
+        let kept = if settings_pending { Kept::Nothing } else { kept };
         let mut app = App::new(first, w, h, cfg.display.density as f32 / 160.0);
         app.set_screen_corners(cfg.display.corner_radius as f32);
+        if let Some(sb) = cfg.status_bar {
+            app.set_status_bar(sb.height as f32, sb.left as f32, sb.right as f32, sb.bolt_right as f32);
+        }
+        let maintenance_lease = if crate::venus_rw::enabled() { Some(crate::venus_maintenance::lease()?) } else { None };
+        app.state.venus_maintenance = maintenance_lease.is_some();
         // The settings kept from the starts before are back before the first
         // frame, and before file transfer starts with its switch and the time
         // zone. The pages speak the language chosen then, or else the one the
         // system named with the work it asks for, or the one the installed
         // system is built to start in, or else the one they last spoke.
-        let kept = settings::read()?;
         let locale = request.locale.as_deref().or(info.locale.as_deref());
         let named = locale.map(Lang::for_locale).transpose()?;
         app.take_settings(kept.settings(), named);
+        if !app.state.auto_decrypt {
+            app.state.saved_lock = None;
+        }
+        if crate::venus_rw::enabled() {
+            // Keep the independent ADB transport until the user explicitly enables MTP.
+            app.state.file_transfer = false;
+        }
         let keeper = Keeper::new(&kept);
         skyward_sys::kmsg(&format!(
             "the pages speak {:?}, {}, and the locale named is {}",
@@ -1297,6 +1507,15 @@ impl<'a> Pages<'a> {
             app.set_boot_slots(read_slots());
         }
         app.set_asked(asked(&request));
+        let venus_aod = cfg.device.codename == "venus" && surface.supports_aod();
+        app.state.panel_dozes = venus_aod;
+        app.state.hardware_double_tap = cfg.touch.hardware_double_tap.is_some();
+        let mobile = if crate::venus_rw::enabled() {
+            app.set_mobile(skyward_net::mobile::Mobile { checking: true, ..Default::default() });
+            Some(crate::mobile::Worker::start()?)
+        } else {
+            None
+        };
         let screen = Canvas::new(w, h);
         // A page sliding over another draws on three screens' worth of canvas
         // besides the panel's: made ready now, the first slide finds them so.
@@ -1381,6 +1600,15 @@ impl<'a> Pages<'a> {
             control,
             haptics,
             backlight,
+            venus_aod,
+            native_aod: None,
+            faced: String::new(),
+            double_tap_applied: None,
+            double_tap_request: None,
+            double_tap_retry: Instant::now(),
+            maintenance_lease,
+            maintenance: None,
+            mobile,
             keeper,
             shown_clock: String::new(),
             arriving: Some(Incoming::Arrived),
@@ -1416,6 +1644,15 @@ impl<'a> Pages<'a> {
             switched: false,
             servers: Arc::new(Mutex::new(Vec::new())),
             wlan: None,
+            wlan_servers: Arc::new(Mutex::new(Vec::new())),
+            wlan_waiting: None,
+            wlan_retry_at: None,
+            auto_decrypt_pending: false,
+            settings_pending,
+            pending_wlan: None,
+            auto_join: false,
+            unlock_credential: None,
+            unlock_from_saved: false,
             scanned_at: Instant::now(),
             checker: None,
             downloader: None,
@@ -1533,20 +1770,47 @@ impl<'a> Pages<'a> {
             }
             self.app.set_update(standing);
         }
+        if self.app.state.auto_decrypt && matches!(self.app.state.data, Data::Closed) {
+            if crate::venus_rw::enabled() && !crate::venus_wlan::ready() {
+                self.auto_decrypt_pending = true;
+            } else {
+                self.decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
+            }
+        }
         // The WLAN starts off. Without the bundle of the vendor interface's
         // libraries the supplicant does not start, and the WLAN page says why.
         if let Some(w) = &cfg.wlan {
-            self.app.state.wlan = Some(Wlan::default());
+            self.app.state.wlan = Some(Wlan { power: WlanPower::Starting, ..Default::default() });
             let modules = cfg.modules.sources.iter().map(|s| skyward_modules::source_dir(s)).collect::<Result<Vec<_>>>()?;
-            let libraries = secure::libraries().unwrap_or_else(|e| {
-                let _ = skyward_sys::kmsg(&format!("the vendor interface's libraries are not open: {e:#}"));
+            let libraries = if crate::venus_rw::enabled() {
                 None
-            });
-            self.wlan = Some(wlan::Worker::start(w.clone(), modules, libraries, self.servers.clone())?);
+            } else {
+                secure::libraries().unwrap_or_else(|e| {
+                    let _ = skyward_sys::kmsg(&format!("the vendor interface's libraries are not open: {e:#}"));
+                    None
+                })
+            };
+            self.wlan = Some(wlan::Worker::start(w.clone(), modules, libraries, self.wlan_servers.clone())?);
+            self.auto_join = self.app.state.saved_wlan.is_some();
+            if crate::venus_rw::enabled() && !crate::venus_wlan::ready() {
+                self.wlan_waiting = Some(Instant::now());
+            } else {
+                wlan_worker(&self.wlan)?.send(wlan::Command::On);
+            }
         }
         self.scanned_at = Instant::now();
         self.app.state.update_server = cfg.update.is_some();
         self.drive_at = Instant::now();
+        if self.surface.refresh_hz() != self.app.state.refresh_rate {
+            if let Err(e) = self.surface.set_refresh(self.app.state.refresh_rate) {
+                let _ = skyward_sys::kmsg(&format!("refresh rate {} Hz was not set: {e:#}", self.app.state.refresh_rate));
+            } else {
+                let _ = skyward_sys::kmsg(&format!("panel refresh set to {} Hz", self.app.state.refresh_rate));
+            }
+        }
+        if self.app.state.wireless_adb {
+            self.set_wireless_adb(true)?;
+        }
         Ok(())
     }
 
@@ -1555,6 +1819,9 @@ impl<'a> Pages<'a> {
     /// under way told comes first, so a touch acts on the page as it now
     /// stands.
     fn turn(&mut self, sleeper: &Sleeper, uevents: &uevent::Listener) -> Result<()> {
+        // Processing an alarm or input, and settling the resulting frame,
+        // must finish before the next explicit suspend permission.
+        sleeper.allow(false);
         let now = monotonic_ms();
         if self.leave_at.is_some_and(|at| now >= at) {
             self.leave_at = None;
@@ -1569,6 +1836,45 @@ impl<'a> Pages<'a> {
         }
         self.tick(now)?;
         self.take_readings(now)?;
+        if self.app.state.hardware_double_tap && self.inputs.has_panel()
+            && self.double_tap_applied != Some(self.app.state.double_tap_wake) {
+            let enabled = self.app.state.double_tap_wake;
+            if self.double_tap_request.as_ref().map(|(want, _)| *want) != Some(enabled) {
+                self.double_tap_request = Some((enabled, Instant::now()));
+                self.double_tap_retry = Instant::now();
+            }
+            if Instant::now() >= self.double_tap_retry {
+                self.double_tap_applied = None;
+                match skyward_sys::touch_wake::set_double_tap(enabled) {
+                    Ok(()) => {
+                        self.double_tap_applied = Some(enabled);
+                        self.double_tap_request = None;
+                        self.app.state.double_tap_issue = None;
+                        let _ = skyward_sys::kmsg(&format!("Venus hardware double-tap requested={enabled}; controller acknowledged"));
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::EAGAIN)
+                        && self.double_tap_request.as_ref().is_some_and(|(_, since)| since.elapsed() < Duration::from_secs(15)) => {
+                        self.double_tap_retry = Instant::now() + Duration::from_millis(200);
+                        self.app.state.double_tap_issue = Some(self.app.state.lang.pick([
+                            "等待触摸驱动就绪", "等待觸控驅動就緒", "Waiting for the touch controller",
+                        ]).to_string());
+                    }
+                    Err(error) => {
+                        let cleanup = skyward_sys::touch_wake::set_double_tap(false);
+                        self.app.state.double_tap_wake = false;
+                        self.double_tap_applied = Some(false);
+                        self.double_tap_request = None;
+                        let mut why = format!("{}: {error}", self.app.state.lang.pick(["双击唤醒设置失败", "雙擊喚醒設定失敗", "Could not set double tap to wake"]));
+                        if let Err(e) = cleanup { why.push_str(&format!("; disable: {e}")); }
+                        let _ = skyward_sys::kmsg(&why);
+                        self.app.state.double_tap_issue = Some(why);
+                    }
+                }
+                self.app.refresh();
+            }
+        } else if self.double_tap_applied == Some(self.app.state.double_tap_wake) {
+            self.double_tap_request = None;
+        }
         // In fastboot the page follows fastbootd and the cable each second.
         if self.fastboot && self.port_at.elapsed().as_secs() >= 1 {
             let (running, link) = fastboot_status()?;
@@ -1577,6 +1883,7 @@ impl<'a> Pages<'a> {
         }
         let (lit, shown) = self.show(now)?;
         self.wait(sleeper, uevents, now, lit, shown)?;
+        sleeper.allow(false);
         let now = monotonic_ms();
         for slept in sleeper.slept() {
             match slept {
@@ -1601,7 +1908,13 @@ impl<'a> Pages<'a> {
         self.backup_told(now);
         self.merge_told(now)?;
         self.systems_told(now)?;
+        self.mobile_told()?;
+        self.maintenance_told(now)?;
         self.wlan_told()?;
+        self.wlan_gating()?;
+        self.settings_gating()?;
+        self.auto_decrypt_gating()?;
+        self.refresh_network_dns();
         self.keep_settings(now)?;
         self.updates_told(now)?;
         self.skyward_told(now)?;
@@ -1687,7 +2000,19 @@ impl<'a> Pages<'a> {
     /// rest it or turn it off as the page asks. Gives whether the panel is
     /// lit, and whether a frame was shown.
     fn show(&mut self, now: u64) -> Result<(bool, bool)> {
-        let panel = self.app.panel(now);
+        let mut panel = self.app.panel(now);
+        let native_wanted = self.venus_aod && panel.is_none() && self.app.state.always_on;
+        if !native_wanted && (self.native_aod.is_some() || self.surface.is_aod()) {
+            if let Err(error) = leave_native_aod(&mut self.surface, &mut self.native_aod) {
+                let why = format!("{}: {error:#}", self.app.state.lang.pick(["息屏显示退出失败", "息屏顯示退出失敗", "Could not leave always-on display"]));
+                let _ = skyward_sys::kmsg(&why);
+                self.app.aod_failed(&why, now);
+                ensure!(!self.surface.is_aod(), "{why}; normal display power could not be restored");
+            }
+            panel = self.app.panel(now);
+            self.blanked = false;
+            self.faced.clear();
+        }
         let mut shown = false;
         if panel.is_some() {
             // A display turned off comes on again with a frame drawn for it.
@@ -1702,6 +2027,64 @@ impl<'a> Pages<'a> {
                 shown = true;
             }
             self.blanked = false;
+        } else if native_wanted {
+            let updated = (|| -> Result<()> {
+                if self.native_aod.is_none() {
+                    self.native_aod = Some(NativeAod::open()?);
+                }
+                let native = self.native_aod.as_mut().expect("native AOD was opened above");
+                let alarm_changed = native.changed()?;
+                let entering = !self.surface.is_aod();
+                if entering || alarm_changed || self.faced != self.shown_clock {
+                    let shown_unix = unix_now()?;
+                    self.shown_clock = skyward_ui::fmt::clock(shown_unix, self.app.state.time_zone);
+                    let facts = skyward_ui::aod::Facts {
+                        date: skyward_ui::fmt::date(self.app.state.lang, shown_unix, self.app.state.time_zone),
+                        battery: self.info.battery.as_ref().map(|b| (b.level, b.plugged)),
+                        slot: self.info.slot.map(|s| s.letter().to_string()),
+                        data: skyward_ui::fmt::data(self.app.state.lang, &self.app.state.data).to_string(),
+                    };
+                    skyward_ui::aod::face(&mut self.screen, &self.fonts, &self.shown_clock, &facts, self.cfg.display.density as f32 / 160.0);
+                    if entering {
+                        self.surface.present(&self.screen)?;
+                        self.surface.settle()?;
+                        self.backlight.show(None)?;
+                        let raw: u32 = fs::read_to_string(&self.backlight.path)?.trim().parse()?;
+                        ensure!(raw == 0, "normal brightness is {raw}, requested 0 before AOD");
+                        self.surface.begin_aod()?;
+                        set_native_doze(VENUS_DOZE_LOW)?;
+                        self.surface.sleep_aod()?;
+                    } else {
+                        self.surface.present_aod(&self.screen)?;
+                    }
+                    verify_native_doze(VENUS_DOZE_LOW)?;
+                    ensure!(self.surface.is_aod_sleeping(), "AOD frame did not settle into LP2");
+                    native.arm(shown_unix)?;
+                    self.faced.clone_from(&self.shown_clock);
+                }
+                Ok(())
+            })();
+            match updated {
+                Ok(()) => {
+                    self.blanked = true;
+                    self.rested_at = None;
+                }
+                Err(error) => {
+                    let mut why = format!("{}: {error:#}", self.app.state.lang.pick(["息屏显示失败，已关闭", "息屏顯示失敗，已關閉", "Always-on display failed and was turned off"]));
+                    if let Err(recovery) = leave_native_aod(&mut self.surface, &mut self.native_aod) {
+                        why.push_str(&format!("; restore: {recovery:#}"));
+                    }
+                    let _ = skyward_sys::kmsg(&why);
+                    self.app.aod_failed(&why, now);
+                    ensure!(!self.surface.is_aod(), "{why}; normal display power could not be restored");
+                    panel = self.app.panel(now);
+                    self.blanked = false;
+                    self.faced.clear();
+                }
+            }
+            if self.native_aod.is_some() {
+                return Ok((false, false));
+            }
         } else if !self.blanked {
             // Black out the panel's frame memory before the backlight goes
             // to 0 and the display off, so an OLED that floors the backlight
@@ -1754,6 +2137,9 @@ impl<'a> Pages<'a> {
         let timeout = if ahead { 0 } else { until_due.into_iter().chain(rest_left).min().map_or(1000, |t| t.clamp(floor, 1000)) };
         sleeper.allow(self.may_sleep()?);
         let mut fds = vec![self.inputs.fd(), uevents.fd(), sleeper.fd()];
+        if let Some(native) = &self.native_aod {
+            fds.push(native.wakeful.fd());
+        }
         if let Some(i) = &self.installer {
             fds.push(i.fd());
         }
@@ -1802,6 +2188,9 @@ impl<'a> Pages<'a> {
         if let Some(s) = &self.systems_worker {
             fds.push(s.fd());
         }
+        if let Some(m) = &self.mobile {
+            fds.push(m.fd());
+        }
         fds.push(self.readings.fd());
         wait(&fds, timeout)
     }
@@ -1825,19 +2214,23 @@ impl<'a> Pages<'a> {
             || self.downloader.is_some()
             || self.skyward_checker.is_some()
             || self.skyward_updater.is_some()
+            || self.maintenance.is_some()
             || systems_busy;
         let joining = self.app.state.wlan.as_ref().and_then(|w| w.joined.as_ref()).is_some_and(|j| matches!(j.stage, Joining::Joining | Joining::Addressing));
         let running = match &self.shell {
             Some(sh) => !sh.waiting()?,
             None => false,
         };
-        Ok(self.surface.is_off()
+        let native_dozing = self.native_aod.as_ref().is_some_and(|n| n.armed) && self.surface.is_aod_sleeping();
+        Ok((self.surface.is_off() || native_dozing)
             && !busy
             && !self.fastboot
             && !self.sideloading
             && self.leave_at.is_none()
             && !joining
             && !running
+            && !self.cfg.touch.double_tap
+            && self.double_tap_request.is_none()
             && self.asked.is_none()
             && usb_link()? != UsbLink::Connected)
     }
@@ -1968,6 +2361,7 @@ impl Pages<'_> {
                     }
                     self.closed = opening.closed;
                     show_closed(&mut self.app, &self.closed)?;
+                    self.readings.refresh();
                 }
                 wipe::Event::Ended(outcome) => {
                     let said = outcome.as_ref().map_or_else(wipe::said, |_| "done".to_string());
@@ -2187,6 +2581,36 @@ impl Pages<'_> {
 
     /// What the WLAN told; its page scans again now and then while it
     /// shows, as the stock settings do.
+    /// The Venus mobile reader's newest snapshot.
+    fn mobile_told(&mut self) -> Result<()> {
+        if let Some(reading) = self.mobile.as_ref().and_then(crate::mobile::Worker::taken) {
+            self.app.set_mobile(reading);
+        }
+        Ok(())
+    }
+
+    /// What the maintenance worker prepared, how far it has written, and
+    /// whether it finished.
+    fn maintenance_told(&mut self, _now: u64) -> Result<()> {
+        let mut finished = false;
+        if let Some(worker) = &self.maintenance {
+            for event in worker.events() {
+                match event {
+                    crate::venus_maintenance::Event::Ready(summary) => self.app.maintenance_ready(summary),
+                    crate::venus_maintenance::Event::Progress(done, total) => self.app.maintenance_progress(done, total),
+                    crate::venus_maintenance::Event::Finished(result) => {
+                        self.app.maintenance_finished(result.success, result.detail, result.write_started);
+                        finished = true;
+                    }
+                }
+            }
+        }
+        if finished {
+            self.maintenance = None;
+        }
+        Ok(())
+    }
+
     fn wlan_told(&mut self) -> Result<()> {
         if let Some((told, traffic)) = self.wlan.as_ref().map(wlan::Worker::told) {
             if let Some(w) = told {
@@ -2196,6 +2620,45 @@ impl Pages<'_> {
                 self.app.set_traffic(t);
             }
         }
+        if let Some((ssid, name, security, password)) = self.pending_wlan.clone() {
+            let joined = self.app.state.wlan.as_ref().and_then(|w| w.joined.as_ref());
+            match joined {
+                Some(j) if j.ssid == ssid && j.security == security && matches!(j.stage, Joining::Connected(_)) => {
+                    self.app.state.saved_wlan = Some(skyward_ui::app::SavedWlan {
+                        ssid,
+                        name,
+                        security: security_tag(security).to_string(),
+                        password,
+                    });
+                    self.pending_wlan = None;
+                    self.app.refresh();
+                }
+                Some(j) if j.ssid == ssid && matches!(j.stage, Joining::Failed | Joining::NoAddress(_)) => {
+                    self.pending_wlan = None;
+                }
+                _ => {}
+            }
+        }
+        if self.auto_join
+            && self.app.state.wlan.as_ref().is_some_and(|w| w.power == WlanPower::On && w.joined.is_none())
+            && let Some(saved) = self.app.state.saved_wlan.clone()
+            && let Some(security) = security_from_tag(&saved.security)
+        {
+            self.auto_join = false;
+            wlan_worker(&self.wlan)?.send(wlan::Command::Join {
+                ssid: saved.ssid,
+                name: saved.name,
+                security,
+                password: saved.password,
+            });
+        }
+        if self.wlan_retry_at.is_none()
+            && crate::venus_rw::enabled()
+            && crate::venus_wlan::ready()
+            && self.app.state.wlan.as_ref().is_some_and(|w| matches!(w.power, WlanPower::Failed(_)))
+        {
+            self.wlan_retry_at = Some(Instant::now() + Duration::from_secs(5));
+        }
         let wlan_on = self.app.state.wlan.as_ref().is_some_and(|w| w.power == WlanPower::On);
         if self.app.screen() == Screen::Wlan && wlan_on && self.scanned_at.elapsed() >= SCAN_EVERY {
             self.scanned_at = Instant::now();
@@ -2204,12 +2667,99 @@ impl Pages<'_> {
         Ok(())
     }
 
+    /// Start the WLAN once the Venus device services behind it are ready,
+    /// or fail the page after a bounded wait.
+    fn wlan_gating(&mut self) -> Result<()> {
+        if self.wlan_waiting.is_some() {
+            if crate::venus_wlan::ready() {
+                wlan_worker(&self.wlan)?.send(wlan::Command::On);
+                self.wlan_waiting = None;
+            }
+        }
+        if let Some(at) = self.wlan_retry_at
+            && at <= Instant::now()
+        {
+            self.wlan_retry_at = None;
+            if crate::venus_wlan::ready() {
+                wlan_worker(&self.wlan)?.send(wlan::Command::On);
+            }
+        }
+        Ok(())
+    }
+
+    /// adbd listens on the WLAN address at the stock debugging port, or
+    /// stops listening there; USB adb is left as it was.
+    fn set_wireless_adb(&mut self, on: bool) -> Result<()> {
+        skyward_sys::set_prop("service.adb.tcp.port", if on { "5555" } else { "0" })?;
+        skyward_sys::set_prop("ctl.restart", "adbd")?;
+        self.app.state.wireless_adb = on;
+        self.app.refresh();
+        Ok(())
+    }
+
+    /// Start the auto-opened data partition once the Venus security runtime
+    /// it needs is ready.
+    fn auto_decrypt_gating(&mut self) -> Result<()> {
+        if self.auto_decrypt_pending
+            && crate::venus_wlan::ready()
+            && self.decryptor.is_none()
+            && matches!(self.app.state.data, Data::Closed)
+        {
+            self.auto_decrypt_pending = false;
+            self.decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
+        }
+        Ok(())
+    }
+
+    /// Read the settings once the Venus metadata mount is ready, and apply
+    /// the choices that could not be read when the pages opened.
+    fn settings_gating(&mut self) -> Result<()> {
+        if self.settings_pending && crate::venus_wlan::ready() {
+            let kept = settings::read()?;
+            if !matches!(kept, Kept::Unreadable) {
+                self.settings_pending = false;
+                self.app.take_settings(kept.settings(), None);
+                if !self.app.state.auto_decrypt {
+                    self.app.state.saved_lock = None;
+                }
+                if crate::venus_rw::enabled() {
+                    self.app.state.file_transfer = false;
+                }
+                self.keeper = Keeper::new(&kept);
+                self.app.refresh();
+                if self.app.state.auto_decrypt
+                    && matches!(self.app.state.data, Data::Closed)
+                    && self.decryptor.is_none()
+                {
+                    self.auto_decrypt_pending = false;
+                    self.decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The resolver list follows the active route: WLAN when it owns the
+    /// default route, otherwise the modem's data call.
+    fn refresh_network_dns(&self) {
+        let link = self.app.state.wlan.as_ref().and_then(|w| w.joined.as_ref()).and_then(|j| {
+            if let Joining::Connected(link) = &j.stage { Some(link) } else { None }
+        });
+        let modem = self.app.state.mobile.as_ref().and_then(|m| m.modem.as_ref());
+        let dns = skyward_net::modem::dns(link, modem);
+        let mut servers = self.servers.lock().expect("the DNS servers are not held by a thread that panicked");
+        if *servers != dns {
+            *servers = dns;
+        }
+    }
+
     /// Settings changed go into their file a moment after the last change,
     /// while nothing else has /metadata: not in fastboot, whose fastbootd
     /// may, nor while an install, a merge, erasing, a backup or work on
     /// whole partitions is under way.
     fn keep_settings(&mut self, now: u64) -> Result<()> {
-        let metadata_busy = self.fastboot
+        let metadata_busy = self.maintenance.is_some()
+            || self.fastboot
             || self.installer.is_some()
             || self.merger.is_some()
             || self.eraser.is_some()
@@ -2333,7 +2883,33 @@ impl Pages<'_> {
                     log_mounted(mounted)?;
                 }
                 self.closed = opening.closed;
-                show_closed(&mut self.app, &self.closed)?;
+                let waiting = self.closed.iter().find(|c| !c.made_up).map(|c| {
+                    use skyward_crypto::user::Lock;
+                    let keys = match c.lock {
+                        Lock::PATTERN => Keys::Pattern,
+                        Lock::PIN => Keys::Digits,
+                        _ => Keys::Letters,
+                    };
+                    (c.user, keys)
+                });
+                let auto = self.app.state.auto_decrypt.then(|| self.app.state.saved_lock.clone()).flatten().zip(waiting);
+                if let Some(((credential), (user, keys))) = auto {
+                    self.app.data_waiting(Some((user, keys)));
+                    if let Data::Locked { checking, .. } = &mut self.app.state.data {
+                        *checking = true;
+                    }
+                    self.unlock_credential = Some(credential.clone());
+                    self.unlock_from_saved = true;
+                    let _ = skyward_sys::kmsg("VENUS_AUTO_UNLOCK begin user=0");
+                    self.decryptor = Some(Decryptor::start(decrypt::Job::Unlock {
+                        closed: self.closed.clone(),
+                        user,
+                        credential: credential.into_bytes(),
+                    })?);
+                } else {
+                    show_closed(&mut self.app, &self.closed)?;
+                }
+                self.readings.refresh();
             }
             decrypt::Ended::Opened(Err(why)) => {
                 skyward_sys::kmsg(&format!("the data partition stays closed: {why}"))?;
@@ -2349,8 +2925,27 @@ impl Pages<'_> {
             decrypt::Ended::Unlocked(Ok(still)) => {
                 self.closed = still;
                 show_closed(&mut self.app, &self.closed)?;
+                if let Some(credential) = self.unlock_credential.take() {
+                    if self.unlock_from_saved {
+                        let _ = skyward_sys::kmsg("VENUS_AUTO_UNLOCK_OK user=0 shared_storage_ready=true");
+                    }
+                    self.unlock_from_saved = false;
+                    if self.app.state.auto_decrypt {
+                        self.app.state.saved_lock = Some(credential);
+                        self.app.refresh();
+                    }
+                }
+                self.readings.refresh();
             }
             decrypt::Ended::Unlocked(Err(why)) => {
+                if self.unlock_from_saved {
+                    let _ = skyward_sys::kmsg(&format!("VENUS_AUTO_UNLOCK_FAILED {why}"));
+                }
+                self.unlock_from_saved = false;
+                self.unlock_credential = None;
+                if self.app.state.auto_decrypt {
+                    self.app.state.saved_lock = None;
+                }
                 skyward_sys::kmsg(&format!("what was entered did not open the user's files: {why}"))?;
                 self.app.unlock_failed(why, now);
             }
@@ -2405,7 +3000,7 @@ impl Pages<'_> {
         let kept = match &mut self.transfer {
             Some(t) if !t.service.running() => Err(anyhow!("the file transfer service ended")),
             Some(t) => {
-                let offer = self.app.state.data.storage_open() && self.eraser.is_none() && self.installer.is_none();
+                let offer = self.app.state.data.storage_open() && self.eraser.is_none() && self.installer.is_none() && self.maintenance.is_none();
                 t.offer(offer, self.app.state.lang).and_then(|()| {
                     if t.zone != self.app.state.time_zone {
                         t.service.set_zone(skyward_ui::fmt::rules(self.app.state.time_zone).clone())?;
@@ -2459,12 +3054,16 @@ impl Pages<'_> {
                 Incoming::Input(Event::Touch(t, at)) => self.app.touch(t, &self.fonts, at),
                 Incoming::Input(Event::Key(k, true)) => self.app.key(k, now),
                 Incoming::Input(Event::Key(k, false)) => self.app.key_up(k, now),
+                Incoming::Input(Event::Wake) => {
+                    self.app.hardware_wake(now);
+                    Vec::new()
+                }
             };
             // What the pages ask for in answer to the work done goes on
             // after it.
             let mut queue = VecDeque::from(effects);
             while let Some(fx) = queue.pop_front() {
-                eprintln!("effect {fx:?}");
+                eprintln!("effect kind {:?}", std::mem::discriminant(&fx));
                 queue.extend(self.effect(fx, now)?);
             }
         }
@@ -2475,7 +3074,52 @@ impl Pages<'_> {
     /// to it.
     fn effect(&mut self, fx: Effect, now: u64) -> Result<Vec<Effect>> {
         let cfg = self.cfg;
+        if self.maintenance.is_some() && !matches!(fx, Effect::ExecuteMaintenance | Effect::CancelMaintenance | Effect::Haptic | Effect::Ticks) {
+            self.app.report("维护计划持有分区和 Data；请先完成或返回取消。", now);
+            return Ok(Vec::new());
+        }
         match fx {
+            Effect::PrepareMaintenance(action) => {
+                let result = (|| -> Result<crate::venus_maintenance::Worker> {
+                    ensure!(self.maintenance.is_none() && self.installer.is_none() && self.eraser.is_none() && self.worker.is_none()
+                        && self.relabeler.is_none() && self.backuper.is_none() && self.merger.is_none() && self.decryptor.is_none()
+                        && self.part_worker.is_none() && self.checker.is_none() && self.downloader.is_none() && self.skyward_checker.is_none()
+                        && self.skyward_updater.is_none() && self.pending.is_none() && self.shell.is_none() && self.leave_at.is_none()
+                        && !self.fastboot && !self.sideloading && !self.systems_worker.as_ref().is_some_and(systems::Worker::busy),
+                        "请等待当前安装、文件、解密或 USB 操作完成并关闭终端后重试");
+                    ensure!(self.app.state.data.storage_open(), "请先解锁用户 0 的内部存储");
+                    skyward_install::task_scope::ensure_quiet()?;
+                    if let Some(t) = self.transfer.take() { t.stop(true)?; }
+                    self.app.state.file_transfer = false;
+                    crate::venus_maintenance::Worker::start(action, self.maintenance_lease.as_ref().context("maintenance is only available in integrated Venus Recovery")?)
+                })();
+                match result {
+                    Ok(w) => self.maintenance = Some(w),
+                    Err(e) => self.app.maintenance_finished(false, format!("{e:#}"), false),
+                }
+            }
+            Effect::ExecuteMaintenance => {
+                let result = self.maintenance.as_ref().context("prepared maintenance worker is missing").and_then(|w| w.execute());
+                if let Err(e) = result {
+                    self.maintenance = None;
+                    self.app.maintenance_finished(false, format!("{e:#}"), false);
+                }
+            }
+            Effect::CancelMaintenance => self.maintenance = None,
+            Effect::RefreshCellular => {
+                if let Some(m) = &self.mobile { m.refresh(); }
+            }
+            Effect::Cellular(command) => {
+                use skyward_ui::app::CellularCommand;
+                let command = match command {
+                    CellularCommand::Radio(true) => "radio-on", CellularCommand::Radio(false) => "radio-off",
+                    CellularCommand::Data(true) => "data-on", CellularCommand::Data(false) => "data-off",
+                };
+                if let Err(error) = crate::venus_modem::request(command) {
+                    self.app.cellular_failed(&format!("{error:#}"), now);
+                }
+                if let Some(m) = &self.mobile { m.refresh(); }
+            }
             // Leaving is the user's answer to whatever the request
             // still kept in misc asked.
             Effect::Reboot(target) => {
@@ -2553,11 +3197,14 @@ impl Pages<'_> {
             // The decrypt page shows meanwhile that the work is
             // under way, and takes nothing more until it is done.
             Effect::OpenData => {
-                ensure!(self.decryptor.is_none(), "the data partition is being opened already");
-                self.decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
+                if self.decryptor.is_none() {
+                    self.decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
+                }
             }
             Effect::Unlock { user, code } => {
                 ensure!(self.decryptor.is_none(), "the data partition is being opened already");
+                self.unlock_credential = Some(code.clone());
+                self.unlock_from_saved = false;
                 let job = decrypt::Job::Unlock { closed: self.closed.clone(), user, credential: code.into_bytes() };
                 self.decryptor = Some(Decryptor::start(job)?);
             }
@@ -2599,15 +3246,35 @@ impl Pages<'_> {
                 skyward_sys::kmsg("merging the update, as the update page asked")?;
                 self.merger = Some(merge::Merger::start(slot, true)?);
             }
-            Effect::Wlan(on) => wlan_worker(&self.wlan)?.send(if on { wlan::Command::On } else { wlan::Command::Off }),
+            Effect::Wlan(on) => {
+                if on && crate::venus_rw::enabled() && !crate::venus_wlan::ready() {
+                    self.wlan_waiting = Some(Instant::now());
+                } else {
+                    self.wlan_waiting = None;
+                    wlan_worker(&self.wlan)?.send(if on { wlan::Command::On } else { wlan::Command::Off });
+                }
+            }
+            Effect::WirelessAdb(on) => self.set_wireless_adb(on)?,
+            Effect::RefreshRate(hz) => {
+                self.surface.set_refresh(hz)?;
+                let _ = skyward_sys::kmsg(&format!("panel refresh set to {hz} Hz"));
+                self.app.redraw();
+            }
             Effect::ScanWlan => {
                 self.scanned_at = Instant::now();
                 wlan_worker(&self.wlan)?.send(wlan::Command::Scan);
             }
             Effect::JoinWlan { ssid, name, security, password } => {
+                self.pending_wlan = Some((ssid.clone(), name.clone(), security, password.0.clone()));
                 wlan_worker(&self.wlan)?.send(wlan::Command::Join { ssid, name, security, password: password.0 })
             }
-            Effect::LeaveWlan => wlan_worker(&self.wlan)?.send(wlan::Command::Leave),
+            Effect::LeaveWlan => {
+                self.pending_wlan = None;
+                self.auto_join = false;
+                self.app.state.saved_wlan = None;
+                self.app.refresh();
+                wlan_worker(&self.wlan)?.send(wlan::Command::Leave)
+            }
             Effect::CheckUpdate => self.check_update()?,
             Effect::Download(release) => self.download(release, now)?,
             Effect::StopDownload => self.downloader.as_ref().context("there is no download to stop")?.stop(),
@@ -2671,17 +3338,29 @@ impl Pages<'_> {
             // A partition that will not mount, or is in use, is the
             // page's to report; the recovery carries on.
             Effect::Mount(base) => {
-                let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-                if let Err(e) = skyward_vab::mount_one(slot, &base) {
+                let result = if crate::venus_rw::enabled() {
+                    crate::venus_basic::runtime::mount_one(&base).map(|_| ())
+                } else {
+                    let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+                    skyward_vab::mount_one(slot, &base).map(|_| ())
+                };
+                if let Err(e) = result {
                     self.app.mount_failed(MountFailure { mounting: true, base, detail: format!("{e:#}") });
                 }
+                self.readings.refresh();
                 self.app.set_mounts(self.mounts());
             }
             Effect::Unmount(base) => {
-                let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-                if let Err(e) = skyward_vab::unmount_one(slot, &base) {
+                let result = if crate::venus_rw::enabled() {
+                    crate::venus_runtime::unmount_one(&base)
+                } else {
+                    let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+                    skyward_vab::unmount_one(slot, &base)
+                };
+                if let Err(e) = result {
                     self.app.mount_failed(MountFailure { mounting: false, base, detail: format!("{e:#}") });
                 }
+                self.readings.refresh();
                 self.app.set_mounts(self.mounts());
             }
             Effect::EnterRecovery => self.enter_recovery()?,
@@ -2977,7 +3656,12 @@ impl Pages<'_> {
         let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
         crate::prepare(self.cfg, slot)?;
         self.read_at = Instant::now();
-        read_details(self.cfg, &mut self.info, &mut self.unread.details)?;
+        if crate::venus_rw::enabled() {
+            self.info = collect_info(self.cfg)?;
+        } else {
+            read_details(self.cfg, &mut self.info, &mut self.unread.details)?;
+        }
+        self.readings.refresh();
         self.fastboot = false;
         self.app.enter_recovery();
         if let Some(w) = self.systems_worker.as_mut() {

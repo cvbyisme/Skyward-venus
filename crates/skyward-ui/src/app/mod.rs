@@ -113,6 +113,8 @@ pub enum Screen {
     BackupJob,
     /// Tools for the experienced: files, a terminal, the logs.
     Advanced,
+    /// A prepared Venus partition-maintenance plan, confirmed separately.
+    Maintenance(VenusMaintenance),
     Files,
     /// One file, and what can be done with it.
     FileInfo,
@@ -179,6 +181,10 @@ pub enum Screen {
     /// The WLAN switch, the network chosen and how joining it goes, and
     /// the networks in range.
     Wlan,
+    /// Live SIM slots, registration, carrier and signal readings.
+    Cellular,
+    /// The panel refresh rate.
+    RefreshRate,
     /// The password of the network chosen, typed on the screen's keyboard.
     WlanPassword,
     /// The network joined, and the address and the rest it gave.
@@ -189,7 +195,28 @@ pub enum Screen {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VenusMaintenance {
+    DisableAvb,
+    InstallRecovery,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Maintenance {
+    pub action: VenusMaintenance,
+    pub phase: MaintenancePhase,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MaintenancePhase {
+    Preparing,
+    Ready { summary: String },
+    Writing { done: u64, total: u64 },
+    Finished { success: bool, detail: String, write_started: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Confirm {
+    Maintenance,
     Reboot,
     Wipe,
     Flash,
@@ -225,6 +252,44 @@ pub enum Confirm {
     InstallSystem,
 }
 
+/// The exact scanned network a rendered row names. Signal/order may change
+/// between pressing and releasing it; neither its index nor lossy name is an
+/// identity. SSIDs are at most 32 bytes, so actions can remain Copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetworkKey {
+    ssid: [u8; wlan::SSID_MAX],
+    len: u8,
+    security: Security,
+}
+
+impl NetworkKey {
+    pub fn of(network: &Network) -> Option<Self> {
+        if network.ssid.is_empty() || network.ssid.len() > wlan::SSID_MAX { return None; }
+        let mut ssid = [0; wlan::SSID_MAX];
+        ssid[..network.ssid.len()].copy_from_slice(&network.ssid);
+        Some(Self { ssid, len: network.ssid.len() as u8, security: network.security })
+    }
+
+    fn matches(self, network: &Network) -> bool {
+        network.security == self.security && network.ssid == self.ssid[..self.len as usize]
+    }
+}
+
+/// A control request is pending until the independent modem owner has
+/// acknowledged a new command and reached a terminal phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellularCommand {
+    Radio(bool),
+    Data(bool),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingCellular {
+    pub command: CellularCommand,
+    pub previous: String,
+    pub until: u64,
+}
+
 /// What a control does when touched.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {
@@ -237,6 +302,8 @@ pub enum Action {
     OpenData,
     Back,
     Theme { dark: bool },
+    /// Choose the panel refresh rate.
+    RefreshRate(u32),
     Toggle(Switch),
     RebootTarget(usize),
     /// Choose or leave out what the wipe page erases.
@@ -344,12 +411,10 @@ pub enum Action {
     ChooseFs(FsChoice),
     /// Stop copying, moving or deleting.
     StopJob,
-    /// Join the network at this place in the list of those in range, or
-    /// open the page of the one joined.
-    JoinNetwork(usize),
-    /// Open the details of the network at this place in the list of those
-    /// in range.
-    NetworkDetails(usize),
+    /// Join the exact network named by the rendered row, or open its page.
+    JoinNetwork(NetworkKey),
+    /// Open details of the exact network named by the rendered row.
+    NetworkDetails(NetworkKey),
     /// The network chosen: its password again once refused, its details
     /// otherwise.
     OpenJoined,
@@ -357,6 +422,9 @@ pub enum Action {
     LeaveNetwork,
     /// Look for the networks in range again.
     Rescan,
+    RefreshCellular,
+    CellularRadio,
+    CellularData,
     /// Open the page that adds a network by hand.
     AddNetwork,
     /// Type into this field of the page that adds a network.
@@ -415,6 +483,13 @@ pub enum Shot {
 /// Work the runtime carries out on the UI's behalf.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
+    /// Make adbd listen on the WLAN address, or stop.
+    WirelessAdb(bool),
+    /// Switch the panel to this refresh rate.
+    RefreshRate(u32),
+    PrepareMaintenance(VenusMaintenance),
+    ExecuteMaintenance,
+    CancelMaintenance,
     Reboot(Target),
     /// A short tap of the vibration motor.
     Haptic,
@@ -569,6 +644,8 @@ pub enum Effect {
     /// [`App::set_wlan`].
     Wlan(bool),
     ScanWlan,
+    RefreshCellular,
+    Cellular(CellularCommand),
     JoinWlan { ssid: Vec<u8>, name: String, security: Security, password: Secret },
     LeaveWlan,
     /// Ask the update server for the newest system, telling what it
@@ -1028,6 +1105,11 @@ struct Turn {
     /// of the screen's width, as a spring settling where it goes; set off
     /// on the first frame of the slide.
     spring: Option<Spring>,
+    /// How far a predictive back drag has carried the page in, as a share
+    /// of the screen's width, while a finger still holds it.
+    drag: Option<f32>,
+    /// The page under the one that leaves during a predictive back drag.
+    behind: Option<Canvas>,
 }
 
 /// Whether a control is a row: as wide as the cards it lies on.
@@ -1189,6 +1271,9 @@ pub struct App {
     backdrop: Option<Canvas>,
     /// How round the screen's corners are, in pixels.
     corners: f32,
+    /// The stock status bar's height, clock start and right insets, in
+    /// pixels, where the device's overlay names them.
+    status_bar: Option<(f32, f32, f32, f32)>,
     dirty: bool,
     w: u32,
     h: u32,
@@ -1255,6 +1340,7 @@ impl App {
             cols: 0,
             backdrop: None,
             corners: 0.0,
+            status_bar: None,
             dirty: true,
             w,
             h,
@@ -1268,12 +1354,27 @@ impl App {
         self.corners = radius;
     }
 
+    /// Follow the stock status bar's height and horizontal insets.
+    pub fn set_status_bar(&mut self, height: f32, left: f32, right: f32, bolt_right: f32) {
+        self.status_bar = Some((height, left, right, bolt_right));
+        self.dirty = true;
+    }
+
     pub fn theme(&self) -> Theme {
-        if self.state.dark {
+        let mut t = if self.state.dark {
             Theme::dark(self.w, self.h, self.px_per_dp)
         } else {
             Theme::light(self.w, self.h, self.px_per_dp)
+        };
+        if let Some((height, left, right, bolt_right)) = self.status_bar {
+            // The clock digits sit one digit-height lower than the bar's
+            // vertical centre, as the stock bar leaves room for its cutout.
+            t.m.status_cy = height / 2.0 + t.m.status_px;
+            t.m.status_x = left;
+            t.m.status_right = right;
+            t.m.status_bolt_right = bolt_right;
         }
+        t
     }
 
     pub fn screen(&self) -> Screen {
@@ -1331,7 +1432,8 @@ impl App {
         };
         let blink = self.blink_at(now).filter(|_| self.display_on).map(|(_, next)| next);
         let chord = self.chord.map(|(_, at)| at + CHORD_MS);
-        [self.toast.as_ref().map(|t| t.1), easing, self.idle_due(), held, repeat, blink, darkens, chord].into_iter().flatten().min()
+        [self.toast.as_ref().map(|t| t.1), easing, self.idle_due(), held, repeat, blink, darkens, chord,
+            self.state.cellular_pending.as_ref().map(|p| p.until)].into_iter().flatten().min()
     }
 
     /// Whether a text field's cursor shows at `now`, and when it next turns;
@@ -1358,6 +1460,10 @@ impl App {
     /// deadline goes away.
     pub fn tick(&mut self, now: u64) -> Vec<Effect> {
         let mut fx = Vec::new();
+        if self.state.cellular_pending.as_ref().is_some_and(|p| now >= p.until) {
+            self.cellular_failed(self.state.lang.pick(["移动网络操作超时，请刷新后重试。", "行動網路操作逾時，請重新整理後再試。", "Mobile network operation timed out. Refresh and try again."]), now);
+            fx.push(Effect::RefreshCellular);
+        }
         // The key waiting for its partner in a screenshot, left alone long
         // enough, does what it does alone.
         if self.chord.is_some_and(|(_, at)| now >= at + CHORD_MS) {
@@ -1510,6 +1616,65 @@ impl App {
     }
 
     /// Whether the About page's field is on screen, moving.
+    /// A touch-controller wake key is distinct from the power button.
+    pub fn hardware_wake(&mut self, now: u64) {
+        if self.state.hardware_double_tap && self.state.double_tap_wake && !self.display_on {
+            self.wake(now);
+        }
+    }
+
+    /// An AOD failure must be visible even if hardware gesture wake is off.
+    /// The runtime restores normal panel power before presenting this page.
+    pub fn aod_failed(&mut self, why: &str, now: u64) {
+        self.state.always_on = false;
+        self.state.aod_issue = Some(why.to_string());
+        self.wake(now);
+        self.report(why, now);
+        self.refresh();
+    }
+
+    pub fn maintenance_ready(&mut self, summary: String) {
+        let Some(job) = self.state.maintenance.as_mut() else { return };
+        if !matches!(job.phase, MaintenancePhase::Preparing) { return; }
+        job.phase = if summary.trim().is_empty() {
+            MaintenancePhase::Finished { success: false, detail: "The prepared write plan was empty.".into(), write_started: false }
+        } else { MaintenancePhase::Ready { summary } };
+        self.refresh();
+    }
+
+    pub fn maintenance_progress(&mut self, done: u64, total: u64) {
+        let Some(job) = self.state.maintenance.as_mut() else { return };
+        if !matches!(job.phase, MaintenancePhase::Writing { .. }) { return; }
+        job.phase = MaintenancePhase::Writing { done, total };
+        self.refresh();
+    }
+
+    pub fn maintenance_finished(&mut self, success: bool, detail: String, write_started: bool) {
+        let Some(job) = self.state.maintenance.as_mut() else { return };
+        if !matches!(job.phase, MaintenancePhase::Preparing | MaintenancePhase::Writing { .. }) { return; }
+        job.phase = MaintenancePhase::Finished { success, detail, write_started };
+        self.refresh();
+    }
+
+    pub fn set_mobile(&mut self, mobile: skyward_net::mobile::Mobile) {
+        let completed = self.state.cellular_pending.as_ref().is_some_and(|pending| {
+            let Some(modem) = mobile.modem.as_ref().filter(|m| m.command != pending.previous) else { return false; };
+            let (phase, on) = match pending.command { CellularCommand::Radio(on) => (&modem.radio, on), CellularCommand::Data(on) => (&modem.data, on) };
+            modem.radio == skyward_net::modem::Phase::Failed || *phase == skyward_net::modem::Phase::Failed || *phase == if on { skyward_net::modem::Phase::Ready } else { skyward_net::modem::Phase::Off }
+        });
+        if completed { self.state.cellular_pending = None; }
+        if completed || self.state.mobile.as_ref() != Some(&mobile) {
+            self.state.mobile = Some(mobile);
+            self.refresh();
+        }
+    }
+
+    pub fn cellular_failed(&mut self, why: &str, now: u64) {
+        self.state.cellular_pending = None;
+        self.report(why, now);
+        self.refresh();
+    }
+
     fn glowing(&self) -> bool {
         self.glow.is_some() && self.display_on && self.top().1 < self.theme().m.dp(ABOUT_FIELD_DP)
     }
