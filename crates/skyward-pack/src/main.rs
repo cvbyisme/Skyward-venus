@@ -62,6 +62,11 @@ enum Cmd {
         /// Never flash this as a daily-use boot; CLI only unless --venus-ui is added.
         #[arg(long)]
         venus_probe: bool,
+        /// TEMPORARY standalone Skyward REC: keep the stock recovery service,
+        /// but patch the verified venus first-stage init to enter recovery.
+        /// This path uses the provided boot image and Skyward source only.
+        #[arg(long, conflicts_with = "venus_probe", requires = "standalone")]
+        venus_force_recovery: bool,
         /// Start the isolated, non-destructive menus in the temporary venus probe.
         #[arg(long, requires = "venus_probe")]
         venus_ui: bool,
@@ -77,9 +82,8 @@ enum Cmd {
         /// Embed a finite capsule able to reinstall this exact build with original init.
         #[arg(long, requires = "venus_recovery_assets")]
         venus_install_capsule: bool,
-        /// Write a standalone fastboot-bootable REC image: v3 header, device
-        /// kernel, and a ramdisk that forces Skyward Recovery, without the
-        /// full-partition AVB footer/padding or normal-entry installer capsule.
+        /// Write a standalone fastboot-bootable REC image without full-partition
+        /// AVB footer/padding or a normal-entry installer capsule.
         #[arg(long)]
         standalone: bool,
         /// Skyward built for the device (aarch64-linux-android).
@@ -172,11 +176,19 @@ fn main() -> Result<()> {
             img.kernel = BootImage::read(&kernel)?.kernel;
             write(&out, &img, &img.to_bytes()?)
         }
-        Cmd::Recovery { stock, partition, binary, system_init, config, font, mono, mono_license, out, venus_probe, venus_ui, venus_basic, venus_recovery_assets, venus_normal_entry, venus_install_capsule, standalone } => {
+        Cmd::Recovery { stock, partition, binary, system_init, config, font, mono, mono_license, out, venus_probe, venus_force_recovery, venus_ui, venus_basic, venus_recovery_assets, venus_normal_entry, venus_install_capsule, standalone } => {
             if venus_probe {
                 ensure!(partition == "boot", "--venus-probe requires --partition boot");
                 ensure!(skyward_config::DeviceConfig::load(&config)?.device.codename == "venus",
                         "--venus-probe is only for venus");
+            }
+            if venus_force_recovery {
+                ensure!(partition == "boot" && standalone,
+                        "--venus-force-recovery requires --partition boot --standalone");
+                ensure!(skyward_config::DeviceConfig::load(&config)?.device.codename == "venus",
+                        "--venus-force-recovery is only for venus");
+                ensure!(venus_recovery_assets.is_none(),
+                        "--venus-force-recovery uses the stock recovery service, not integrated runtime assets");
             }
             if venus_ui {
                 let display = skyward_config::DeviceConfig::load(&config)?.display;
@@ -191,11 +203,11 @@ fn main() -> Result<()> {
             );
             ensure!(
                 !standalone || (partition == "boot"
-                    && venus_probe
-                    && venus_recovery_assets.is_some()
                     && !venus_normal_entry
-                    && !venus_install_capsule),
-                "standalone REC requires a forced-recovery Venus build with integrated assets, and cannot include normal-entry or installer-capsule content"
+                    && !venus_install_capsule
+                    && ((venus_probe && venus_recovery_assets.is_some())
+                        || venus_force_recovery)),
+                "standalone REC requires either integrated Venus assets with --venus-probe or the stock-service path with --venus-force-recovery"
             );
             let size = partition_size(&stock)?;
             let mut img = BootImage::read(&stock)?;
@@ -239,6 +251,22 @@ fn main() -> Result<()> {
                 }
             } else {
                 rd.add(paths::MTP_RC, 0o644, MTP_RC.to_vec())?;
+            }
+            if venus_force_recovery {
+                ensure!(img.header.header_version() == 3, "standalone venus REC requires boot header v3");
+                let original_init = rd.find("system/bin/init").context("missing first-stage init")?.data.clone();
+                let patched_init = venus_first_stage::patch(&original_init)?;
+                rd.replace("system/bin/init", patched_init)?;
+                rd.add(
+                    "skyward/venus-temporary-rec.txt",
+                    0o644,
+                    format!(
+                        "venus-temporary-rec-v1\nTEMPORARY FASTBOOT BOOT ONLY - DO NOT FLASH\nsource_init_sha256={}\npatched_init_sha256={}\nentry=stock_recovery_service\n",
+                        venus_first_stage::SOURCE_SHA256,
+                        venus_first_stage::PATCHED_SHA256,
+                    ).into_bytes(),
+                )?;
+                eprintln!("TEMPORARY standalone Skyward REC: stock kernel and recovery init service retained; do not flash.");
             }
             if let Some(assets) = &venus_recovery_assets {
                 venus_recovery::prepare(&mut rd, assets, venus_normal_entry, &native_init)?;

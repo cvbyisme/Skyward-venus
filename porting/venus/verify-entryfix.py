@@ -82,6 +82,7 @@ def main():
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--normal", action="store_true")
     modes.add_argument("--ui", action="store_true")
+    modes.add_argument("--temporary-rec", action="store_true")
     parser.add_argument("--basic", action="store_true")
     a = parser.parse_args()
     check(not a.basic or a.ui, "--basic requires --ui")
@@ -89,7 +90,15 @@ def main():
     after_h, after_k, after, rs, raw_size = boot(a.output)
     check(before_h == after_h, "header changed beyond ramdisk_size")
     check(before_k == after_k, "kernel changed")
-    check(a.source.stat().st_size == a.output.stat().st_size == 201326592, "partition size changed")
+    if a.temporary_rec:
+        expected_size = 4096 + align(len(after_k), 4096) + align(rs, 4096)
+        check(a.output.stat().st_size == expected_size, "standalone REC has unexpected trailing padding or truncation")
+        check(a.output.stat().st_size < a.source.stat().st_size, "standalone REC was padded to the full boot partition")
+        with a.output.open("rb") as f:
+            f.seek(-64, 2)
+            check(f.read(4) != b"AVBf", "standalone REC unexpectedly has a full-partition AVB footer")
+    else:
+        check(a.source.stat().st_size == a.output.stat().st_size == 201326592, "partition size changed")
     changed = []
     allowed = {"system/bin/recovery", "prop.default", "system/bin/7za", "system/bin/avbctl", "system/bin/resetprop", "system/bin/unzip", "system/bin/zstd"}
     if not a.normal:
@@ -110,6 +119,17 @@ def main():
         check(init_new == init_old, "normal build must not patch init")
         check(before["system/etc/init/hw/init.rc"] == after["system/etc/init/hw/init.rc"], "normal build must not patch recovery init.rc")
         check("skyward/probe.sh" not in after, "probe leaked into normal build")
+    elif a.temporary_rec:
+        check(sha(init_new) == PATCHED_INIT, "wrong temporary REC first-stage init hash")
+        check(len(init_new) == len(init_old), "first-stage init size changed")
+        check(diffs == [k for start in SITES for k in range(start, start + 4)], "temporary REC changes more than the two verified instructions")
+        for off, word in SITES.items():
+            check(init_old[off:off + 4] == word and init_new[off:off + 4] == NOP, "first-stage instruction mismatch")
+        check(before["system/etc/init/hw/init.rc"] == after["system/etc/init/hw/init.rc"], "stock recovery init.rc changed")
+        check("service recovery /system/bin/recovery\n" in after["system/etc/init/hw/init.rc"][1].decode(), "stock Skyward recovery service entry is missing")
+        marker = after.get("skyward/venus-temporary-rec.txt", (None, b""))[1].decode()
+        check(marker.startswith("venus-temporary-rec-v1\n") and "entry=stock_recovery_service\n" in marker, "temporary REC marker is missing or invalid")
+        check("skyward/probe.sh" not in after and "skyward/probe-entryfix.txt" not in after, "probe-only entry leaked into the full REC")
     else:
         check(sha(init_new) == PATCHED_INIT, "wrong patched init hash")
         check(len(init_new) == len(init_old), "init size changed")
@@ -147,7 +167,7 @@ def main():
     if not a.basic:
         check("skyward/basic-features.txt" not in after, "basic features leaked into non-basic image")
     report = {
-        "status": "PASS", "mode": "normal-isolation" if a.normal else ("basic-functions" if a.basic else ("ui-autostart" if a.ui else "entryfix-probe")),
+        "status": "PASS", "mode": "temporary-skyward-recovery" if a.temporary_rec else ("normal-isolation" if a.normal else ("basic-functions" if a.basic else ("ui-autostart" if a.ui else "entryfix-probe"))),
         "source": str(a.source.resolve()), "output": str(a.output.resolve()),
         "source_sha256": file_sha(a.source), "output_sha256": file_sha(a.output),
         "kernel_size": len(after_k), "kernel_sha256": sha(after_k),
