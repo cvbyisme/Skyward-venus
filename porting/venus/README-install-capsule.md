@@ -9,9 +9,11 @@ paths, lengths and SHA-256 values. Repeated installations therefore do not grow
 the image.
 
 `skyward-pack recovery --venus-install-capsule` is explicit and requires the
-integrated Venus assets. Both the temporary forced-entry carrier and the
-normal-entry image contain the same capsule. The temporary init patch is never
-part of the installable template. The build runs `capsule-verify TEMP NORMAL`
+integrated Venus assets. The temporary forced-entry carrier, the fastboot-bootable standalone REC, and
+the normal-entry image contain the same capsule. The standalone image omits
+only the full-partition AVB footer/padding; it still needs the capsule because
+it is the running Recovery UI used to install itself. The temporary init patch
+is never part of the installable template. The build runs `capsule-verify TEMP NORMAL`
 and `capsule-verify NORMAL NORMAL`; each reconstructs the full partition,
 including its unsigned AVB footer, and compares all bytes.
 
@@ -46,8 +48,10 @@ changes vbmeta, vendor_boot, another slot, or boot-control state.
 
 Host tests and byte identity are not boot or flash proof. Before persistent
 installation, the next integrated image still needs a RAM-only `prepare` check
-on the actual device and the authorized normal-entry boot validation. The
-existing older image does not gain this feature until rebuilt.
+on the actual device and the authorized normal-entry boot validation. Older
+standalone images built without `--venus-install-capsule` do not gain this
+feature until rebuilt; the UI now reports that missing-capsule condition
+explicitly instead of exposing a raw ENOENT error.
 
 ## UI and command line
 

@@ -157,7 +157,9 @@ impl App {
                 }
             }
             Action::FlashSlots(pick) => {
-                if let Install::Choosing(choice) = &mut self.state.install {
+                if let Install::Choosing(choice) = &mut self.state.install
+                    && choice.kind != ImageKind::Super
+                {
                     choice.pick = pick;
                     self.refresh();
                 }
@@ -873,7 +875,8 @@ impl App {
             Confirm::Flash => {
                 if let Install::Choosing(choice) = &self.state.install {
                     let partition = choice.partitions[choice.partition];
-                    fx.push(Effect::Flash { partition, pick: choice.pick });
+                    let pick = if choice.kind == ImageKind::Super { Pick::Current } else { choice.pick };
+                    fx.push(Effect::Flash { partition, pick });
                     self.state.install = Install::Flashing { partition, stage: None };
                     self.refresh();
                 }

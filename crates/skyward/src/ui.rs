@@ -1113,13 +1113,21 @@ fn set_slot(slot: skyward_vab::Slot) -> Result<skyward_vab::BootSlots, String> {
 /// and the booted slot's partitions come off.
 fn detach(services: Vec<Service>) -> Detach {
     Box::new(move || {
-        if crate::venus_rw::enabled() {
-            return crate::venus_runtime::release_sources();
-        }
         let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-        let mounted = skyward_vab::mounted_partitions(slot)?;
-        let busy = services::pin(&services, &mounted)?;
-        skyward_vab::release_partitions(slot, &busy)
+        if crate::venus_rw::enabled() {
+            // The Venus security runtime has already moved its HALs to
+            // independent RAM roots. Release its private source maps first,
+            // then remove the recovery's ordinary logical-partition maps too.
+            crate::venus_runtime::release_sources()?;
+        } else {
+            let mounted = skyward_vab::mounted_partitions(slot)?;
+            let busy = services::pin(&services, &mounted)?;
+            skyward_vab::release_partitions(slot, &busy)?;
+        }
+        // A physical super write must not leave even an unmounted dm-linear
+        // map holding the container. This is stricter than an OTA write,
+        // which may keep pinned files alive on detached mounts.
+        skyward_vab::unmap_partitions(slot)
     })
 }
 
@@ -3167,8 +3175,13 @@ impl Pages<'_> {
                 }
             }
             Effect::Flash { partition, pick } => {
-                let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-                self.installer.as_ref().context("no installer holds an image")?.flash(partition, pick.slots(slot));
+                let slots = if partition == "super" {
+                    Vec::new()
+                } else {
+                    let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+                    pick.slots(slot)
+                };
+                self.installer.as_ref().context("no installer holds an image")?.flash(partition, slots);
             }
             Effect::Cancel => self.cancel_install(now)?,
             Effect::ReadMounts => self.app.set_mounts(self.mounts()),

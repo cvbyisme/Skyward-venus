@@ -94,6 +94,8 @@ cd /home/abc/SKYWARD/skyward
 bash porting/venus/build-recovery.sh
 ```
 
+完整物理 `super.img` 刷写行为、内部存储直读性能路径、安全检查及构建产物说明见 [`README-super-flashing.md`](README-super-flashing.md)。
+
 只在构建、测试和镜像独立校验全部成功后更新 `target/venus-recovery-latest.txt`。以下为 2026-11-09 阶段的历史产物；2026-11-11 最新 USB 修复产物及实机结果见文末。历史产物目录：
 
 `/home/abc/SKYWARD/skyward/target/venus-recovery.gfZcqd`

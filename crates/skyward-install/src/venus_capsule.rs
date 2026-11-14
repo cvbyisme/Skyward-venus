@@ -225,14 +225,24 @@ impl ValidatedPlan {
 
 pub fn prepare(device: &CurrentDevice, backup_path: &Path) -> Result<ValidatedPlan> {
     live(device)?;
+    let manifest_path = Path::new("/").join(capsule::MANIFEST_PATH);
+    ensure!(
+        manifest_path.is_file(),
+        "this Recovery image has no embedded installer manifest; rebuild the standalone REC with --venus-install-capsule"
+    );
     let manifest_bytes = read_ram(
-        Path::new("/").join(capsule::MANIFEST_PATH).as_path(),
+        manifest_path.as_path(),
         capsule::MAX_MANIFEST,
         false,
     )?;
     let manifest: Manifest = capsule::manifest(&manifest_bytes)?;
+    let template_path = Path::new("/").join(capsule::TEMPLATE_PATH);
+    ensure!(
+        template_path.is_file(),
+        "this Recovery image is missing its embedded installer template"
+    );
     let template = read_ram(
-        Path::new("/").join(capsule::TEMPLATE_PATH).as_path(),
+        template_path.as_path(),
         capsule::MAX_TEMPLATE,
         false,
     )?;

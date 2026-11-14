@@ -406,14 +406,23 @@ pub fn release_partitions(slot: Slot, busy: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-/// Undo `mount_partitions`: unmount the slot's partitions where their own
-/// device is what shows, remove their device-mapper devices, and unmount
-/// /metadata.
-pub fn unmount_partitions(slot: Slot) -> Result<()> {
+/// Unmount and remove every logical mapping of `slot`, leaving /metadata
+/// mounted. Callers that replace the physical super partition need this
+/// before writing it, while still needing snapshot state readable.
+pub fn unmap_partitions(slot: Slot) -> Result<()> {
+    ensure_no_snapshot()?;
     let md = skyward_lp::read(&super_device(), slot.number())?;
     for p in slot_partitions(&md, slot).into_iter().rev() {
         unmap(&p.name, &mount_point(base(p, slot)))?;
     }
+    Ok(())
+}
+
+/// Undo `mount_partitions`: unmount the slot's partitions where their own
+/// device is what shows, remove their device-mapper devices, and unmount
+/// /metadata.
+pub fn unmount_partitions(slot: Slot) -> Result<()> {
+    unmap_partitions(slot)?;
     let metadata = Path::new(METADATA);
     let metadata_dev = devnum(Path::new(BY_NAME).join("metadata"))?;
     if mount::visible(metadata)?.is_some_and(|v| v.device == metadata_dev) {

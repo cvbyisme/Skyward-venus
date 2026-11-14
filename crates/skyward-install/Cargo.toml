@@ -9,6 +9,7 @@ abootimg-oxide = "0.5.2"
 anyhow = { workspace = true }
 cms = "0.2.3"
 cpio = "0.4.1"
+crc32fast = "1.5.2"
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
 libc = { workspace = true }
 lz4_flex = "0.14.0"
@@ -21,6 +22,7 @@ skyward-block = { path = "../skyward-block" }
 skyward-bootimg = { path = "../skyward-bootimg" }
 skyward-config = { path = "../skyward-config" }
 skyward-info = { path = "../skyward-info" }
+skyward-lp = { path = "../skyward-lp" }
 skyward-sys = { path = "../skyward-sys" }
 skyward-systems = { path = "../skyward-systems" }
 skyward-vab = { path = "../skyward-vab" }

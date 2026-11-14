@@ -1315,32 +1315,46 @@ pub fn installing(cx: &Ctx) -> Frame {
             let parts = widgets::list(&mut c, t, f, y, &rows);
             let choose: Vec<Action> = (0..choice.partitions.len()).map(Action::FlashPartition).collect();
             out.extend(hits(&parts.rows, &choose));
-            let y = widgets::section(&mut c, t, f, parts.bottom, l.pick(["槽位", "槽位", "Slot"]));
-            let titles = Pick::ALL.map(|p| pick_title(l, p, i.slot));
-            let rows: Vec<Row> =
-                Pick::ALL.iter().zip(&titles).map(|(p, title)| Row::new(title).trail(Trail::Check(*p == choice.pick))).collect();
-            let picks = widgets::list(&mut c, t, f, y, &rows);
-            out.extend(hits(&picks.rows, &Pick::ALL.map(Action::FlashSlots)));
+            let confirm_from = if choice.kind == skyward_install::ImageKind::Super {
+                // A physical super image replaces the container and both slots.
+                parts.bottom
+            } else {
+                let y = widgets::section(&mut c, t, f, parts.bottom, l.pick(["槽位", "槽位", "Slot"]));
+                let titles = Pick::ALL.map(|p| pick_title(l, p, i.slot));
+                let rows: Vec<Row> =
+                    Pick::ALL.iter().zip(&titles).map(|(p, title)| Row::new(title).trail(Trail::Check(*p == choice.pick))).collect();
+                let picks = widgets::list(&mut c, t, f, y, &rows);
+                out.extend(hits(&picks.rows, &Pick::ALL.map(Action::FlashSlots)));
+                picks.bottom
+            };
             let (label, danger) = confirm_label(Confirm::Flash, cx.state);
-            let track = widgets::confirm(&mut c, t, f, picks.bottom + t.m.dp(28.0), label, danger, s.confirm);
+            let track = widgets::confirm(&mut c, t, f, confirm_from + t.m.dp(28.0), label, danger, s.confirm);
             out.push(Hit { rect: track, action: Action::Confirm(Confirm::Flash) });
-            let note = l.pick(match s.source {
-                Source::Computer => [
-                    "刷入将覆盖分区中的原有内容。返回将取消刷入，并结束电脑上的 adb sideload。",
-                    "刷入將覆寫分割區中的原有內容。返回將取消刷入，並結束電腦上的 adb sideload。",
-                    "Flashing writes over what the partition holds. Going back cancels it and ends adb sideload on the computer.",
-                ],
-                Source::Rescue => [
-                    "刷入将覆盖分区中的原有内容。返回将取消刷入，并退出救援模式。",
-                    "刷入將覆寫分割區中的原有內容。返回將取消刷入，並結束救援模式。",
-                    "Flashing writes over what the partition holds. Going back cancels it and leaves rescue mode.",
-                ],
-                Source::File(_) | Source::Opened { .. } | Source::Asked { .. } => [
-                    "刷入将覆盖分区中的原有内容。返回将取消刷入。",
-                    "刷入將覆寫分割區中的原有內容。返回將取消刷入。",
-                    "Flashing writes over what the partition holds. Going back cancels it.",
-                ],
-            });
+            let note = if choice.kind == skyward_install::ImageKind::Super {
+                l.pick([
+                    "警告：这会整体覆盖物理 super 分区，替换其中的系统、厂商及产品等动态分区，并同时覆盖 A/B 两个槽位。请确认镜像适用于 venus。刷写期间不要断电。",
+                    "警告：這會整體覆寫實體 super 分割區，替換其中的系統、廠商及產品等動態分割區，並同時覆寫 A/B 兩個槽位。請確認映像檔適用於 venus。刷寫期間不要斷電。",
+                    "Warning: this replaces the entire physical super partition, including system, vendor, product and other logical partitions in both A/B slots. Make sure the image is for venus. Do not power off while flashing.",
+                ])
+            } else {
+                l.pick(match s.source {
+                    Source::Computer => [
+                        "刷入将覆盖分区中的原有内容。返回将取消刷入，并结束电脑上的 adb sideload。",
+                        "刷入將覆寫分割區中的原有內容。返回將取消刷入，並結束電腦上的 adb sideload。",
+                        "Flashing writes over what the partition holds. Going back cancels it and ends adb sideload on the computer.",
+                    ],
+                    Source::Rescue => [
+                        "刷入将覆盖分区中的原有内容。返回将取消刷入，并退出救援模式。",
+                        "刷入將覆寫分割區中的原有內容。返回將取消刷入，並結束救援模式。",
+                        "Flashing writes over what the partition holds. Going back cancels it and leaves rescue mode.",
+                    ],
+                    Source::File(_) | Source::Opened { .. } | Source::Asked { .. } => [
+                        "刷入将覆盖分区中的原有内容。返回将取消刷入。",
+                        "刷入將覆寫分割區中的原有內容。返回將取消刷入。",
+                        "Flashing writes over what the partition holds. Going back cancels it.",
+                    ],
+                })
+            };
             widgets::footnote(&mut c, t, f, track.y + track.h, note)
         }
         Install::Confirming { version, wipe } => {

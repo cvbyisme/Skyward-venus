@@ -83,7 +83,7 @@ enum Cmd {
         #[arg(long, requires = "venus_recovery_assets")]
         venus_install_capsule: bool,
         /// Write a standalone fastboot-bootable REC image without full-partition
-        /// AVB footer/padding or a normal-entry installer capsule.
+        /// AVB footer/padding. The installer capsule may still be embedded.
         #[arg(long)]
         standalone: bool,
         /// Skyward built for the device (aarch64-linux-android).
@@ -204,7 +204,6 @@ fn main() -> Result<()> {
             ensure!(
                 !standalone || (partition == "boot"
                     && !venus_normal_entry
-                    && !venus_install_capsule
                     && ((venus_probe && venus_recovery_assets.is_some())
                         || venus_force_recovery)),
                 "standalone REC requires either integrated Venus assets with --venus-probe or the stock-service path with --venus-force-recovery"

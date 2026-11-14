@@ -12,6 +12,8 @@ use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+pub mod super_image;
+
 const BOOT_MAGIC: &[u8] = b"ANDROID!";
 const VENDOR_BOOT_MAGIC: &[u8] = b"VNDRBOOT";
 /// A dtbo image starts with this, big-endian.
@@ -33,7 +35,7 @@ const RECOVERY_PROGRAMS: [&str; 2] = ["system/bin/recovery", "sbin/recovery"];
 const FOOTER_MAGIC: &[u8] = b"AVBf";
 const FOOTER_LEN: u64 = 64;
 
-const CHUNK: usize = 1 << 20;
+pub(crate) const IO_CHUNK: usize = 4 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageKind {
@@ -42,6 +44,8 @@ pub enum ImageKind {
     VendorBoot,
     Dtbo,
     Vbmeta,
+    /// A complete physical super partition image, not a logical partition.
+    Super,
 }
 
 /// The ramdisk a boot image carries.
@@ -67,6 +71,7 @@ impl ImageKind {
             ImageKind::VendorBoot => &["vendor_boot"],
             ImageKind::Dtbo => &["dtbo"],
             ImageKind::Vbmeta => &["vbmeta", "vbmeta_system", "vbmeta_vendor"],
+            ImageKind::Super => &["super"],
         }
     }
 }
@@ -96,6 +101,9 @@ pub fn detect<R: Read + Seek>(file: &mut R, head: &[u8]) -> Result<Option<ImageK
     }
     if head.starts_with(VBMETA_MAGIC) {
         return Ok(Some(ImageKind::Vbmeta));
+    }
+    if super_image::is_super(file, head)? {
+        return Ok(Some(ImageKind::Super));
     }
     Ok(None)
 }
@@ -181,6 +189,10 @@ pub fn device(dir: &Path, name: &str, slot: Slot) -> PathBuf {
 /// The partitions `kind` fits that this phone has in both slots, among the
 /// links in `dir`, the likeliest first.
 pub fn partitions(kind: ImageKind, dir: &Path) -> Result<Vec<&'static str>> {
+    if kind == ImageKind::Super {
+        let path = dir.join("super");
+        return Ok(if path.try_exists().with_context(|| format!("look for {}", path.display()))? { vec!["super"] } else { Vec::new() });
+    }
     let mut found = Vec::new();
     for name in kind.partitions() {
         let mut has = true;
@@ -225,12 +237,12 @@ pub fn flash<R: Read + Seek>(image: &mut R, len: u64, devices: &[PathBuf], progr
     let total = end * outs.len() as u64 * 2;
     let mut source = image.take(len).chain(io::repeat(0).take(gap)).chain(tail);
 
-    let mut buf = vec![0u8; CHUNK];
+    let mut buf = vec![0u8; IO_CHUNK];
     let mut written = Sha256::new();
     let mut done = 0;
     let mut at = 0;
     while at < end {
-        let n = (end - at).min(CHUNK as u64) as usize;
+        let n = (end - at).min(IO_CHUNK as u64) as usize;
         source.read_exact(&mut buf[..n]).context("read the image")?;
         written.update(&buf[..n]);
         for (path, f, _) in &mut outs {
@@ -250,7 +262,7 @@ pub fn flash<R: Read + Seek>(image: &mut R, len: u64, devices: &[PathBuf], progr
         let mut back = Sha256::new();
         let mut left = end;
         while left > 0 {
-            let n = left.min(CHUNK as u64) as usize;
+            let n = left.min(IO_CHUNK as u64) as usize;
             f.read_exact(&mut buf[..n]).with_context(|| format!("read back {}", path.display()))?;
             back.update(&buf[..n]);
             left -= n as u64;

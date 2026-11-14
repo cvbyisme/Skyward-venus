@@ -22,7 +22,7 @@ use skyward_sys::{kmsg, prop};
 use skyward_vab::{Slot, SlotMaps, SnapshotState};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -272,7 +272,40 @@ fn receive(ctx: &mut Context, mut conn: Connection<Endpoints>, offer: Offer, res
 
 /// Install the file at `path`, read where it is.
 fn run_file(ctx: &mut Context, path: &Path) -> Outcome {
-    let (file, offer) = match LocalFile::open(path) {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) => return Outcome::Failed(Failure::Unreadable(format!("open {}: {e}", path.display()))),
+    };
+    let size = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(e) => return Outcome::Failed(Failure::Unreadable(format!("look at {}: {e}", path.display()))),
+    };
+
+    // A locally selected physical super image goes straight from its file
+    // descriptor to the block writer. Sending several GiB through FUSE first
+    // adds a userspace copy, per-request wakeups and a small-block hash path
+    // without providing anything the flash operation needs.
+    let mut head = Vec::with_capacity(4096);
+    if let Err(e) = (&mut file).take(4096).read_to_end(&mut head) {
+        return Outcome::Failed(Failure::Unreadable(format!("read {}: {e}", path.display())));
+    }
+    match image::super_image::is_super(&mut file, &head) {
+        Ok(true) => {
+            if let Err(e) = file.seek(SeekFrom::Start(0)) {
+                return Outcome::Failed(Failure::Unreadable(format!("rewind {}: {e}", path.display())));
+            }
+            let _ = kmsg(&format!("install: {}, {size} bytes; direct super-image I/O (FUSE bypassed)", path.display()));
+            return match flash_super_image(ctx, size, file) {
+                Ok(Done::Decided(outcome)) => outcome,
+                Ok(_) => failed(anyhow!("super image returned an unexpected installer state")),
+                Err(e) => failed(e.context("flash the super image from internal storage")),
+            };
+        }
+        Ok(false) => {}
+        Err(e) => return Outcome::Failed(Failure::Unreadable(format!("inspect {}: {e:#}", path.display()))),
+    }
+
+    let (file, offer) = match LocalFile::from_file(file) {
         Ok(opened) => opened,
         Err(e) => return Outcome::Failed(Failure::Unreadable(format!("{e:#}"))),
     };
@@ -487,7 +520,7 @@ fn install_system(ctx: &Context, contents: &skyward_systems::package::Contents) 
     ensure!(sizes.contains(&size), "{size} bytes is not among the sizes offered, {sizes:?}");
     let program = Path::new("/").join(skyward_config::ramdisk::SYSTEM_INIT);
     let program = fs::read(&program).with_context(|| format!("read {}", program.display()))?;
-    let mut zip = zip::ZipArchive::new(BufReader::with_capacity(1 << 20, File::open(fuse::PACKAGE).context("open the package")?)).context("read the package")?;
+    let mut zip = zip::ZipArchive::new(BufReader::with_capacity(image::IO_CHUNK, File::open(fuse::PACKAGE).context("open the package")?)).context("read the package")?;
     let mut told: Option<Instant> = None;
     skyward_systems::install::install(&mut zip, contents, size, &program, slot, &mut |step| {
         let stage = match step {
@@ -780,7 +813,11 @@ fn lines(from: impl Read, mut each: impl FnMut(&str) -> io::Result<()>) -> io::R
     }
 }
 
-fn flash_image(ctx: &Context, kind: ImageKind, size: u64) -> Result<Done> {
+fn flash_image(ctx: &mut Context, kind: ImageKind, size: u64) -> Result<Done> {
+    if kind == ImageKind::Super {
+        let file = File::open(fuse::PACKAGE).context("open the package")?;
+        return flash_super_image(ctx, size, file);
+    }
     let dir = Path::new(skyward_block::BY_NAME);
     let partitions = image::partitions(kind, dir)?;
     if partitions.is_empty() {
@@ -798,7 +835,7 @@ fn flash_image(ctx: &Context, kind: ImageKind, size: u64) -> Result<Done> {
         installed_boot_set()?;
     }
     let devices: Vec<_> = slots.iter().map(|&slot| image::device(dir, partition, slot)).collect();
-    let mut file = BufReader::with_capacity(1 << 20, File::open(fuse::PACKAGE).context("open the package")?);
+    let mut file = BufReader::with_capacity(image::IO_CHUNK, File::open(fuse::PACKAGE).context("open the package")?);
     let mut told: Option<Instant> = None;
     image::flash(&mut file, size, &devices, &mut |done, total| {
         if done == total || told.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
@@ -807,6 +844,85 @@ fn flash_image(ctx: &Context, kind: ImageKind, size: u64) -> Result<Done> {
         }
     })?;
     Ok(Done::Decided(Outcome::Flashed { partition, slots }))
+}
+
+/// A physical super image replaces the complete dynamic-partition container,
+/// which belongs to neither A nor B. Validate it before asking the user,
+/// then detach every live source mapping and prove the block device has no
+/// holders before the first write. Sparse images are expanded as a stream.
+fn flash_super_image(ctx: &mut Context, size: u64, file: File) -> Result<Done> {
+    if let Some(refusal) = short_of_charge(ctx.origin)? {
+        return Ok(Done::Decided(Outcome::Refused(refusal)));
+    }
+    let state = skyward_vab::snapshot_state()?;
+    if state != SnapshotState::None {
+        return Ok(Done::Decided(Outcome::Refused(Refusal::Pending(state))));
+    }
+    let dir = Path::new(skyward_block::BY_NAME);
+    let super_dev = dir.join("super");
+    ensure!(super_dev.exists(), "this device has no physical super partition");
+    let super_size = skyward_block::size_bytes(&super_dev).context("read the physical super partition size")?;
+    ensure!(super_size != 0, "physical super partition has zero size");
+
+    let mut image = image::super_image::SuperImage::open(BufReader::with_capacity(image::IO_CHUNK, file))
+        .context("open the complete super image")?;
+    let metadata = image.validate(super_size).context("validate the complete super image before flashing")?;
+    let _ = kmsg(&format!(
+        "install: validated super image file_bytes={size} expanded_bytes={} lp_version={}.{} partitions_a={} partitions_b={}",
+        image.expanded_size(), metadata[0].major_version, metadata[0].minor_version,
+        metadata[0].partitions.len(), metadata[1].partitions.len()
+    ));
+
+    ctx.send(Event::Image { kind: ImageKind::Super, size, partitions: vec!["super"] });
+    let (partition, slots) = match ctx.commands.recv() {
+        Ok(Command::Flash { partition, slots }) => (partition, slots),
+        Ok(Command::Cancel) | Err(_) => return Ok(Done::Decided(Outcome::Cancelled)),
+        Ok(other) => bail!("a super image waiting for confirmation was told {other:?}"),
+    };
+    ensure!(partition == "super", "a complete super image can only be written to super");
+    ensure!(slots.is_empty(), "super is a physical partition and has no A/B slot selection");
+    if ctx.shared.cancelled() {
+        return Ok(Done::Decided(Outcome::Cancelled));
+    }
+
+    // The running system's logical partitions and any Venus diagnostic
+    // source mounts must be gone before the physical container is replaced.
+    detach_once(ctx)?;
+    let state = skyward_vab::snapshot_state()?;
+    ensure!(state == SnapshotState::None, "an OTA snapshot appeared before super flashing: {state:?}");
+    ensure_super_unreferenced(&super_dev)?;
+
+    let expanded_size = image.expanded_size();
+    let mut told: Option<Instant> = None;
+    image::flash(&mut image, expanded_size, &[super_dev], &mut |done, total| {
+        if done == total || told.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
+            ctx.send(Event::Progress(Stage::Flashing { done, total }));
+            told = Some(Instant::now());
+        }
+    })?;
+    Ok(Done::Decided(Outcome::Flashed { partition: "super", slots: Vec::new() }))
+}
+
+/// Prove no mount or device-mapper mapping still depends directly on the
+/// physical super device. A logical-partition map holds super in sysfs even
+/// when its filesystem is no longer mounted.
+fn ensure_super_unreferenced(super_dev: &Path) -> Result<()> {
+    let devnum = skyward_block::devnum(super_dev).context("identify the physical super block device")?;
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").context("read active mount table")?;
+    let number = format!("{}:{}", devnum.0, devnum.1);
+    ensure!(
+        !mountinfo.lines().any(|line| line.split_whitespace().nth(2) == Some(number.as_str())),
+        "the physical super partition is still mounted"
+    );
+    let resolved = std::fs::canonicalize(super_dev).with_context(|| format!("resolve {}", super_dev.display()))?;
+    let name = resolved.file_name().context("physical super has no device name")?.to_string_lossy();
+    let holders = Path::new("/sys/class/block").join(name.as_ref()).join("holders");
+    let active: Vec<String> = std::fs::read_dir(&holders)
+        .with_context(|| format!("read super holders at {}", holders.display()))?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<_>>()?;
+    ensure!(active.is_empty(), "super is still used by device-mapper holders: {}", active.join(", "));
+    Ok(())
 }
 
 /// Run the install script of the zip being served, `size` bytes, once the

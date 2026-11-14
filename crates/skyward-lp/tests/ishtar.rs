@@ -94,6 +94,13 @@ fn both_geometry_copies_damaged_is_an_error() {
 }
 
 #[test]
+fn reports_the_complete_metadata_prefix_size() {
+    let data = std::fs::read(fixture()).unwrap();
+    assert_eq!(skyward_lp::metadata_prefix_size(&data).unwrap(), data.len());
+    assert_eq!(skyward_lp::metadata_prefix_size(&data[..12288]).unwrap(), data.len());
+}
+
+#[test]
 fn an_image_file_keeps_the_geometry_then_one_copy_of_the_metadata() {
     // Laid out as liblp writes an image file: the geometry block, then the
     // header and its tables with nothing after them.

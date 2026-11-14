@@ -88,7 +88,13 @@ impl LocalFile {
     /// it is served in.
     pub fn open(path: &Path) -> Result<(LocalFile, Offer)> {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let size = file.metadata().with_context(|| format!("look at {}", path.display()))?.len();
+        Self::from_file(file).with_context(|| format!("look at {}", path.display()))
+    }
+
+    /// Serve an already-open file. Keeping the descriptor lets callers
+    /// inspect the image first without opening it a second time.
+    pub fn from_file(file: File) -> Result<(LocalFile, Offer)> {
+        let size = file.metadata().context("look at the package file")?.len();
         let block_size = file_block(size);
         Ok((LocalFile { file, block_size: u64::from(block_size) }, Offer { size, block_size }))
     }

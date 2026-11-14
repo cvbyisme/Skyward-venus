@@ -3,13 +3,19 @@
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
-export PATH="$HOME/.cargo/bin:$PATH"
+export PATH="$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$HOME/Android/Sdk/ndk/29.0.14206865}"
 DUMP="${VENUS_DUMP_DIR:-$HOME/SKYWARD/venus_dump}"
 TOOLS="${VENUS_TOOLS_DIR:-$HOME/SKYWARD/tools}"
 CACHE="${VENUS_KM41_CACHE:-$DUMP/keymaster41.sSBzw7}"
 TETHERING="${VENUS_TETHERING_IMAGE:-$DUMP/network-20261110/apex-ro/com.android.tethering.img}"
-CC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang"
+NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+CC="$NDK_BIN/aarch64-linux-android30-clang"
+# cargo-ndk configures Rust's linker, but cc-rs native dependencies (SQLite,
+# zstd, etc.) still need an explicit Android C compiler and archiver.
+export CC_aarch64_linux_android="$CC"
+export CXX_aarch64_linux_android="$NDK_BIN/aarch64-linux-android30-clang++"
+export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
 CONFIG=devices/venus.toml
 for file in "$DUMP/boot_a.img" "$DUMP/vendor_boot_a.img" "$DUMP/vbmeta_a.img" "$CC" "$CONFIG" "$TOOLS/avbtool.py" "$CACHE/runtime.img" "$CACHE/vndk30.img" "$TETHERING" porting/venus/framework-manifest.xml porting/venus/suspend/build.sh; do
     test -s "$file" || { printf 'Missing input: %s\n' "$file" >&2; exit 1; }
@@ -17,6 +23,8 @@ done
 mkdir -p target
 OUT="$(mktemp -d "$ROOT/target/venus-recovery.XXXXXX")"
 mkdir "$OUT/input" "$OUT/assets" "$OUT/temporary" "$OUT/standalone" "$OUT/normal" "$OUT/old-mode-isolation"
+# Python tests and py_compile must not leave __pycache__ in the source tree.
+export PYTHONPYCACHEPREFIX="$OUT/python-cache"
 printf 'Output: %s\n' "$OUT"
 sha256sum "$DUMP/boot_a.img" "$DUMP/vendor_boot_a.img" "$DUMP/vbmeta_a.img" > "$OUT/inputs.sha256"
 cp -p "$DUMP/boot_a.img" "$OUT/input/boot_a.img"
@@ -39,11 +47,13 @@ ${HOST_CC:-cc} -std=c11 -O2 -Wall -Wextra -Werror porting/venus/test-netmgr-init
 ${HOST_CC:-cc} -std=c11 -O2 -Wall -Wextra -Werror -DKM41_RPMB_TEST porting/venus/km41-rpmb.c -o "$OUT/test-rpmb"
 "$OUT/test-rpmb" | tee "$OUT/rpmb-tests.log"
 git diff --check
+cargo test --locked -p skyward-lp -p skyward-vab 2>&1 | tee "$OUT/logical-partition-tests.log"
 cargo test --locked -p skyward-binder -p skyward-block -p skyward-crypto -p skyward-files -p skyward-install -p skyward-net -p skyward-sys --lib 2>&1 | tee "$OUT/library-tests.log"
 cargo test --locked -p skyward --bin skyward 2>&1 | tee "$OUT/policy-tests.log"
 cargo test --locked -p skyward-pack 2>&1 | tee "$OUT/pack-tests.log"
 cargo test --locked -p skyward-bootimg -p skyward-systems 2>&1 | tee "$OUT/systems-tests.log"
 cargo test --locked -p skyward-ui --lib 2>&1 | tee "$OUT/ui-tests.log"
+cargo clippy --locked -p skyward-install --all-targets -- -D warnings 2>&1 | tee "$OUT/install-clippy.log"
 cargo clippy --locked -p skyward-pack --all-targets -- -D warnings 2>&1 | tee "$OUT/pack-clippy.log"
 cargo build --locked --release -p skyward-pack 2>&1 | tee "$OUT/pack-build.log"
 cargo ndk -t arm64-v8a --platform 30 build --locked --release -p skyward 2>&1 | tee "$OUT/android-build.log"
@@ -73,14 +83,17 @@ printf '%s  %s\n' \
 ARGS=(recovery --partition boot --stock "$OUT/input/boot_a.img" --binary "$OUT/assets/skyward" --system-init "$OUT/assets/system-init" --config "$OUT/input/device.toml"
       --font resources/fonts/MiSansVF.ttf --mono resources/fonts/KirkMono-Regular.ttf --mono-license resources/fonts/KirkMono-OFL.txt)
 FULL=(--venus-probe --venus-ui --venus-basic --venus-recovery-assets "$OUT/assets" --venus-install-capsule)
-RECOVERY=(--venus-probe --venus-ui --venus-basic --venus-recovery-assets "$OUT/assets")
+# The fastboot-bootable standalone image is still the running recovery build.
+# It must carry the same finite capsule so its own UI can install the normal-entry
+# candidate into the active boot slot after the on-device backup/preflight.
+RECOVERY=(--venus-probe --venus-ui --venus-basic --venus-recovery-assets "$OUT/assets" --venus-install-capsule)
 target/release/skyward-pack "${ARGS[@]}" "${FULL[@]}" --out "$OUT/temporary/boot.img" 2>&1 | tee "$OUT/temporary/pack.log"
 python3 porting/venus/verify-recovery.py --capsule "$OUT/input/boot_a.img" "$OUT/temporary/boot.img" "$OUT/assets/skyward" "$OUT/input/device.toml" "$OUT/assets" > "$OUT/temporary/validation.json"
 python3 "$TOOLS/avbtool.py" verify_image --image "$OUT/temporary/boot.img" 2>&1 | tee "$OUT/temporary/avb-verify.txt"
 target/release/skyward-pack "${ARGS[@]}" "${RECOVERY[@]}" --standalone --out "$OUT/standalone/skyward-rec.img" 2>&1 | tee "$OUT/standalone/pack.log"
-python3 porting/venus/verify-recovery.py --standalone "$OUT/input/boot_a.img" "$OUT/standalone/skyward-rec.img" "$OUT/assets/skyward" "$OUT/input/device.toml" "$OUT/assets" > "$OUT/standalone/validation.json"
+python3 porting/venus/verify-recovery.py --standalone --capsule --capsule-reference "$OUT/temporary/boot.img" "$OUT/input/boot_a.img" "$OUT/standalone/skyward-rec.img" "$OUT/assets/skyward" "$OUT/input/device.toml" "$OUT/assets" > "$OUT/standalone/validation.json"
 target/release/skyward-pack "${ARGS[@]}" "${FULL[@]}" --venus-normal-entry --out "$OUT/normal/boot.img" 2>&1 | tee "$OUT/normal/pack.log"
-python3 porting/venus/verify-recovery.py --capsule --normal-entry "$OUT/input/boot_a.img" "$OUT/normal/boot.img" "$OUT/assets/skyward" "$OUT/input/device.toml" "$OUT/assets" > "$OUT/normal/validation.json"
+python3 porting/venus/verify-recovery.py --capsule --normal-entry --capsule-reference "$OUT/temporary/boot.img" "$OUT/input/boot_a.img" "$OUT/normal/boot.img" "$OUT/assets/skyward" "$OUT/input/device.toml" "$OUT/assets" > "$OUT/normal/validation.json"
 python3 "$TOOLS/avbtool.py" verify_image --image "$OUT/normal/boot.img" 2>&1 | tee "$OUT/normal/avb-verify.txt"
 # Both the temporary RAM boot and the persistent normal image carry the same
 # finite installer. Prove reconstruction from each, including the complete AVB footer.

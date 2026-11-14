@@ -207,13 +207,42 @@ impl Metadata {
 /// replaced by its backup, and the damage is listed in `damaged`.
 pub fn read(super_dev: &Path, slot: u32) -> Result<Metadata> {
     let file = File::open(super_dev).with_context(|| format!("open {}", super_dev.display()))?;
-    let at = |offset: u64, len: usize| -> Result<Vec<u8>> {
+    read_with(slot, |offset, len| {
         let mut buf = vec![0u8; len];
         file.read_exact_at(&mut buf, offset)
             .with_context(|| format!("read {len} bytes at {offset} in {}", super_dev.display()))?;
         Ok(buf)
-    };
+    })
+}
 
+/// Read both geometry and metadata from the start of a raw super image held
+/// in memory. `super_prefix` need only include the metadata region, not the
+/// logical partition extents. This also lets callers validate Android sparse
+/// images after expanding just their bounded metadata prefix.
+pub fn metadata_prefix_size(super_prefix: &[u8]) -> Result<usize> {
+    ensure!(super_prefix.len() >= (RESERVED_BYTES + GEOMETRY_SIZE * 2) as usize,
+        "super prefix ends before both geometry copies");
+    let primary = &super_prefix[RESERVED_BYTES as usize..(RESERVED_BYTES + GEOMETRY_SIZE) as usize];
+    let backup = &super_prefix[(RESERVED_BYTES + GEOMETRY_SIZE) as usize..(RESERVED_BYTES + GEOMETRY_SIZE * 2) as usize];
+    let geometry = match Geometry::parse(primary) {
+        Ok(g) => g,
+        Err(e) => Geometry::parse(backup).with_context(|| format!("both geometry copies are damaged; primary: {e:#}"))?,
+    };
+    usize::try_from(geometry.metadata_region()).context("super metadata region does not fit memory")
+}
+
+pub fn read_bytes(super_prefix: &[u8], slot: u32) -> Result<Metadata> {
+    read_with(slot, |offset, len| {
+        let start = usize::try_from(offset).context("metadata offset does not fit memory")?;
+        let end = start.checked_add(len).context("metadata range overflow")?;
+        Ok(super_prefix
+            .get(start..end)
+            .with_context(|| format!("super image prefix ends before {len} bytes at {offset}"))?
+            .to_vec())
+    })
+}
+
+fn read_with(slot: u32, at: impl Fn(u64, usize) -> Result<Vec<u8>>) -> Result<Metadata> {
     let mut damaged = Vec::new();
     let geometry = match Geometry::parse(&at(RESERVED_BYTES, GEOMETRY_SIZE as usize)?) {
         Ok(g) => g,
@@ -413,6 +442,13 @@ fn parse_metadata(geometry: &Geometry, buf: &[u8], slot: Option<u32>) -> Result<
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    for (i, extent) in extents.iter().enumerate() {
+        if let Extent::Linear { sectors, device, sector } = *extent {
+            let block = block_devices.get(device).context("extent has no block device")?;
+            let end = sector.checked_add(sectors).context("extent end overflows")?;
+            ensure!(end <= block.size / SECTOR_SIZE, "extent {i} ends at sector {end}, past {}'s {} sectors", block.partition_name, block.size / SECTOR_SIZE);
+        }
+    }
 
     let groups = header
         .groups

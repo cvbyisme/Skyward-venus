@@ -26,9 +26,13 @@ def main() -> None:
     p.add_argument("--normal-entry", action="store_true")
     p.add_argument("--capsule", action="store_true")
     p.add_argument("--standalone", action="store_true")
+    p.add_argument("--capsule-reference", type=Path,
+                   help="require the capsule to byte-match another boot image")
     a = p.parse_args()
-    v.check(not (a.standalone and (a.normal_entry or a.capsule)),
-            "standalone REC cannot use normal-entry or installer-capsule mode")
+    v.check(not (a.standalone and a.normal_entry),
+            "standalone REC cannot use normal-entry mode")
+    v.check(a.capsule_reference is None or a.capsule,
+            "--capsule-reference requires --capsule")
     bh, bk, before, _, _ = v.boot(a.source)
     ah, ak, after, compressed, raw = v.boot(a.output)
     v.check(bh == ah, "Boot header changed beyond ramdisk_size")
@@ -146,6 +150,12 @@ def main() -> None:
         for ref in capsule["payloads"]:
             data = after[ref["path"]][1]
             v.check(ref["size"] == len(data) and ref["sha256"] == v.sha(data), "capsule RAM payload mismatch")
+        if a.capsule_reference is not None:
+            _, _, reference, _, _ = v.boot(a.capsule_reference)
+            v.check(capsule_paths <= reference.keys(), "reference image has no complete installer capsule")
+            for name in capsule_paths:
+                v.check(after[name][1] == reference[name][1],
+                        "installer capsule differs from reference image: " + name)
     else:
         v.check(not capsule_paths & after.keys(), "unexpected capsule without explicit validation")
     print(json.dumps({"status":"PASS", "scope":"standalone fastboot-bootable venus REC image" if a.standalone else "offline integrated venus Recovery image", "original_first_stage":a.normal_entry,

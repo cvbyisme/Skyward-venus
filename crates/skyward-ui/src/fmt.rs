@@ -926,6 +926,7 @@ pub fn image_kind(l: Lang, kind: ImageKind) -> (&'static str, &'static str) {
         }
         ImageKind::Dtbo => (["dtbo 镜像", "dtbo 映像檔", "dtbo image"], ["包含设备树叠加层", "包含裝置樹疊加層", "Holds device tree overlays"]),
         ImageKind::Vbmeta => (["vbmeta 镜像", "vbmeta 映像檔", "vbmeta image"], ["包含启动验证数据", "包含啟動驗證資料", "Holds verified boot data"]),
+        ImageKind::Super => (["完整 super 镜像", "完整 super 映像檔", "Full super image"], ["包含 A/B 全部动态分区，将整体覆盖现有系统", "包含 A/B 全部動態分割區，將整體覆寫現有系統", "Contains all A/B logical partitions and replaces the entire existing system"]),
     };
     (l.pick(name), l.pick(holds))
 }
@@ -941,6 +942,7 @@ pub fn partition_role(l: Lang, name: &str) -> &'static str {
         "vbmeta" => ["启动验证数据", "啟動驗證資料", "Verified boot data"],
         "vbmeta_system" => ["系统分区的验证数据", "系統分割區的驗證資料", "Verification data of the system partitions"],
         "vbmeta_vendor" => ["厂商分区的验证数据", "廠商分割區的驗證資料", "Verification data of the vendor partitions"],
+        "super" => ["完整动态分区容器（覆盖 A/B）", "完整動態分割區容器（覆寫 A/B）", "Complete dynamic-partition container (both slots)"],
         _ => ["分区", "分割區", "Partition"],
     })
 }
