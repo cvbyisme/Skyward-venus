@@ -1,207 +1,122 @@
-![Skyward Recovery](assets/hero.jpg)
+# Skyward — 小米 11（venus）移植版
 
-# Skyward
+**Skyward-venus** 是基于 [Skyward Recovery 上游项目](https://github.com/kirklin/skyward)维护的小米 11（代号 `venus`）设备移植与开发仓库。这里集中维护 Venus 设备配置、Recovery 集成、构建打包流程和机型专属的安装功能。它不是上游官方发布版本，也不是适用于其他小米机型的通用镜像。
 
-[English](README.md) | 简体中文
+[English](README.md) · [Venus 构建说明](porting/venus/README-recovery.md) · [物理 super 镜像刷写说明](porting/venus/README-super-flashing.md)
 
-Skyward 是使用 Rust 编写的 recovery，从零开始编写。
+> **开发状态：实验性机型移植。** 主机端编译成功或镜像静态校验通过，不代表手机上的启动、解密、挂载、无线服务或 Recovery 操作全部安全可用。测试时必须使用与目标机型和分区布局匹配的构建，并按项目说明逐项验收。本 README 不提供可直接刷入的预编译镜像。
 
-<p align="center">
-  <img src="assets/home.png" width="30%" alt="首页">
-  <img src="assets/settings-dark.png" width="30%" alt="深色模式下的设置">
-  <img src="assets/time-zone.png" width="30%" alt="时区">
-</p>
+## 目标设备
 
-## 功能
-
-### 双系统
-
-![一台手机可以安装两个系统](slides/zh-CN/out/01-dual-boot.png)
-
-![切换系统只改写两个分区](slides/zh-CN/out/02-dual-boot-partitions.png)
-
-第二系统的安装包格式和启动过程见下文的[双系统的工作方式](#双系统的工作方式)。
-
-### 解密
-
-![用锁屏图案或密码解密 data 分区](slides/zh-CN/out/03-decrypt.png)
-
-### 安装
-
-![从三个来源安装四种安装包](slides/zh-CN/out/04-install.png)
-
-刷机包的安装脚本可以使用 `7za` 和 `zstd`，支持刷入 super 镜像使用 zstd 压缩的第三方 ROM；`unzip -p` 边解压边输出镜像。安装脚本还可以使用 `avbctl` 关闭验证启动的校验，使用 `resetprop` 读取和设置属性。
-
-### 在线更新
-
-![系统和 Skyward 都能在线更新](slides/zh-CN/out/05-updates.png)
-
-### 备份和恢复
-
-![系统、应用和 IMEI 都可以备份](slides/zh-CN/out/06-backup.png)
-
-### 文件管理
-
-![在 Skyward 中管理手机里的文件](slides/zh-CN/out/07-files.png)
-
-### 终端
-
-![手机上就能运行 root shell](slides/zh-CN/out/08-terminal.png)
-
-### 连接电脑
-
-![用数据线连接电脑，传文件和刷写分区](slides/zh-CN/out/09-computer.png)
-
-### 清除数据
-
-![每一项都写明会清除哪些内容](slides/zh-CN/out/10-wipe.png)
-
-### 替换原厂 recovery
-
-![系统发来的请求，Skyward 照常处理](slides/zh-CN/out/11-requests.png)
-
-### 搜索
-
-![输入拼音首字母，就能找到功能](slides/zh-CN/out/12-search.png)
-
-### 高级
-
-![系统出了问题，可以先在这里修复](slides/zh-CN/out/13-tools.png)
-
-### 关于本机
-
-![电池剩余容量和充电循环都能查看](slides/zh-CN/out/14-specs.png)
-
-### 其他功能
-
-- 重启到系统、recovery、fastboot、bootloader 和 EDL，切换启动槽位
-- 浅色和深色模式，简体中文、繁体中文和英文
-
-### 没有系统时
-
-![super 中没有系统，也能装回一个系统](slides/zh-CN/out/15-no-system.png)
-
-## 支持的机型
-
-| 机型 | 代号 | 测试的系统版本 |
-| --- | --- | --- |
-| 小米 17 Ultra | `nezha` | OS4.0.4.0.XPACNXM（Android 17） |
-| 小米 13 Ultra | `ishtar` | OS3.0.308.0.WMACNXM（Android 16） |
-
-### 🚧 施工中
-
-这些机型的镜像按照各自的原厂固件构建，还没有在真机上试过。屏幕、触摸、WLAN 和振动已经配置好。解密 data 分区所需的程序由 Skyward 在手机上从已安装系统的 init 脚本和服务描述中读出，每个机型的读取结果都用原厂固件核对过，这些程序在这些机型上的运行情况还没有验证。
-
-| 机型 | 代号 | 构建所用的系统版本 |
-| --- | --- | --- |
-| 🚧 小米 13 | `fuxi` | OS3.0.309.0.WMCCNXM（Android 16） |
-| 🚧 小米 13 Pro | `nuwa` | OS3.0.312.0.WMBCNXM（Android 16） |
-| 🚧 小米 14 | `houji` | OS3.0.307.0.WNCCNXM（Android 16） |
-| 🚧 小米 14 Pro | `shennong` | OS3.0.309.0.WNBCNXM（Android 16） |
-| 🚧 小米 14 Ultra | `aurora` | OS3.0.308.0.WNACNXM（Android 16） |
-| 🚧 小米 15 | `dada` | OS3.0.307.0.WOCCNXM（Android 16） |
-| 🚧 小米 15 Pro | `haotian` | OS3.0.309.0.WOBCNXM（Android 16） |
-| 🚧 小米 15 Ultra | `xuanyuan` | OS3.0.314.0.WOACNXM（Android 16） |
-| 🚧 小米 17 | `pudding` | OS4.0.4.0.XPCCNXM（Android 17） |
-| 🚧 小米 17 Pro | `pandora` | OS4.0.4.0.XBLCNXM（Android 17） |
-| 🚧 小米 17 Pro Max | `popsicle` | OS4.0.4.0.XPBCNXM（Android 17） |
-| 🚧 小米 17 Max | `byron` | OS3.0.310.0.WAFCNXM（Android 16） |
-| 🚧 REDMI K80 | `zorn` | OS3.0.309.0.WOKCNXM（Android 16） |
-| 🚧 REDMI K80 Pro | `miro` | OS3.0.305.0.WOMCNXM（Android 16） |
-| 🚧 REDMI K90 | `annibale` | OS3.0.307.0.WPKCNXM（Android 16） |
-| 🚧 REDMI K90 Pro Max | `myron` | OS4.0.4.0.XPMCNXM（Android 17） |
-| 🚧 REDMI K90 Ultra | `warsaw` | OS3.0.309.0.WHPCNXM（Android 16） |
-| 🚧 REDMI K100 Pro | `athens` | OS4.0.4.0.XPICNXM（Android 17） |
-| 🚧 REDMI K100 Pro Max | `songyuan` | OS4.0.4.0.XGNCNXM（Android 17） |
-
-## 安装 Skyward
-
-Skyward 需要已解锁的 bootloader。从 [Releases](https://github.com/kirklin/skyward/releases) 下载对应机型的 zip，每个文件都标有机型和代号，例如 Xiaomi 17 Ultra (nezha)。使用 `SHA256SUMS` 核对并解压之后，在手机处于 fastboot 模式的时候，把其中的镜像刷入当前运行槽位的 recovery 分区：
-
-```sh
-unzip skyward-v0.3.1-nezha-OS4.0.4.0.XPACNXM.zip
-fastboot flash recovery skyward-v0.3.1-nezha-OS4.0.4.0.XPACNXM.img
-fastboot reboot recovery
-```
-
-之后连接 WLAN，就可以在“设置”的“Skyward 更新”页面更新到最新版本，也可以在 Skyward 自己的“安装”页面安装解压出来的新版镜像。打开 **自动重新刷入 Skyward** 之后，系统更新或者刷机包覆盖 recovery 分区的时候，Skyward 会重新刷回这些分区。
-
-Skyward 中的 adb 是 root shell，手机上无需授权：手机处于 recovery 的时候，任何人拿到手机和数据线都能访问其中的存储。
-
-## 双系统的工作方式
-
-Skyward 可以在手机自身分区中的系统旁边安装第二系统，主系统是 HyperOS 或者第三方 ROM 都可以，并在首页的“双系统”中切换。第二系统的根文件系统是 data 分区中的一个文件，文件系统不能移动或删除它，Skyward 直接通过分区读写其中的内容；两个系统的启动镜像保存在另一个这样的文件中。切换系统只改写下次启动槽位的 boot 和 init_boot 分区，每一步都先记录在 /metadata 中，切换过程中断电的话，Skyward 下次启动时会完成这次切换。vendor_boot、dtbo、recovery、vbmeta、固件和 super 都保持不变，第二系统使用主系统的 vendor_boot 和 dtbo 启动。
-
-其他操作写入启动分区之前，Skyward 会先把主系统的启动镜像写回：安装、切换启动槽位、fastboot、恢复出厂设置，以及备份或恢复启动分区。系统更新尚未合并的时候，暂不切换到第二系统；备份 data 分区的时候不包含第二系统。
-
-第二系统的安装包是 zip 文件，和其他安装包一样在“安装”页面安装：
-
-| 文件 | 内容 |
+| 项目 | 配置 |
 | --- | --- |
-| `system.toml` | `id`、`name`、`version` 和 `filesystem`；`init` 是根文件系统中第一个运行的程序，默认为 `/sbin/init`；`minimum` 是根文件系统至少需要的空间，单位为字节 |
-| `boot.img` | bootloader 启动的内核 |
-| `rootfs.img` | 根文件系统的镜像，格式为 `filesystem` 指定的文件系统 |
-| `init_boot.img` | 只有自带第一阶段 ramdisk 的系统需要 |
+| 设备 | Xiaomi Mi 11 / 小米 11 |
+| 代号 | `venus` |
+| SoC | Qualcomm Snapdragon 888 / 高通骁龙 888 |
+| 分区布局 | A/B |
+| 屏幕配置 | 1440 × 3200，逻辑 density 560 |
+| 设备配置 | [`devices/venus.toml`](devices/venus.toml) |
+| Vendor 集成来源 | `vendor_boot`、`vendor` |
 
-没有自带 init_boot 镜像的系统，从 Skyward 生成的 init_boot 镜像启动。其中的程序按照主系统第一阶段的方式加载第一阶段的内核模块，包括模块之间的软依赖和内核命令行中给模块的参数，然后在 data 分区中找到根文件系统，挂载之后运行其中的 `init`。启动过程中出现任何错误，这个程序都会进入 Skyward，和主系统启动失败时进入 recovery 一样：它在 misc 中留下原因，把当前槽位 recovery 分区中的 ramdisk 按照 bootloader 启动 recovery 时内核解包的方式解包到自己的 ramdisk 上，然后交给 Skyward 的第一个程序运行，所以无论 bootloader 怎样处理重启，都能进入 Skyward。Skyward 显示原因；用户在“双系统”中切换之前，下次启动的仍是第二系统。启动长时间没有进展时，这个程序改为重启到 recovery；交给第二系统之前手机重启的话，下次启动时它会在 misc 中看到同样的请求，先进入 Skyward。两种方式都无法进入 Skyward 时，手机停留在出错的地方，不会反复启动同一个系统。自带第一阶段 ramdisk 的系统可以运行 Skyward 放在 `/skyward/map` 的程序，它把根文件系统映射为块设备，并输出设备节点的路径。每次切换到第二系统，Skyward 都用自己带的程序写入第二系统的 init_boot 镜像，所以更新 Skyward 以后，第二系统也用新的程序启动。
+上述内容描述的是本仓库的目标硬件配置，不代表所有功能已经在所有固件版本上完成独立实机验证。不同固件版本的 vendor 文件和分区布局可能不同，禁止将其他 codename 的镜像或设备 dump 用于 Venus。
 
-正在运行的系统也可以请求切换：在 misc 中写入 `boot-recovery` 和 `--switch_system=installed`，或者 `--switch_system=` 加上第二系统的 `id`，然后重启到 recovery。bootloader 仍然启动这个槽位的话（小米 13 Ultra 连着 USB 线时可能这样），Skyward 的程序会在下次启动时在 misc 中看到这个请求，先进入 Skyward。
+## 本仓库维护的机型功能
 
-## 构建
+- **Venus Recovery 打包。** 将 Recovery 程序、Venus 设备配置、选定的 boot 镜像、运行时资源和安装 capsule 组合成机型专用镜像。
+- **机型适配。** 包含 Venus 显示、触摸、vendor 运行环境和部分硬件服务的集成工作。Keymaster 4.1、Gatekeeper、fscrypt 相关代码也在仓库中，但凭据类型、冷启动、挂载模式和卸载流程必须分别进行实机验收，不能只凭编译结果判断可用。
+- **完整物理 `super.img` 安装。** 安装器识别 raw 和 Android sparse 格式的完整物理 super 镜像，校验 LP Metadata 与目标分区几何信息，并在写入前检查相关 snapshot 和块设备状态。
+- **内部存储直读路径。** 从 Recovery 内部存储选择物理 super 镜像时，直接使用已打开的文件描述符读取，绕过 sideload FUSE 数据通道。写入使用 4 MiB I/O 缓冲，并保留源数据哈希和目标分区全量读回 SHA-256 校验。ADB sideload 仍使用原有传输路径。
 
-Skyward 使用 `rust-toolchain.toml` 指定版本的 Rust 和它的 `aarch64-linux-android` 目标、Android NDK r29 和 [cargo-ndk](https://github.com/bbqsrc/cargo-ndk) 构建。recovery 服务针对手机构建，打包工具针对电脑构建：
+物理 super 安装针对完整的 `super.img`，不是单独的 `system.img`、`vendor.img` 或其他逻辑分区镜像。该操作会替换两个 metadata slot 所描述的物理 super 内容；镜像错误可能导致系统无法启动。使用前必须阅读[物理 super 刷写说明](porting/venus/README-super-flashing.md)。
 
-```sh
-cargo ndk -t arm64-v8a --platform 30 build --release -p skyward
-cargo build --release -p skyward-pack
+## 构建 Venus Recovery
+
+当前维护的统一离线构建入口：
+
+```bash
+cd /path/to/Skyward-venus
+bash porting/venus/build-recovery.sh
 ```
 
-第二系统启动时运行的第一个程序在任何动态库可用之前运行，因此构建为静态程序：
+脚本不会连接手机、挂载 userdata 或刷写任何分区。它会运行主机侧回归测试，构建主机端 packer 和 Android ARM64 Recovery 组件，打包三种 Venus 镜像，并执行镜像、capsule 和 AVB 校验。成功后会更新 `target/venus-recovery-latest.txt`。
 
-```sh
-RUSTFLAGS="-C target-feature=+crt-static" cargo ndk -t arm64-v8a --platform 30 build --release -p skyward-system-init --target-dir target/system-init
+### 主机环境依赖
+
+- 仓库 [`rust-toolchain.toml`](rust-toolchain.toml) 指定的 Rust 工具链，以及项目需要的 Android target。
+- `cargo-ndk` 和 Android NDK r29。
+- Python 3、主机 C 编译器、`readelf`，以及本地工具目录中的 `avbtool.py`。
+- 下文列出的设备提取文件和运行时资源。这些文件仅作为本机构建输入，不存储在本仓库中。
+
+### 构建输入目录
+
+构建脚本支持环境变量覆盖。以下默认值与 `porting/venus/build-recovery.sh` 保持一致：
+
+| 环境变量 | 默认值 |
+| --- | --- |
+| `ANDROID_NDK_HOME` | `$HOME/Android/Sdk/ndk/29.0.14206865` |
+| `VENUS_DUMP_DIR` | `$HOME/SKYWARD/venus_dump` |
+| `VENUS_TOOLS_DIR` | `$HOME/SKYWARD/tools` |
+| `VENUS_KM41_CACHE` | `$VENUS_DUMP_DIR/keymaster41.sSBzw7` |
+| `VENUS_TETHERING_IMAGE` | `$VENUS_DUMP_DIR/network-20261110/apex-ro/com.android.tethering.img` |
+
+Dump 目录必须包含 `boot_a.img`、`vendor_boot_a.img`、`vbmeta_a.img`；Keymaster cache 必须包含 `runtime.img` 和 `vndk30.img`。此外还需要配置的 tethering 镜像、`avbtool.py`，以及仓库内的 Venus framework/suspend 构建输入。缺少文件或固定哈希校验失败时，脚本会停止。若本机目录不同，请通过对应环境变量指定路径，不要为了适配单台电脑而把个人绝对路径写进脚本。
+
+### 查找构建产物
+
+构建成功后执行：
+
+```bash
+OUT="$(cat target/venus-recovery-latest.txt)"
+printf 'Standalone REC: %s\n' "$OUT/standalone/skyward-rec.img"
+printf 'Temporary carrier: %s\n' "$OUT/temporary/boot.img"
+printf 'Normal-entry candidate: %s\n' "$OUT/normal/boot.img"
+sha256sum \
+  "$OUT/standalone/skyward-rec.img" \
+  "$OUT/temporary/boot.img" \
+  "$OUT/normal/boot.img"
 ```
 
-打包工具从小米服务器上这个版本的完整更新包中取出原厂 recovery 分区，只读取这个分区所在的部分，并且按照设备配置文件核对 SHA-256：
+只进行 RAM 临时启动测试时，使用 standalone 镜像：
 
-```sh
-target/release/skyward-pack stock --config devices/nezha.toml --out target/stock/nezha/recovery.img
+```bash
+fastboot boot "$OUT/standalone/skyward-rec.img"
 ```
 
-然后在它的基础上构建镜像：
+`standalone/skyward-rec.img` 才是供 `fastboot boot` 使用的独立 REC 镜像。`temporary/boot.img` 和 `normal/boot.img` 是启动流程不同的打包/安装候选，不能互相替代。本仓库的构建脚本不会执行 `fastboot flash`；在对应构建完成必要的实机验证、并确认具备恢复手段之前，不要将候选镜像写入持久分区。
 
-```sh
-target/release/skyward-pack recovery \
-  --stock target/stock/nezha/recovery.img \
-  --binary target/aarch64-linux-android/release/skyward \
-  --system-init target/system-init/aarch64-linux-android/release/system-init \
-  --config devices/nezha.toml \
-  --font resources/fonts/MiSansVF.ttf \
-  --mono resources/fonts/KirkMono-Regular.ttf \
-  --mono-license resources/fonts/KirkMono-OFL.txt \
-  --out target/skyward-nezha.img
+## 测试与校验
+
+完整构建脚本会执行 Venus Python/C 回归测试、相关 Rust crate 测试、installer 和 packer 的严格 Clippy 检查、Android ARM64 Release 构建、capsule 检查及 AVB 验证。
+
+针对 super 镜像代码的快速检查命令：
+
+```bash
+cargo test --locked -p skyward-lp -p skyward-vab
+cargo test --locked -p skyward-install --lib
+cargo clippy --locked -p skyward-install --all-targets -- -D warnings
 ```
 
-测试和代码检查在电脑上运行；只在手机上运行的代码按照手机目标检查：
+这些都是主机侧检查，不能代替目标手机上的受控实测。尤其需要分别验证启动、触摸、PIN 凭据处理、Data 挂载与卸载，以及 super 写入和读回校验。
 
-```sh
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo ndk -t arm64-v8a --platform 30 clippy --workspace --all-targets -- -D warnings
-```
+## 目录结构
 
-名称以 `on_the_phone` 开头的测试会创建文件系统、挂载分区、设置加密密钥，这些操作只有手机能够完成。把一台已经进入 Skyward、数据分区已经打开的手机通过 adb 连接到电脑，`cargo ndk` 会把每个测试程序推送到手机上运行，测试逐个执行：
+| 路径 | 用途 |
+| --- | --- |
+| `crates/skyward/` | Recovery 主程序与 Venus 运行时入口 |
+| `crates/skyward-install/` | 安装流程与物理 super 镜像处理 |
+| `crates/skyward-lp/` | Android Logical Partition Metadata 解析与校验 |
+| `crates/skyward-vab/` | Virtual A/B 与逻辑分区集成 |
+| `crates/skyward-ui/` | Recovery 用户界面 |
+| `crates/skyward-pack/` | 主机端镜像打包工具 |
+| `devices/venus.toml` | 小米 11 设备配置 |
+| `porting/venus/` | Venus 运行时资源、构建脚本、验证工具和移植记录 |
 
-```sh
-cargo ndk -t arm64-v8a --platform 30 test -p skyward -p skyward-block -p skyward-files -p skyward-mtp on_the_phone -- --test-threads=1
-```
+## 固件、密钥与构建产物
 
-`skyward-preview` 无需手机，在电脑上把页面绘制成 PNG 文件：每个页面完整绘制成长截图的样子，覆盖它可能处于的各种状态，另外还有触摸和动画过程中某些时刻的屏幕。`--lang` 按照地区代码选择语言，例如 `en` 或者 `zh-TW`：
+构建过程会从本机目录读取设备提取的固件和运行时文件。未经明确许可，不要提交个人设备 dump、userdata、基带/NV 备份、私钥、签名材料、账号凭据或不可再分发的闭源二进制。构建产物位于 `target/`，该目录已从 Git 跟踪中排除。分享二进制镜像前，必须确认其中每个外部组件的许可证和再分发条件。
 
-```sh
-cargo run --release -p skyward-preview -- target/preview --lang en
-```
+## 上游来源与许可证
 
-## 许可证
+本项目基于 [Kirk Lin 的 Skyward Recovery](https://github.com/kirklin/skyward)。上游提供 Recovery 基础实现；本仓库单独维护小米 11（`venus`）的设备适配及其专属修改。它是独立开发分支，不代表上游官方分支或官方发布版本。上游通用功能和发行状态请以原项目为准。
 
-[GPL-3.0-or-later](LICENSE)
+本仓库采用 **GPL-3.0-or-later**，详见 [`LICENSE`](LICENSE)。原有上游代码的版权和许可证声明继续适用于其覆盖的代码；第三方固件和二进制组件可能另有许可条件。
