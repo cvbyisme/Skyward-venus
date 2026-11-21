@@ -56,6 +56,18 @@ impl Data {
     }
 }
 
+/// A saved auto-unlock credential is only valid for the owner, after that
+/// owner's actual CE key has been installed. A worker returning Ok does not
+/// prove this when it still lists user 0 among its locked users.
+pub fn owner_credential_verified(
+    auto_decrypt: bool,
+    unlock_user: Option<u32>,
+    owner_was_locked: bool,
+    owner_still_locked: bool,
+) -> bool {
+    auto_decrypt && unlock_user == Some(0) && owner_was_locked && !owner_still_locked
+}
+
 impl App {
     /// The data partition is open: every user's own files with it, or
     /// those of `waiting`, the user and the control their screen lock is
@@ -149,6 +161,21 @@ impl App {
         widgets::pattern_lock(&mut fr.canvas, t, cx, cy, span, &self.state.pattern);
         self.layer = None;
         self.dirty = true;
+    }
+}
+
+#[cfg(test)]
+mod credential_persistence_gate_tests {
+    use super::owner_credential_verified;
+
+    #[test]
+    fn remember_only_an_enabled_confirmed_owner_unlock() {
+        assert!(owner_credential_verified(true, Some(0), true, false));
+        assert!(!owner_credential_verified(false, Some(0), true, false));
+        assert!(!owner_credential_verified(true, Some(10), true, false));
+        assert!(!owner_credential_verified(true, Some(0), true, true));
+        assert!(!owner_credential_verified(true, Some(0), false, false));
+        assert!(!owner_credential_verified(true, None, true, false));
     }
 }
 

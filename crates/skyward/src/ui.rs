@@ -1390,6 +1390,9 @@ struct Pages<'a> {
     auto_join: bool,
     /// The credential being checked, saved once it opens the owner's files.
     unlock_credential: Option<String>,
+    /// Which user's credential is currently being verified. Saving another
+    /// user's CE credential as the owner's PIN would poison future boots.
+    unlock_user: Option<u32>,
     /// The credential came from the saved auto-unlock setting.
     unlock_from_saved: bool,
     scanned_at: Instant,
@@ -1660,6 +1663,7 @@ impl<'a> Pages<'a> {
             pending_wlan: None,
             auto_join: false,
             unlock_credential: None,
+            unlock_user: None,
             unlock_from_saved: false,
             scanned_at: Instant::now(),
             checker: None,
@@ -2907,6 +2911,7 @@ impl Pages<'_> {
                         *checking = true;
                     }
                     self.unlock_credential = Some(credential.clone());
+                    self.unlock_user = Some(user);
                     self.unlock_from_saved = true;
                     let _ = skyward_sys::kmsg("VENUS_AUTO_UNLOCK begin user=0");
                     self.decryptor = Some(Decryptor::start(decrypt::Job::Unlock {
@@ -2931,29 +2936,58 @@ impl Pages<'_> {
                 self.app.data_failed(why);
             }
             decrypt::Ended::Unlocked(Ok(still)) => {
+                let owner_was_locked = self.closed.iter().any(|c| c.user == 0);
+                let owner_still_locked = still.iter().any(|c| c.user == 0);
+                let unlock_user = self.unlock_user.take();
                 self.closed = still;
                 show_closed(&mut self.app, &self.closed)?;
+                let verified_owner = skyward_ui::app::owner_credential_verified(
+                    self.app.state.auto_decrypt,
+                    unlock_user,
+                    owner_was_locked,
+                    owner_still_locked,
+                );
                 if let Some(credential) = self.unlock_credential.take() {
-                    if self.unlock_from_saved {
+                    if self.unlock_from_saved && verified_owner {
                         let _ = skyward_sys::kmsg("VENUS_AUTO_UNLOCK_OK user=0 shared_storage_ready=true");
                     }
                     self.unlock_from_saved = false;
-                    if self.app.state.auto_decrypt {
+                    if verified_owner {
+                        // A credential is persisted only after user 0's CE key
+                        // was installed successfully. Do not wait for the
+                        // 2-second UI settings debounce: rebooting immediately
+                        // after a successful PIN must not lose auto-unlock.
                         self.app.state.saved_lock = Some(credential);
                         self.app.refresh();
+                        let settings = self.app.settings();
+                        match settings::write(&settings) {
+                            Ok(()) => {
+                                self.keeper.written(settings);
+                                skyward_sys::kmsg("VENUS_AUTO_UNLOCK_CREDENTIAL_SAVED user=0 verified_ce=true")?;
+                            }
+                            Err(e) => {
+                                // The in-memory setting stays dirty, so the
+                                // existing debounced keeper retries it later.
+                                skyward_sys::kmsg(&format!(
+                                    "VENUS_AUTO_UNLOCK_CREDENTIAL_SAVE_FAILED user=0: {e:#}"
+                                ))?;
+                            }
+                        }
                     }
                 }
                 self.readings.refresh();
             }
             decrypt::Ended::Unlocked(Err(why)) => {
                 if self.unlock_from_saved {
-                    let _ = skyward_sys::kmsg(&format!("VENUS_AUTO_UNLOCK_FAILED {why}"));
+                    // HIDL Gatekeeper's general failure code may mean a HAL
+                    // or protector mismatch rather than a bad PIN. Never
+                    // erase a previously verified credential on transient
+                    // hardware errors or an unrelated manual failed attempt.
+                    skyward_sys::kmsg(&format!("VENUS_AUTO_UNLOCK_FAILED {why}"))?;
                 }
                 self.unlock_from_saved = false;
+                self.unlock_user = None;
                 self.unlock_credential = None;
-                if self.app.state.auto_decrypt {
-                    self.app.state.saved_lock = None;
-                }
                 skyward_sys::kmsg(&format!("what was entered did not open the user's files: {why}"))?;
                 self.app.unlock_failed(why, now);
             }
@@ -3217,6 +3251,7 @@ impl Pages<'_> {
             Effect::Unlock { user, code } => {
                 ensure!(self.decryptor.is_none(), "the data partition is being opened already");
                 self.unlock_credential = Some(code.clone());
+                self.unlock_user = Some(user);
                 self.unlock_from_saved = false;
                 let job = decrypt::Job::Unlock { closed: self.closed.clone(), user, credential: code.into_bytes() };
                 self.decryptor = Some(Decryptor::start(job)?);
