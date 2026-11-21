@@ -3,7 +3,7 @@
 on boot
     start venus_ui
 
-service venus_ui /system/bin/sh /skyward/ui-start.sh
+service venus_ui /system/bin/skyward venus-helper ui-start
     disabled
     oneshot
     user root

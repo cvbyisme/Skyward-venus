@@ -1,4 +1,4 @@
-<manifest version="1.0" type="framework">
+<manifest version="4.0" type="framework">
     <hal format="hidl">
         <name>android.system.net.netd</name>
         <transport>hwbinder</transport>
@@ -33,5 +33,10 @@
         <name>vendor.qti.hardware.wifi.supplicant</name>
         <transport>hwbinder</transport>
         <fqname>@2.2::ISupplicantVendor/default</fqname>
+    </hal>
+    <hal format="aidl">
+        <name>android.system.keystore2</name>
+        <version>1</version>
+        <fqname>IKeystoreService/default</fqname>
     </hal>
 </manifest>

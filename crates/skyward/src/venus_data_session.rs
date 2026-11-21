@@ -6,7 +6,7 @@ use anyhow::{Context, Result, ensure};
 
 const HEADER: &str = "venus-readonly-data-session-v1";
 #[cfg(target_os = "android")]
-const RECORD: &str = "/tmp/skyward-km41-data-session.txt";
+const RECORD: &str = "/skyward/run/state/data-ro.txt";
 #[cfg(target_os = "android")]
 const MOUNT: &str = "/mnt/skyward-data-ro";
 #[cfg(target_os = "android")]

@@ -981,7 +981,7 @@ fn show_closed(app: &mut App, closed: &[Closed]) -> Result<()> {
         };
         (c.user, keys)
     });
-    app.data_waiting(waiting);
+    app.data_waiting_storage(waiting, !closed.iter().any(|c| c.user == 0));
     Ok(())
 }
 
@@ -2900,9 +2900,9 @@ impl Pages<'_> {
                     };
                     (c.user, keys)
                 });
-                let auto = self.app.state.auto_decrypt.then(|| self.app.state.saved_lock.clone()).flatten().zip(waiting);
+                let auto = self.app.state.auto_decrypt.then(|| self.app.state.saved_lock.clone()).flatten().zip(waiting.filter(|(user, _)| *user == 0));
                 if let Some(((credential), (user, keys))) = auto {
-                    self.app.data_waiting(Some((user, keys)));
+                    self.app.data_waiting_storage(Some((user, keys)), !self.closed.iter().any(|c| c.user == 0));
                     if let Data::Locked { checking, .. } = &mut self.app.state.data {
                         *checking = true;
                     }

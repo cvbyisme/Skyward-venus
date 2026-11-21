@@ -188,7 +188,7 @@ mod tests {
         assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "internal storage waits for the data partition");
         assert_eq!(app.deadline(0), Some(TOAST_MS), "and says so");
         // The owner's files open first; another user's still wait.
-        app.data_waiting(Some((10, Keys::Digits)));
+        app.data_waiting_storage(Some((10, Keys::Digits)), true);
         let first = Effect::Backup { parts: [true, true, false, true], place: Place::Storage, compress: false, verify: true };
         assert_eq!(swipe(&mut app, &f, &i, Confirm::Backup), vec![first]);
         tap(&mut app, &f, &i, Action::BackupPart(2));

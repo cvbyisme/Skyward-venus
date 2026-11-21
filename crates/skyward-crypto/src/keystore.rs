@@ -64,12 +64,22 @@ pub struct StoredKey {
 
 impl StoredKey {
     pub fn load(dir: &Path) -> Result<StoredKey> {
+        Self::load_inner(dir, false)
+    }
+
+    /// The TeamWin KeyStorage branch reads version/secdiscardable/blob/
+    /// encrypted_key directly; the obsolete stretching marker isn't used.
+    pub fn load_recovery(dir: &Path) -> Result<StoredKey> {
+        Self::load_inner(dir, true)
+    }
+
+    fn load_inner(dir: &Path, recovery: bool) -> Result<StoredKey> {
         let read = |name: &str| fs::read(dir.join(name)).with_context(|| format!("read {}", dir.join(name).display()));
         let version = fs::read_to_string(dir.join(FN_VERSION)).with_context(|| format!("read {}", dir.join(FN_VERSION).display()))?;
         if version.trim() != VERSION {
             bail!("{} is written in layout {}, Skyward reads layout {VERSION}", dir.display(), version.trim());
         }
-        if dir.join(FN_STRETCHING).exists() {
+        if !recovery && dir.join(FN_STRETCHING).exists() {
             bail!("{} was written by an Android too old for Skyward to read", dir.display());
         }
         let secdiscardable_hash = match dir.join(FN_SECDISCARDABLE).exists() {

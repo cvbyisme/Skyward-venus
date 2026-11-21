@@ -18,8 +18,6 @@ printf 'Output: %s\n' "$OUT"
 sha256sum "$DUMP/boot_a.img" "$DUMP/vendor_boot_a.img" "$DUMP/vbmeta_a.img" > "$OUT/inputs.sha256"
 cp -p "$DUMP/boot_a.img" "$OUT/input/boot_a.img"
 cmp "$DUMP/boot_a.img" "$OUT/input/boot_a.img"
-sh -n crates/skyward-pack/src/venus_probe.sh
-sh -n crates/skyward-pack/src/venus_probe_logs.sh
 git diff --check
 cargo test --locked -p skyward-pack 2>&1 | tee "$OUT/tests.log"
 cargo clippy --locked -p skyward-pack --all-targets -- -D warnings 2>&1 | tee "$OUT/clippy.log"

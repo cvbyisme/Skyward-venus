@@ -33,7 +33,7 @@ pub enum Data {
     Opening,
     /// Open, with this user's own files waiting on their screen lock,
     /// answered with `keys`; `checking` while what they entered is checked.
-    Locked { user: u32, keys: Keys, checking: bool },
+    Locked { user: u32, keys: Keys, checking: bool, storage_ready: bool },
     /// Open, every user's own files with it.
     Open,
     /// Not opened, and why.
@@ -50,7 +50,7 @@ impl Data {
         match self {
             Data::Open => true,
             // The owner is user 0.
-            Data::Locked { user, .. } => *user != 0,
+            Data::Locked { storage_ready, .. } => *storage_ready,
             _ => false,
         }
     }
@@ -61,8 +61,14 @@ impl App {
     /// those of `waiting`, the user and the control their screen lock is
     /// answered with, still closed.
     pub fn data_waiting(&mut self, waiting: Option<(u32, Keys)>) {
+        self.data_waiting_storage(waiting, false);
+    }
+
+    /// Storage readiness comes from the owner's completed CE preparation,
+    /// independently of which user's credential is currently requested.
+    pub fn data_waiting_storage(&mut self, waiting: Option<(u32, Keys)>, storage_ready: bool) {
         self.state.data = match waiting {
-            Some((user, keys)) => Data::Locked { user, keys, checking: false },
+            Some((user, keys)) => Data::Locked { user, keys, checking: false, storage_ready },
             None => Data::Open,
         };
         self.state.code.clear();
@@ -96,8 +102,8 @@ impl App {
     /// files wait. It is taken as it is sent, so the dots clear while it is
     /// checked, and nothing more is entered until it has been.
     pub(super) fn unlock(&mut self, code: String) -> Vec<Effect> {
-        let Data::Locked { user, keys, .. } = self.state.data else { unreachable!("only a screen lock waiting takes what is entered") };
-        self.state.data = Data::Locked { user, keys, checking: true };
+        let Data::Locked { user, keys, storage_ready, .. } = self.state.data else { unreachable!("only a screen lock waiting takes what is entered") };
+        self.state.data = Data::Locked { user, keys, checking: true, storage_ready };
         self.refresh();
         vec![Effect::Unlock { user, code }]
     }
@@ -199,7 +205,7 @@ mod tests {
         let fx = tap(&mut app, &f, &i, Action::Type(Cap::Enter));
         assert_eq!(fx, vec![Effect::Unlock { user: 0, code: "123".into() }]);
         assert_eq!(app.state.code, "", "what was typed is gone once it is sent");
-        assert_eq!(app.state.data, Data::Locked { user: 0, keys: Keys::Digits, checking: true });
+        assert_eq!(app.state.data, Data::Locked { user: 0, keys: Keys::Digits, checking: true, storage_ready: false });
         assert!(!keys_shown(&mut app, &f, &i), "nothing more is taken while it is checked");
         app.unlock_failed("the secure world does not recognise that credential".into(), 0);
         assert!(keys_shown(&mut app, &f, &i), "turned down, it is asked for again");

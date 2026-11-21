@@ -231,7 +231,7 @@ enum Cmd {
     /// Say whether a service has registered with the phone's service
     /// directory, such as android.hardware.security.keymint.IKeyMintDevice/default.
     #[cfg(any(target_os = "android", test))]
-    Service { name: String },
+    Service { name: String, #[arg(long)] crypto: bool },
     /// Query venus HIDL Keymaster 4.1, optionally test metadata key unwrap in RAM.
     #[cfg(target_os = "android")]
     Keymaster41 {
@@ -316,18 +316,18 @@ enum Cmd {
     Data {
         /// What a user would type at their screen lock, where one is set.
         /// A wrong one is counted against that user by the phone's secure
-        /// world, the same as a wrong try on the screen itself.
+        /// world, the same as a wrong try on the screen itself. Read from stdin; never put credentials in argv.
         #[arg(long)]
-        credential: Option<String>,
+        credential_stdin: bool,
         /// Close the data partition instead, as a factory reset does before
         /// it erases it: every other program holding it ends first.
-        #[arg(long, conflicts_with = "credential")]
+        #[arg(long, conflicts_with = "credential_stdin")]
         close: bool,
     },
     /// Bring up real menus and touch without executing system effects (venus probe only).
     #[cfg(target_os = "android")]
     UiProbe {
-        #[arg(long, default_value = "/tmp/venus-ui-probe.toml")]
+        #[arg(long, default_value = "/skyward/run/tmp/venus-ui-probe.toml")]
         config: PathBuf,
         #[arg(long, default_value_t = 900, conflicts_with = "until_stopped")]
         seconds: u64,
@@ -533,6 +533,11 @@ fn main() -> Result<()> {
     }
     // Install scripts run the commands linked to this binary by their names.
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|a| a == "venus-helper") {
+        let mut helper = vec![std::ffi::OsString::from("venus-runtime")];
+        helper.extend(args.into_iter().skip(1));
+        return skyward_venus_runtime::run(helper);
+    }
     // The legacy AVB writer must not cross maintenance or a live UI installer.
     #[cfg(target_os = "android")]
     let _legacy_lease = if name == "avbctl" && venus_rw::enabled() { Some(venus_maintenance::legacy_lease()?) } else { None };
@@ -677,9 +682,9 @@ fn main() -> Result<()> {
             Ok(())
         }
         #[cfg(target_os = "android")]
-        Cmd::Service { name } => {
-            let binder = skyward_binder::driver::Binder::open()?;
-            let described = if skyward_binder::service::declared(&binder, &name)? { "described" } else { "not described" };
+        Cmd::Service { name, crypto } => {
+            let binder = if crypto { skyward_binder::driver::Binder::recovery_crypto()? } else { skyward_binder::driver::Binder::open()? };
+            let described = if name.contains('/') && skyward_binder::service::declared(&binder, &name)? { "described" } else { "not described" };
             let running = match skyward_binder::service::find(&binder, &name)? {
                 Some(_) => "registered",
                 None => "not registered",
@@ -697,7 +702,7 @@ fn main() -> Result<()> {
         Cmd::VenusRuntime { release_sources } => {
             if release_sources { venus_runtime::release_sources()?; }
             venus_runtime::verified()?;
-            println!("VENUS_RUNTIME_CACHE_VERIFIED services=6 source_release={release_sources}");
+            println!("VENUS_RUNTIME_CACHE_VERIFIED services=7 source_release={release_sources}");
             Ok(())
         },
         #[cfg(target_os = "android")]
@@ -755,11 +760,19 @@ fn main() -> Result<()> {
             Ok(())
         }
         #[cfg(target_os = "android")]
-        Cmd::Data { credential, close: false } => {
+        Cmd::Data { credential_stdin, close: false } => {
+            let credential = if credential_stdin {
+                use std::io::Read;
+                let mut value = zeroize::Zeroizing::new(Vec::new());
+                std::io::stdin().take(4097).read_to_end(&mut value)?;
+                anyhow::ensure!(value.len() <= 4096, "credential exceeds input limit");
+                if value.last() == Some(&b'\n') {value.pop();}
+                Some(value)
+            } else {None};
             use skyward_crypto::data;
-            let binder = skyward_binder::driver::Binder::open()?;
-            let service = skyward_crypto::keymint::KeyMint::open(&binder)?;
-            let opening = data::open_without_credential(&service)?;
+            let opening = if venus_rw::enabled() { venus_rw::open()? } else {
+                decrypt::with_key_service(data::open_without_credential).map_err(anyhow::Error::msg)?
+            };
             match &opening.mounted {
                 Some(mounted) => {
                     if let Some(checked) = &mounted.checked {
@@ -773,7 +786,9 @@ fn main() -> Result<()> {
             let mut closed = opening.closed;
             let asked = closed.iter().find(|c| !c.made_up).map(|c| c.user);
             if let (Some(credential), Some(user)) = (&credential, asked) {
-                closed = data::unlock(&service, &closed, user, credential.as_bytes())?;
+                closed = if venus_rw::enabled() { venus_rw::unlock(&closed, user, &credential)? } else {
+                    decrypt::with_key_service(|service| data::unlock(service, &closed, user, &credential)).map_err(anyhow::Error::msg)?
+                };
             }
             for c in &closed {
                 match &c.why {

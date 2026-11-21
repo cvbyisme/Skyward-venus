@@ -2390,6 +2390,7 @@ dependencies = [
  "skyward-systems",
  "skyward-ui",
  "skyward-vab",
+ "skyward-venus-runtime",
  "tempfile",
  "ureq",
  "zeroize",
@@ -2474,6 +2475,7 @@ dependencies = [
  "sha2 0.10.9",
  "skyward-binder",
  "skyward-block",
+ "skyward-sys",
  "tempfile",
  "zeroize",
 ]
@@ -2724,6 +2726,18 @@ dependencies = [
  "skyward-binder",
  "skyward-block",
  "skyward-lp",
+]
+
+[[package]]
+name = "skyward-venus-runtime"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde_json",
+ "sha2 0.10.9",
+ "skyward-binder",
+ "tempfile",
 ]
 
 [[package]]

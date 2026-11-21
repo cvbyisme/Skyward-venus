@@ -8,6 +8,80 @@ use std::path::Path;
 /// How long the name the kernel gives a key is.
 pub const NAME_BYTES: usize = 16;
 
+/// Android init normally creates this keyring when it installs /data's
+/// keys. Recovery mounts /data itself, so it must provide the same session
+/// keyring before attempting any filesystem-key installation.
+#[cfg(any(target_os = "android", test))]
+fn find_or_create_keyring(
+    search: impl FnOnce() -> std::io::Result<libc::c_long>,
+    create: impl FnOnce() -> std::io::Result<libc::c_long>,
+) -> std::io::Result<libc::c_long> {
+    match search() {
+        Err(error) if error.raw_os_error() == Some(libc::ENOKEY) => create(),
+        result => result,
+    }
+}
+
+#[cfg(target_os = "android")]
+pub fn ensure_provisioning_keyring() -> Result<libc::c_long> {
+    let checked = |result| {
+        if result == -1 { Err(std::io::Error::last_os_error()) } else { Ok(result) }
+    };
+    find_or_create_keyring(
+        || checked(unsafe {
+            libc::syscall(libc::SYS_keyctl, 10 as libc::c_long, -3 as libc::c_long,
+                c"keyring".as_ptr(), c"fscrypt".as_ptr(), 0 as libc::c_long)
+        }),
+        || checked(unsafe {
+            libc::syscall(libc::SYS_add_key, c"keyring".as_ptr(), c"fscrypt".as_ptr(),
+                std::ptr::null::<u8>(), 0usize, -3 as libc::c_long)
+        }),
+    ).context("prepare fscrypt session keyring")
+}
+
+/// KeyUtil::installProvisioningKey payload, shared by v2 fscrypt installs.
+#[cfg(any(target_os = "android", test))]
+fn provisioning_payload(raw: &[u8]) -> zeroize::Zeroizing<Vec<u8>> {
+    let mut payload = zeroize::Zeroizing::new(vec![0; 8 + raw.len()]);
+    payload[..4].copy_from_slice(&2u32.to_ne_bytes());
+    payload[8..].copy_from_slice(raw);
+    payload
+}
+
+/// TWRP installs both the filesystem key and a session provisioning key.
+/// The latter permits reloading after a controlled unmount/remount.
+#[cfg(target_os = "android")]
+pub fn install_key(mount: &Path, raw: &[u8], wrapped: bool) -> Result<[u8; NAME_BYTES]> {
+    let ring = ensure_provisioning_keyring()?;
+    let identifier = add_key(mount, raw, wrapped)?;
+    let name = std::ffi::CString::new(hex::encode(identifier))?;
+    let payload = provisioning_payload(raw);
+    if unsafe { libc::syscall(libc::SYS_add_key, c"fscrypt-provisioning".as_ptr(), name.as_ptr(),
+            payload.as_ptr(), payload.len(), ring) } == -1 {
+        return Err(std::io::Error::last_os_error()).context("install fscrypt provisioning key");
+    }
+    Ok(identifier)
+}
+
+/// KeyUtil::reloadKeyFromSessionKeyring for a known v2 policy. No hardware
+/// authentication or key generation is performed on this path.
+#[cfg(target_os = "android")]
+pub fn reload_key(mount: &Path, id: [u8; NAME_BYTES], wrapped: bool) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let name = std::ffi::CString::new(hex::encode(id))?;
+    let key = unsafe {libc::syscall(libc::SYS_keyctl,10 as libc::c_long,-3 as libc::c_long,
+        c"fscrypt-provisioning".as_ptr(),name.as_ptr(),0 as libc::c_long)};
+    if key == -1 { return Err(std::io::Error::last_os_error()).context("find session provisioning key"); }
+    let mut arg = [0u8;80]; arg[..4].copy_from_slice(&2u32.to_ne_bytes());
+    arg[8..24].copy_from_slice(&id);arg[44..48].copy_from_slice(&(key as u32).to_ne_bytes());
+    if wrapped {arg[76..80].copy_from_slice(&1u32.to_ne_bytes());}
+    let file = std::fs::File::open(mount)?;
+    if unsafe {libc::ioctl(file.as_raw_fd(),0xc0506617u32 as libc::Ioctl,arg.as_mut_ptr())} != 0 {
+        return Err(std::io::Error::last_os_error()).context("reload filesystem key from session keyring");
+    }
+    Ok(())
+}
+
 /// Let `raw` into the filesystem mounted at `mount`, and give the name the
 /// kernel knows it by. Every file whose directory names that key can be
 /// read from then on.
@@ -117,6 +191,31 @@ pub fn recorded_name(path: &Path) -> Result<[u8; NAME_BYTES]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_creates_only_a_missing_session_keyring() {
+        assert_eq!(find_or_create_keyring(|| Ok(17), || panic!("must reuse the inherited ring")).unwrap(), 17);
+        assert_eq!(find_or_create_keyring(
+            || Err(std::io::Error::from_raw_os_error(libc::ENOKEY)), || Ok(23),
+        ).unwrap(), 23);
+        for code in [libc::EACCES, libc::EPERM, libc::EKEYREVOKED] {
+            assert_eq!(find_or_create_keyring(
+                || Err(std::io::Error::from_raw_os_error(code)),
+                || panic!("must not replace an inaccessible or revoked ring"),
+            ).unwrap_err().raw_os_error(), Some(code));
+        }
+        assert_eq!(find_or_create_keyring(
+            || Err(std::io::Error::from_raw_os_error(libc::ENOKEY)),
+            || Err(std::io::Error::from_raw_os_error(libc::EDQUOT)),
+        ).unwrap_err().raw_os_error(), Some(libc::EDQUOT));
+    }
+
+    #[test]
+    fn provisioning_payload_has_v2_type_reserved_word_and_full_wrapped_key() {
+        let payload = provisioning_payload(&[0x42;68]);
+        assert_eq!(&payload[..8], &[2,0,0,0,0,0,0,0]);
+        assert_eq!(&payload[8..], &[0x42;68]);
+    }
 
     #[test]
     fn a_phone_says_whether_the_hardware_holds_the_keys() {

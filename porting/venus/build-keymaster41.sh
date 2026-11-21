@@ -26,17 +26,10 @@ sha256sum "$DUMP/boot_a.img" "$DUMP/vendor_boot_a.img" "$DUMP/vbmeta_a.img" > "$
 cp -p "$DUMP/boot_a.img" "$OUT/input/boot_a.img"
 cp -p "$CONFIG" "$OUT/input/device.toml"
 cmp "$DUMP/boot_a.img" "$OUT/input/boot_a.img"
-sh -n porting/venus/km41-runtime.sh
 bash -n porting/venus/prepare-keymaster41.sh
-sh porting/venus/test-km41-properties.sh porting/venus/km41-runtime.sh 2>&1 | tee "$OUT/property-reader-tests.log"
-sh porting/venus/test-km41-readiness.sh porting/venus/km41-runtime.sh 2>&1 | tee "$OUT/readiness-tests.log"
-${HOST_CC:-cc} -std=c11 -Wall -Wextra -Werror -O2 porting/venus/test-km41-directories.c -o "$OUT/test-km41-directories"
-"$OUT/test-km41-directories" | tee "$OUT/directory-tests.log"
-${HOST_CC:-cc} -std=c11 -Wall -Wextra -Werror -O2 -DKM41_RPMB_TEST porting/venus/km41-rpmb.c -o "$OUT/test-km41-rpmb"
-"$OUT/test-km41-rpmb" | tee "$OUT/rpmb-policy-tests.log"
+cargo test --locked -p skyward-venus-runtime 2>&1 | tee "$OUT/runtime-tests.log"
 python3 porting/venus/test-km41-result.py 2>&1 | tee "$OUT/result-tests.log"
 python3 porting/venus/test-km41-host.py
-sh -n porting/venus/ce-runtime.sh
 python3 porting/venus/test-ce-local.py 2>&1 | tee "$OUT/ce-helper-tests.log" 2>&1 | tee "$OUT/host-wrapper-tests.log"
 git diff --check
 cargo test --locked -p skyward-binder -p skyward-crypto --lib 2>&1 | tee "$OUT/protocol-tests.log"
@@ -47,13 +40,8 @@ cargo clippy --locked -p skyward-pack --all-targets -- -D warnings 2>&1 | tee "$
 cargo build --locked --release -p skyward-pack 2>&1 | tee "$OUT/pack-build.log"
 cargo ndk -t arm64-v8a --platform 30 build --locked --release -p skyward 2>&1 | tee "$OUT/android-build.log"
 cp -p target/aarch64-linux-android/release/skyward "$OUT/assets/skyward"
-"$CC" -std=c11 -O2 -Wall -Wextra -Werror -static porting/venus/binderfs-setup.c -o "$OUT/assets/binderfs-setup"
-"$CC" -std=c11 -O2 -Wall -Wextra -Werror -static porting/venus/km41-launch.c -o "$OUT/assets/km41-launch"
-"$CC" -std=c11 -O2 -Wall -Wextra -Werror -static porting/venus/km41-kmsg.c -o "$OUT/assets/km41-kmsg"
-"$CC" -std=c11 -O2 -Wall -Wextra -Werror -static porting/venus/km41-rpmb.c -o "$OUT/assets/km41-rpmb"
+bash porting/venus/build-runtime.sh "$OUT/assets" 2>&1 | tee "$OUT/rust-runtime-build.log"
 cp -p "$CACHE/runtime.img" "$CACHE/vndk30.img" "$CACHE/framework-manifest.xml" "$OUT/assets/"
-cp -p porting/venus/km41-runtime.sh "$OUT/assets/"
-cp -p porting/venus/ce-runtime.sh "$OUT/assets/"
 printf '%s  %s\n' \
     9776b642132872ce4931218694c345231ecaac4490ead5d7c2f7c24e17481c17 "$OUT/assets/runtime.img" \
     8948745de8d27cae3fbdf23f6185ae4b6aec680b6a6febf2a2f0eaba1ab59b9e "$OUT/assets/vndk30.img" | sha256sum -c -

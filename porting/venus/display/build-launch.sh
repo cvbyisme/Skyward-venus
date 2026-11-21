@@ -1,23 +1,39 @@
-#!/bin/sh
-set -eu
-root=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
-output=${1:?usage: build-launch.sh OUTPUT_ELF}
-python3 - "$root" "$output" <<'PY'
+#!/usr/bin/env bash
+# Standalone Rust diagnostic launcher; do not build or execute legacy C code.
+set -euo pipefail
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
+OUTPUT="${1:?usage: build-launch.sh OUTPUT_ELF}"
+ROLE="$(basename -- "$OUTPUT")"
+case "$ROLE" in display-probe-launch|display-ipc-launch|display-ipc-qservice) ;; *) echo "Unsupported display role: $ROLE" >&2; exit 2;; esac
+cd "$ROOT"
+export PATH="$HOME/.cargo/bin:$PATH"
+export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$HOME/Android/Sdk/ndk/29.0.14206865}"
+RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static" cargo ndk -t arm64-v8a --platform 30 build --locked --release -p skyward-venus-runtime --bin venus-runtime --target-dir target/venus-runtime-static
+BINARY=target/venus-runtime-static/aarch64-linux-android/release/venus-runtime
+if readelf -l "$BINARY" | grep -q INTERP; then
+    echo 'Display launcher requires a static early-execution binary' >&2
+    exit 1
+fi
+mkdir -p "$(dirname -- "$OUTPUT")"
+cp -p "$BINARY" "$OUTPUT"
+python3 - "$OUTPUT" "$ROOT" "$ROLE" <<'PY'
+import hashlib, json, sys
 from pathlib import Path
-import hashlib,json,os,subprocess,sys,tempfile
-root=Path(sys.argv[1]);out=Path(sys.argv[2]).resolve();out.parent.mkdir(parents=True,exist_ok=True)
-source=root/'porting/venus/display/probe-launch.c'
-config=root/'porting/venus/boot-ld.config.txt'
-ndk=Path(os.environ.get('ANDROID_NDK_HOME',str(Path.home()/'Android/Sdk/ndk/29.0.14206865')))
-tools=ndk/'toolchains/llvm/prebuilt/linux-x86_64/bin'
-with tempfile.TemporaryDirectory(prefix='display-launch-build-') as tmp:
- header=Path(tmp)/'config.h'
- header.write_text('#define DISPLAY_LINKER_CONFIG '+json.dumps(config.read_text())+'\n')
- subprocess.run([tools/'aarch64-linux-android30-clang','-std=c11','-O2','-static','-Wall','-Wextra','-Werror',
-                 '-include',header,source,'-o',out],check=True)
- subprocess.run([tools/'llvm-strip',out],check=True)
-record={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in (source,config)}
-record.update(sha256=hashlib.sha256(out.read_bytes()).hexdigest(),device_tested=False)
-out.with_name(out.name+'.build.json').write_text(json.dumps(record,indent=2)+'\n')
-print(out,record['sha256'])
+output=Path(sys.argv[1]).resolve(); root=Path(sys.argv[2])
+paths=[root/'crates/skyward-venus-runtime/src/display/root.rs',
+       root/'crates/skyward-venus-runtime/src/display/ipc.rs',
+       root/'crates/skyward-venus-runtime/src/display/qservice.rs',
+       root/'crates/skyward-venus-runtime/src/display/stc.rs',
+       root/'crates/skyward-venus-runtime/src/display/platform_binder.rs',
+       root/'crates/skyward-venus-runtime/src/display/protocol.rs',
+       root/'crates/skyward-venus-runtime/src/display/transport.rs',
+       root/'crates/skyward-venus-runtime/src/display/mod.rs',
+       root/'crates/skyward-venus-runtime/src/display/guard.rs',
+       root/'crates/skyward-venus-runtime/src/lib.rs',
+       root/'crates/skyward-venus-runtime/src/common.rs',
+       root/'crates/skyward-venus-runtime/Cargo.toml',
+       root/'porting/venus/boot-ld.config.txt']
+record={'sha256':hashlib.sha256(output.read_bytes()).hexdigest(),'implementation':'rust','role':sys.argv[3],'sources':{str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in paths},'device_tested':False}
+output.with_name(output.name+'.build.json').write_text(json.dumps(record,indent=2)+'\n')
+print('PASS Rust display launcher',output,record['sha256'])
 PY

@@ -68,6 +68,16 @@ WLAN 出厂地址适配候选 `target/venus-recovery.T48gRX`：778 项 Rust 测�
 
 ## 本轮修复
 
+### 2026-11-18：Keystore2 和 fscrypt 解密启动修复
+
+修复私有 BinderFS 容量不足、私有 framework VINTF 缺少 Keystore2 声明、原载体 SELinux 策略缺少 Keystore2 类和命名空间，以及 Recovery 缺少 fscrypt 会话密钥环的问题。最后一项原本在文件系统已接收 wrapped key 后失败，又被非 wrapped 模式重试掩盖为错误 22；现在先准备会话密钥环，仅在 ENOKEY 时创建，并保留真实失败信息。
+
+`target/venus-recovery.ufKbT7` 完整构建通过 952 项 Rust 测试（2 忽略）、脚本检查及镜像校验。独立 REC SHA-256 为 `dd0944cb607abd0c3acab383313969a1de8793eea213b2a950035ffb41f27eb5`。重新临时启动的 boot ID 为 `1787f585-8663-4b37-a55b-ce144cae9664`，18.037 秒达到 DE_READY，手机屏幕凭据输入后 27.028 秒达到 CE_STORAGE_READY。四处 DE/CE 策略的内核密钥状态、`/sdcard` 映射、8 KiB 写入/读回/fsync/清理和 ADB 往返均通过。boot_a/boot_b 哈希未改变；尚未验证持久安装及其他用户。
+
+最终镜像与完整记录在 `/home/abc/SKYWARD/out/data-fix-20261118/final/`。该 REC 用于 `fastboot boot`，本次未刷入分区。
+
+### 安全服务与菜单进程组
+
 原 `venus_ui` 在解密工作线程内启动 QSEE、HwServiceManager、Keymaster 和 Gatekeeper。它们虽然使用私有挂载命名空间，仍属于 `venus_ui` 的 init 进程组。停止菜单时 init 清理整个进程组，四个 HAL 随之退出；重新启动菜单只能看到过期的 `runtime-ready`，无法再次解密。
 
 现在由独立的 `venus_security` init 服务持有这些进程。菜单按需请求启动、等待就绪并核验现存服务，不再亲自创建 HAL 进程。安全服务在初始化完成后保持运行，不设置自动重启；Data 存活时不会自动重建安全环境。首次启动时 disabled 服务没有 `init.svc.*` 属性是合法初态，已加入回归测试。
@@ -93,6 +103,10 @@ skyward venus-data-rw --close-session
 cd /home/abc/SKYWARD/skyward
 bash porting/venus/build-recovery.sh
 ```
+
+Keystore2 版本的构建还需要主机 `checkpolicy` 和 `secilc`（已验证 Ubuntu 22.04 的 3.3）。默认路径为 `$VENUS_TOOLS_DIR/selinux/usr/bin/`，`VENUS_TOOLS_DIR` 未设置时使用 `$HOME/SKYWARD/tools`；也可用 `VENUS_CHECKPOLICY`、`VENUS_SECILC` 指定两个工具的完整路径。可将发行版 deb 解压到该工具目录，无需修改宿主机 SELinux 设置。
+
+`prepare-crypto-policy.py` 从原始 boot 提取 Recovery 策略，加入 `crypto-policy.cil` 中的两个 Keystore2 类、命名空间类型和三个 Recovery 授权规则，再按原策略版本编译。审计保留原有类编号、属性和有效规则；仅允许编译器省略源/目标类型集合为空的无效规则。不添加 permissive 域，不修改输入 boot 或 TWRP 镜像。构建目录的 `policy/validation.json` 记录输入、输出哈希和完整增量。类定义及 vold 权限对应 [AOSP Android 12 access_vectors](https://android.googlesource.com/platform/system/sepolicy/+/refs/heads/android12-release/private/access_vectors) 和 [vold.te](https://android.googlesource.com/platform/system/sepolicy/+/refs/heads/android12-release/private/vold.te)。
 
 完整物理 `super.img` 刷写行为、内部存储直读性能路径、安全检查及构建产物说明见 [`README-super-flashing.md`](README-super-flashing.md)。
 

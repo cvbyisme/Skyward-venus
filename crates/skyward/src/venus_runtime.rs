@@ -9,8 +9,8 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-const RUNTIME: &str = "/tmp/skyward-km41";
-const ROLES: &[&str] = &["hwmanager", "qseecomd", "keymaster", "gatekeeper", "servicemanager", "boot"];
+const RUNTIME: &str = "/skyward/run/hal";
+const ROLES: &[&str] = &["hwmanager", "qseecomd", "keymaster", "gatekeeper", "servicemanager", "boot", "keystore2", "crypto-manager"];
 
 fn pid(text: &str) -> Result<i32> {
     let text = text.trim();
@@ -29,7 +29,7 @@ pub fn verified() -> Result<CachedRuntime> {
     ensure!(crate::venus_rw::enabled() && unsafe { libc::geteuid() } == 0, "marked Venus Recovery and root required");
     let cache = crate::venus_rw::cache_root()?.context("verified RAM runtime is not ready")?;
     ensure!(skyward_sys::prop("init.svc.venus_security").as_deref() == Some("running"), "security owner is not running");
-    ensure!(fs::read_to_string("/tmp/skyward-recovery/runtime-ready")? == "venus-runtime-ready-v2\n", "security startup is incomplete or predates full firmware-source release");
+    ensure!(fs::read_to_string("/skyward/run/state/recovery/runtime-ready")? == "venus-runtime-ready-v2\n", "security startup is incomplete or predates full firmware-source release");
     for (name, value) in [
         ("hwservicemanager.ready", "true"),
         ("vendor.sys.listeners.registered", "true"),
@@ -43,9 +43,12 @@ pub fn verified() -> Result<CachedRuntime> {
     let mut namespaces = BTreeSet::new();
     let mut processes = Vec::new();
     for role in ROLES {
-        let id = pid(&fs::read_to_string(Path::new(RUNTIME).join(format!("{role}.pid")))?)?;
+        let crypto = matches!(*role, "keystore2" | "crypto-manager");
+        let role_root = if *role == "crypto-manager" {PathBuf::from("/skyward/run/crypto/manager-root")} else if *role == "keystore2" {PathBuf::from("/skyward/run/crypto/keystore-root")} else {Path::new(RUNTIME).join(format!("root-{role}"))};
+        let receipt = if *role == "crypto-manager" {PathBuf::from("/skyward/run/crypto/manager.pid")} else if *role == "keystore2" {PathBuf::from("/skyward/run/crypto/keystore2.pid")} else {Path::new(RUNTIME).join(format!("{role}.pid"))};
+        let id = pid(&fs::read_to_string(receipt)?)?;
         let proc = PathBuf::from(format!("/proc/{id}"));
-        ensure!(fs::read_link(proc.join("root"))? == Path::new(RUNTIME).join(format!("root-{role}")), "foreign runtime root: {role}");
+        ensure!(fs::read_link(proc.join("root"))? == role_root, "foreign runtime root: {role}");
         ensure!(fs::read_to_string(proc.join("cgroup"))? == owner_group, "runtime lost its independent owner: {role}");
         let ns = fs::read_link(proc.join("ns/mnt"))?;
         ensure!(ns != our_namespace && namespaces.insert(ns), "runtime mount namespace is not private: {role}");
@@ -53,6 +56,16 @@ pub fn verified() -> Result<CachedRuntime> {
         let stat = process.stat()?;
         ensure!(stat.state != 'Z' && stat.state != 'X', "runtime process exited: {role}");
         let mounts = process.mountinfo()?.0;
+        if crypto {
+            let program = if *role == "keystore2" {"keystore2"} else {"servicemanager"};
+            let expected = fs::metadata(format!("/skyward/crypto-runtime/system/bin/{program}"))?;
+            let actual = fs::metadata(proc.join(format!("root/system/bin/{program}")))?;
+            ensure!((expected.dev(),expected.ino()) == (actual.dev(),actual.ino()), "keystore2 lost its reference runtime");
+            let shown = mounts.iter().rev().find(|m|m.mount_point==Path::new("/system")).context("keystore2 system mount missing")?;
+            ensure!(shown.mount_options.contains_key("ro"), "keystore2 reference must remain read-only");
+            processes.push((id,stat.starttime));
+            continue;
+        }
         for (target, relative) in [
             ("/system", "system/system"), ("/system_ext", "system_ext"),
             ("/vendor", "vendor"), ("/odm", "odm"), ("/product", "product"),
@@ -80,7 +93,7 @@ impl CachedRuntime {
 fn lock() -> Result<File> {
     let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
         .mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open("/tmp/skyward-sources.lock")?;
+        .open("/skyward/run/locks/sources.lock")?;
     ensure!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0, "another source mount operation is running");
     Ok(file)
 }

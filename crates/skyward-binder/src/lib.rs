@@ -1,5 +1,7 @@
 pub mod hidl;
+pub mod hidl_serve;
 pub mod parcel;
+pub mod raw;
 pub mod serve;
 pub mod service;
 pub mod status;

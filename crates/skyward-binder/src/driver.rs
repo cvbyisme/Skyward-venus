@@ -1,12 +1,14 @@
 use crate::parcel::{Parcel, Payload, Reader};
 use crate::serve::{Answer, Objects};
 use crate::wire::{
-    BC_ACQUIRE, BC_ACQUIRE_DONE, BC_ENTER_LOOPER, BC_FREE_BUFFER, BC_INCREFS_DONE, BC_RELEASE, BC_REPLY, BC_TRANSACTION, BC_TRANSACTION_SG,
-    BINDER_SET_MAX_THREADS, BINDER_VERSION, BINDER_WRITE_READ, BR_ACQUIRE, BR_DEAD_REPLY, BR_DECREFS, BR_ERROR, BR_FAILED_REPLY, BR_FROZEN_REPLY,
-    BR_INCREFS, BR_NOOP, BR_OK, BR_RELEASE, BR_REPLY, BR_SPAWN_LOOPER, BR_TRANSACTION, BR_TRANSACTION_COMPLETE,
+    BC_ACQUIRE, BC_ACQUIRE_DONE, BC_ENTER_LOOPER, BC_FREE_BUFFER, BC_INCREFS_DONE, BC_RELEASE,
+    BC_REPLY, BC_REPLY_SG, BC_TRANSACTION, BC_TRANSACTION_SG, BINDER_SET_MAX_THREADS,
+    BINDER_VERSION, BINDER_WRITE_READ, BR_ACQUIRE, BR_DEAD_REPLY, BR_DECREFS, BR_ERROR,
+    BR_FAILED_REPLY, BR_FROZEN_REPLY, BR_INCREFS, BR_NOOP, BR_OK, BR_RELEASE, BR_REPLY,
+    BR_SPAWN_LOOPER, BR_TRANSACTION, BR_TRANSACTION_COMPLETE,
 };
 use crate::wire::{TransactionData, WriteRead};
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use std::convert::Infallible;
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -53,8 +55,12 @@ fn bytes_of<T>(v: &T) -> &[u8] {
 pub struct Binder {
     file: File,
     map: *mut libc::c_void,
+    /// A separate recovery service domain can have a different manager ABI
+    /// from the installed Android system; never change the global SDK for it.
+    pub(crate) manager_sdk: Option<u32>,
     /// The objects this end serves to other programs, where it serves any.
     served: Option<Arc<Objects<Binder>>>,
+    raw: Option<Arc<dyn crate::raw::Service<Binder>>>,
 }
 
 // The driver keeps what each thread is in the middle of by the thread that
@@ -69,7 +75,22 @@ unsafe impl Sync for Binder {}
 #[derive(Default)]
 struct Waiting {
     words: Vec<u8>,
-    replies: Vec<Parcel>,
+    replies: Vec<Box<dyn Payload>>,
+}
+
+struct ReceivedFds(Vec<i32>);
+impl Drop for ReceivedFds {
+    fn drop(&mut self) {
+        self.0.sort_unstable();
+        self.0.dedup();
+        for fd in &self.0 {
+            if *fd >= 0 {
+                unsafe {
+                    libc::close(*fd);
+                }
+            }
+        }
+    }
 }
 
 impl Waiting {
@@ -80,8 +101,26 @@ impl Waiting {
 }
 
 impl Binder {
+    /// Raw driver descriptor for binding the reviewed seccomp policy.
+    /// Never expose another Binder node or relax the policy after this.
+    pub fn driver_fd(&self) -> std::os::fd::RawFd {
+        self.file.as_raw_fd()
+    }
+
+    /// Initialize a specified vendor Binder driver without sending RPCs.
+    /// The caller installs its two-stage no-ioctl policy around this call.
+    pub fn vendor_probe(node: &Path) -> Result<Self> {
+        Self::on(node, None)
+    }
+
     pub fn open() -> Result<Binder> {
         Binder::on(Path::new(DEVICE), None)
+    }
+
+    pub fn recovery_crypto() -> Result<Binder> {
+        let mut binder = Binder::on(Path::new("/dev/skyward-crypto-ipc/binder"), None)?;
+        binder.manager_sdk = Some(32);
+        Ok(binder)
     }
 
     /// The driver the phone's hardware services talk over, which is a
@@ -91,7 +130,12 @@ impl Binder {
             .iter()
             .map(Path::new)
             .find(|p| p.exists())
-            .with_context(|| format!("none of {} is here, so no hardware service can be reached", HARDWARE.join(" or ")))?;
+            .with_context(|| {
+                format!(
+                    "none of {} is here, so no hardware service can be reached",
+                    HARDWARE.join(" or ")
+                )
+            })?;
         Binder::on(node, None)
     }
 
@@ -103,24 +147,62 @@ impl Binder {
         Binder::on(Path::new(DEVICE), Some(objects))
     }
 
+    /// Serve a hardware or vendor endpoint without loading libhidl/libbinder.
+    pub fn raw_serving(node: &Path, service: Arc<dyn crate::raw::Service<Binder>>) -> Result<Self> {
+        let mut binder = Self::on(node, None)?;
+        binder.raw = Some(service);
+        Ok(binder)
+    }
+
     fn on(node: &Path, served: Option<Arc<Objects<Binder>>>) -> Result<Binder> {
-        let file = File::options().read(true).write(true).open(node).with_context(|| format!("open {}", node.display()))?;
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(node)
+            .with_context(|| format!("open {}", node.display()))?;
         let mut version: i32 = 0;
-        unsafe { call(&file, BINDER_VERSION, &mut version as *mut i32 as *mut libc::c_void) }.context("ask the driver its protocol")?;
+        unsafe {
+            call(
+                &file,
+                BINDER_VERSION,
+                &mut version as *mut i32 as *mut libc::c_void,
+            )
+        }
+        .context("ask the driver its protocol")?;
         if version != PROTOCOL {
             bail!("the driver speaks protocol {version}, Skyward speaks {PROTOCOL}");
         }
         // The threads that take calls say so themselves, as many as the
         // program starts, so the driver never has to ask for another.
         let mut threads: u32 = 0;
-        unsafe { call(&file, BINDER_SET_MAX_THREADS, &mut threads as *mut u32 as *mut libc::c_void) }.context("keep the driver from asking for threads")?;
+        unsafe {
+            call(
+                &file,
+                BINDER_SET_MAX_THREADS,
+                &mut threads as *mut u32 as *mut libc::c_void,
+            )
+        }
+        .context("keep the driver from asking for threads")?;
         let map = unsafe {
-            libc::mmap(std::ptr::null_mut(), MAP_BYTES, libc::PROT_READ, libc::MAP_PRIVATE | libc::MAP_NORESERVE, file.as_raw_fd(), 0)
+            libc::mmap(
+                std::ptr::null_mut(),
+                MAP_BYTES,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_NORESERVE,
+                file.as_raw_fd(),
+                0,
+            )
         };
         if map == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error()).context("map the driver's replies");
         }
-        Ok(Binder { file, map, served })
+        Ok(Binder {
+            file,
+            map,
+            served,
+            raw: None,
+            manager_sdk: None,
+        })
     }
 
     /// The service directory, which every program reaches at handle 0. The
@@ -130,7 +212,11 @@ impl Binder {
     /// directory's own object counted up and down from outside while it is
     /// still starting.
     pub fn directory(&self) -> Result<Handle<'_>> {
-        Ok(Handle { binder: self, handle: 0, held: false })
+        Ok(Handle {
+            binder: self,
+            handle: 0,
+            held: false,
+        })
     }
 
     /// Call method `code` on `handle` and wait for what it answers.
@@ -161,30 +247,62 @@ impl Binder {
         // the other side sent lands in the mapped room, not here. While the
         // reply is awaited the other side may call back into an object
         // served here, which is answered and the waiting gone on with.
-        let mut waiting = Waiting { words: write, replies: Vec::new() };
+        let mut waiting = Waiting {
+            words: write,
+            replies: Vec::new(),
+        };
         let mut said = [0u8; SAID_BYTES];
         loop {
-            let heard = self.exchange(&mut waiting, &mut said).context("send a call")?;
+            let heard = self
+                .exchange(&mut waiting, &mut said)
+                .context("send a call")?;
             if let Some(reply) = self.take_in(&said[..heard], &mut waiting, true)? {
                 // What is still waiting to be told is told now: nothing
                 // asks the driver on this thread again for certain.
                 if !waiting.words.is_empty() {
-                    self.exchange(&mut waiting, &mut []).context("answer the driver")?;
+                    self.exchange(&mut waiting, &mut [])
+                        .context("answer the driver")?;
                 }
                 return Ok(reply);
             }
         }
     }
 
+    pub fn oneway(&self, handle: u32, code: u32, data: &impl Payload) -> Result<()> {
+        let td = TransactionData {
+            target: handle as u64,
+            code,
+            flags: TF_ONE_WAY,
+            data_size: data.values().len() as u64,
+            offsets_size: (data.addresses().len() * 8) as u64,
+            buffer: data.values().as_ptr() as u64,
+            offsets: data.addresses().as_ptr() as u64,
+            ..TransactionData::default()
+        };
+        let mut payload = bytes_of(&td).to_vec();
+        let note = if data.addresses().is_empty() {
+            BC_TRANSACTION
+        } else {
+            payload.extend_from_slice(&data.pointed().to_ne_bytes());
+            BC_TRANSACTION_SG
+        };
+        self.tell(note, &payload)
+    }
+
     /// Take the calls made on the objects served through this end, on the
     /// thread that asks, for as long as the driver gives them out.
     pub fn serve(&self) -> Result<Infallible> {
-        ensure!(self.served.is_some(), "this end of the driver serves no object");
+        ensure!(
+            self.served.is_some() || self.raw.is_some(),
+            "this end of the driver serves no object"
+        );
         let mut waiting = Waiting::default();
         waiting.tell(BC_ENTER_LOOPER, &[]);
         let mut said = [0u8; SAID_BYTES];
         loop {
-            let heard = self.exchange(&mut waiting, &mut said).context("wait for a call")?;
+            let heard = self
+                .exchange(&mut waiting, &mut said)
+                .context("wait for a call")?;
             if self.take_in(&said[..heard], &mut waiting, false)?.is_some() {
                 bail!("the driver gave a reply to a thread that made no call");
             }
@@ -202,8 +320,19 @@ impl Binder {
             read_buffer: said.as_mut_ptr() as u64,
             ..WriteRead::default()
         };
-        unsafe { call(&self.file, BINDER_WRITE_READ, &mut bwr as *mut WriteRead as *mut libc::c_void) }?;
-        ensure!(bwr.write_consumed == bwr.write_size, "the driver took {} of the {} bytes it was told", bwr.write_consumed, bwr.write_size);
+        unsafe {
+            call(
+                &self.file,
+                BINDER_WRITE_READ,
+                &mut bwr as *mut WriteRead as *mut libc::c_void,
+            )
+        }?;
+        ensure!(
+            bwr.write_consumed == bwr.write_size,
+            "the driver took {} of the {} bytes it was told",
+            bwr.write_consumed,
+            bwr.write_size
+        );
         waiting.words.clear();
         waiting.replies.clear();
         Ok(bwr.read_consumed as usize)
@@ -211,25 +340,117 @@ impl Binder {
 
     /// Answer a call the driver brought for an object served here: the
     /// reply, and the room the call lay in given back, wait to be told.
-    fn take_call(&self, td: &TransactionData, waiting: &mut Waiting) {
-        let data = match td.data_size {
-            0 => &[][..],
-            size => unsafe { std::slice::from_raw_parts(td.buffer as *const u8, size as usize) },
+    fn mapped(&self, pointer: u64, size: u64) -> Result<&[u8]> {
+        if size == 0 {
+            return Ok(&[]);
+        }
+        let offset = (pointer as usize)
+            .checked_sub(self.map as usize)
+            .context("Binder pointer below mapping")?;
+        ensure!(
+            offset <= MAP_BYTES && size <= (MAP_BYTES - offset) as u64,
+            "Binder buffer outside mapping"
+        );
+        Ok(unsafe { std::slice::from_raw_parts(pointer as *const u8, size as usize) })
+    }
+
+    fn received_fds(&self, td: &TransactionData, data: &[u8]) -> Result<ReceivedFds> {
+        let offsets = self.mapped(td.offsets, td.offsets_size)?;
+        ensure!(offsets.len().is_multiple_of(8), "invalid object offsets");
+        let object_at = |index: usize| -> Result<&[u8]> {
+            let raw = offsets
+                .get(index * 8..index * 8 + 8)
+                .context("invalid parent object")?;
+            let at = u64::from_ne_bytes(raw.try_into()?) as usize;
+            data.get(at..).context("object outside transaction")
         };
-        let answer = match &self.served {
-            Some(objects) => objects.answer(self, td.cookie, td.code, data),
-            None => Answer::Unknown,
+        let mut fds = ReceivedFds(Vec::new());
+        for index in 0..offsets.len() / 8 {
+            let raw = object_at(index)?;
+            let kind = u32::from_ne_bytes(raw.get(..4).context("short Binder object")?.try_into()?);
+            if kind == u32::from_be_bytes([b'f', b'd', b'*', 0x85]) {
+                fds.0.push(i32::from_ne_bytes(
+                    raw.get(8..12).context("short fd object")?.try_into()?,
+                ));
+            } else if kind == u32::from_be_bytes([b'f', b'd', b'a', 0x85]) {
+                let number = |at| -> Result<u64> {
+                    Ok(u64::from_ne_bytes(
+                        raw.get(at..at + 8).context("short fd array")?.try_into()?,
+                    ))
+                };
+                let count = number(8)?;
+                let parent = object_at(number(16)? as usize)?;
+                ensure!(
+                    parent.len() >= 40
+                        && parent[..4]
+                            == u32::from_be_bytes([b'p', b't', b'*', 0x85]).to_ne_bytes(),
+                    "invalid fd array parent"
+                );
+                let start = u64::from_ne_bytes(parent[8..16].try_into()?);
+                let length = u64::from_ne_bytes(parent[16..24].try_into()?);
+                let at = number(24)?;
+                let bytes = count.checked_mul(4).context("fd array overflow")?;
+                ensure!(
+                    at <= length && bytes <= length - at,
+                    "fd array outside parent"
+                );
+                for fd in self
+                    .mapped(
+                        start.checked_add(at).context("fd array pointer overflow")?,
+                        bytes,
+                    )?
+                    .as_chunks::<4>()
+                    .0
+                {
+                    fds.0.push(i32::from_ne_bytes(*fd));
+                }
+            }
+        }
+        Ok(fds)
+    }
+
+    fn take_call(&self, td: &TransactionData, waiting: &mut Waiting) -> Result<()> {
+        let data = self.mapped(td.buffer, td.data_size)?;
+        // Raw endpoints only borrow descriptors during this callback. Closing
+        // them before freeing the Binder buffer mirrors Parcel ownership.
+        let _fds = if self.raw.is_some() {
+            Some(self.received_fds(td, data)?)
+        } else {
+            None
+        };
+        let answer = if let Some(service) = &self.raw {
+            service.call(
+                self,
+                crate::raw::Call {
+                    object: td.cookie,
+                    code: td.code,
+                    flags: td.flags,
+                    pid: td.sender_pid,
+                    uid: td.sender_euid,
+                    data,
+                    mapping: (self.map as usize, MAP_BYTES),
+                },
+            )
+        } else {
+            match &self.served {
+                Some(objects) => match objects.answer(self, td.cookie, td.code, data) {
+                    Answer::Reply(reply) => crate::raw::Reply::Parcel(reply),
+                    Answer::Unknown => crate::raw::Reply::Status(UNKNOWN_TRANSACTION),
+                },
+                None => crate::raw::Reply::Status(UNKNOWN_TRANSACTION),
+            }
         };
         waiting.tell(BC_FREE_BUFFER, &td.buffer.to_ne_bytes());
         if td.flags & TF_ONE_WAY != 0 {
-            return;
+            return Ok(());
         }
-        let (reply, flags) = match answer {
-            Answer::Reply(reply) => (reply, 0),
-            Answer::Unknown => {
+        let (reply, flags): (Box<dyn Payload>, u32) = match answer {
+            crate::raw::Reply::Parcel(reply) => (Box::new(reply), 0),
+            crate::raw::Reply::Hidl(reply) => (Box::new(reply), 0),
+            crate::raw::Reply::Status(code) => {
                 let mut status = Parcel::default();
-                status.i32(UNKNOWN_TRANSACTION);
-                (status, TF_STATUS_CODE)
+                status.i32(code);
+                (Box::new(status), TF_STATUS_CODE)
             }
         };
         let back = TransactionData {
@@ -240,8 +461,16 @@ impl Binder {
             offsets: reply.addresses().as_ptr() as u64,
             ..TransactionData::default()
         };
-        waiting.tell(BC_REPLY, bytes_of(&back));
+        if reply.pointed() == 0 {
+            waiting.tell(BC_REPLY, bytes_of(&back));
+        } else {
+            waiting.tell(BC_REPLY_SG, bytes_of(&back));
+            waiting
+                .words
+                .extend_from_slice(&reply.pointed().to_ne_bytes());
+        }
         waiting.replies.push(reply);
+        Ok(())
     }
 
     /// What the driver said, taken in: the reply among it if it has come.
@@ -252,7 +481,13 @@ impl Binder {
     /// one, what the driver says of a reply that did not arrive is of a
     /// reply this thread gave, to a caller that has gone since: there is
     /// nobody left to tell.
-    fn take_in(&self, mut said: &[u8], waiting: &mut Waiting, calling: bool) -> Result<Option<Reply<'_>>> {
+    fn take_in(
+        &self,
+        mut said: &[u8],
+        waiting: &mut Waiting,
+        calling: bool,
+    ) -> Result<Option<Reply<'_>>> {
+        let mut reply = None;
         while said.len() >= 4 {
             let note = u32::from_ne_bytes(said[..4].try_into().expect("four bytes"));
             said = &said[4..];
@@ -265,9 +500,14 @@ impl Binder {
                 BR_ACQUIRE => waiting.tell(BC_ACQUIRE_DONE, part(&mut said, 16)?),
                 // No other program can call the object any more.
                 BR_RELEASE => {
-                    let cookie = u64::from_ne_bytes(part(&mut said, 16)?[8..].try_into().expect("eight bytes"));
+                    let cookie = u64::from_ne_bytes(
+                        part(&mut said, 16)?[8..].try_into().expect("eight bytes"),
+                    );
                     if let Some(objects) = &self.served {
                         objects.let_go(self, cookie);
+                    }
+                    if let Some(service) = &self.raw {
+                        service.release(self, cookie);
                     }
                 }
                 BR_DECREFS => {
@@ -275,32 +515,41 @@ impl Binder {
                 }
                 BR_TRANSACTION => {
                     let raw = part(&mut said, size_of::<TransactionData>())?;
-                    let td: TransactionData = unsafe { std::ptr::read_unaligned(raw.as_ptr().cast()) };
-                    self.take_call(&td, waiting);
+                    let td: TransactionData =
+                        unsafe { std::ptr::read_unaligned(raw.as_ptr().cast()) };
+                    self.take_call(&td, waiting)?;
                 }
                 BR_REPLY => {
                     let raw = part(&mut said, size_of::<TransactionData>())?;
-                    let td: TransactionData = unsafe { std::ptr::read_unaligned(raw.as_ptr().cast()) };
+                    let td: TransactionData =
+                        unsafe { std::ptr::read_unaligned(raw.as_ptr().cast()) };
                     if td.flags & TF_STATUS_CODE != 0 {
-                        let code = unsafe { std::ptr::read_unaligned(td.buffer as *const i32) };
+                        let code = i32::from_ne_bytes(self.mapped(td.buffer, 4)?.try_into()?);
                         self.free(td.buffer)?;
                         bail!("the call failed in the driver with error {code}");
                     }
-                    let data = unsafe { std::slice::from_raw_parts(td.buffer as *const u8, td.data_size as usize) };
-                    return Ok(Some(Reply { binder: self, buffer: td.buffer, data }));
+                    let data = self.mapped(td.buffer, td.data_size)?;
+                    ensure!(reply.is_none(), "multiple Binder replies in one read");
+                    reply = Some(Reply {
+                        binder: self,
+                        buffer: td.buffer,
+                        data,
+                    });
                 }
                 BR_DEAD_REPLY | BR_FAILED_REPLY | BR_FROZEN_REPLY if !calling => {}
                 BR_DEAD_REPLY => bail!("the other side is gone"),
                 BR_FAILED_REPLY => bail!("the driver refused the call"),
                 BR_FROZEN_REPLY => bail!("the other side is frozen"),
                 BR_ERROR => {
-                    let code = i32::from_ne_bytes(part(&mut said, 4)?.try_into().expect("four bytes"));
+                    let code =
+                        i32::from_ne_bytes(part(&mut said, 4)?.try_into().expect("four bytes"));
                     bail!("the driver reported error {code}");
                 }
                 other => bail!("the driver said {other:#x}, which Skyward does not know"),
             }
         }
-        Ok(None)
+        ensure!(said.is_empty(), "truncated Binder command");
+        Ok(reply)
     }
 
     /// Tell the driver something that needs no answer.
@@ -312,7 +561,14 @@ impl Binder {
             write_buffer: write.as_ptr() as u64,
             ..WriteRead::default()
         };
-        unsafe { call(&self.file, BINDER_WRITE_READ, &mut bwr as *mut WriteRead as *mut libc::c_void) }.context("tell the driver")
+        unsafe {
+            call(
+                &self.file,
+                BINDER_WRITE_READ,
+                &mut bwr as *mut WriteRead as *mut libc::c_void,
+            )
+        }
+        .context("tell the driver")
     }
 
     fn free(&self, buffer: u64) -> Result<()> {
@@ -328,7 +584,11 @@ impl Drop for Binder {
 
 /// The next `n` bytes of what the driver said, taken off its front.
 fn part<'a>(said: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
-    ensure!(said.len() >= n, "the driver cut what it said short: {} bytes where {n} follow", said.len());
+    ensure!(
+        said.len() >= n,
+        "the driver cut what it said short: {} bytes where {n} follow",
+        said.len()
+    );
     let (head, rest) = said.split_at(n);
     *said = rest;
     Ok(head)
@@ -360,12 +620,26 @@ impl<'a> Handle<'a> {
     /// Take a share of an object the driver has just named, so it outlives
     /// the reply that carried it.
     pub fn hold(binder: &'a Binder, handle: u32) -> Result<Handle<'a>> {
-        binder.tell(BC_ACQUIRE, &handle.to_ne_bytes()).context("hold an object open")?;
-        Ok(Handle { binder, handle, held: true })
+        binder
+            .tell(BC_ACQUIRE, &handle.to_ne_bytes())
+            .context("hold an object open")?;
+        Ok(Handle {
+            binder,
+            handle,
+            held: true,
+        })
     }
 
     pub fn transact(&self, code: u32, data: &impl Payload) -> Result<Reply<'a>> {
         self.binder.transact(self.handle, code, data)
+    }
+
+    pub fn oneway(&self, code: u32, data: &impl Payload) -> Result<()> {
+        self.binder.oneway(self.handle, code, data)
+    }
+
+    pub fn same_object(&self, other: &Self) -> bool {
+        std::ptr::eq(self.binder, other.binder) && self.handle == other.handle
     }
 }
 

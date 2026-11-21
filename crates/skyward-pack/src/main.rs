@@ -1,4 +1,4 @@
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use sha2::{Digest, Sha256};
 use skyward_config::ramdisk as paths;
@@ -8,11 +8,11 @@ use std::path::{Path, PathBuf};
 
 mod avb;
 use skyward_bootimg as ramdisk;
+mod described;
 mod venus_first_stage;
 mod venus_probe;
-mod venus_ui;
 mod venus_recovery;
-mod described;
+mod venus_ui;
 
 use skyward_bootimg::{BootImage, Ramdisk};
 
@@ -149,7 +149,9 @@ fn main() -> Result<()> {
         Cmd::List { image } => list(&image),
         Cmd::Cat { image, path } => {
             let rd = Ramdisk::decode(&BootImage::read(&image)?.ramdisk)?;
-            let e = rd.find(&path).with_context(|| format!("{path} is not in the ramdisk"))?;
+            let e = rd
+                .find(&path)
+                .with_context(|| format!("{path} is not in the ramdisk"))?;
             std::io::stdout().write_all(&e.data)?;
             Ok(())
         }
@@ -160,74 +162,155 @@ fn main() -> Result<()> {
         }
         Cmd::CapsuleVerify { image, normal } => {
             let bytes = std::fs::read(&image)?;
-            ensure!(bytes.len() == skyward_bootimg::capsule::PARTITION_SIZE, "wrong capsule carrier size");
-            let rd = Ramdisk::decode_bounded(&BootImage::parse(&bytes)?.ramdisk, 512 * 1024 * 1024, 8192)?;
-            let get = |name: &str| rd.find(name).with_context(|| format!("missing capsule input {name}"));
+            ensure!(
+                bytes.len() == skyward_bootimg::capsule::PARTITION_SIZE,
+                "wrong capsule carrier size"
+            );
+            let rd = Ramdisk::decode_bounded(
+                &BootImage::parse(&bytes)?.ramdisk,
+                512 * 1024 * 1024,
+                8192,
+            )?;
+            let get = |name: &str| {
+                rd.find(name)
+                    .with_context(|| format!("missing capsule input {name}"))
+            };
             let rebuilt = skyward_bootimg::capsule::rebuild(
                 &get(skyward_bootimg::capsule::TEMPLATE_PATH)?.data,
                 &get(skyward_bootimg::capsule::MANIFEST_PATH)?.data,
-                &get(paths::RECOVERY)?.data, |p| Ok(get(&p.path)?.data.clone()))?;
-            ensure!(rebuilt == std::fs::read(&normal)?, "RAM capsule does not reconstruct the complete normal image byte-for-byte");
-            println!("PASS capsule_normal_byte_identity size={} sha256={}", rebuilt.len(), skyward_bootimg::capsule::sha256(&rebuilt));
+                &get(paths::RECOVERY)?.data,
+                |p| Ok(get(&p.path)?.data.clone()),
+            )?;
+            ensure!(
+                rebuilt == std::fs::read(&normal)?,
+                "RAM capsule does not reconstruct the complete normal image byte-for-byte"
+            );
+            println!(
+                "PASS capsule_normal_byte_identity size={} sha256={}",
+                rebuilt.len(),
+                skyward_bootimg::capsule::sha256(&rebuilt)
+            );
             Ok(())
         }
-        Cmd::Boot { kernel, ramdisk, out } => {
+        Cmd::Boot {
+            kernel,
+            ramdisk,
+            out,
+        } => {
             let mut img = BootImage::read(&ramdisk)?;
             img.kernel = BootImage::read(&kernel)?.kernel;
             write(&out, &img, &img.to_bytes()?)
         }
-        Cmd::Recovery { stock, partition, binary, system_init, config, font, mono, mono_license, out, venus_probe, venus_force_recovery, venus_ui, venus_basic, venus_recovery_assets, venus_normal_entry, venus_install_capsule, standalone } => {
+        Cmd::Recovery {
+            stock,
+            partition,
+            binary,
+            system_init,
+            config,
+            font,
+            mono,
+            mono_license,
+            out,
+            venus_probe,
+            venus_force_recovery,
+            venus_ui,
+            venus_basic,
+            venus_recovery_assets,
+            venus_normal_entry,
+            venus_install_capsule,
+            standalone,
+        } => {
             if venus_probe {
-                ensure!(partition == "boot", "--venus-probe requires --partition boot");
-                ensure!(skyward_config::DeviceConfig::load(&config)?.device.codename == "venus",
-                        "--venus-probe is only for venus");
+                ensure!(
+                    partition == "boot",
+                    "--venus-probe requires --partition boot"
+                );
+                ensure!(
+                    skyward_config::DeviceConfig::load(&config)?.device.codename == "venus",
+                    "--venus-probe is only for venus"
+                );
             }
             if venus_force_recovery {
-                ensure!(partition == "boot" && standalone,
-                        "--venus-force-recovery requires --partition boot --standalone");
-                ensure!(skyward_config::DeviceConfig::load(&config)?.device.codename == "venus",
-                        "--venus-force-recovery is only for venus");
-                ensure!(venus_recovery_assets.is_none(),
-                        "--venus-force-recovery uses the stock recovery service, not integrated runtime assets");
+                ensure!(
+                    partition == "boot" && standalone,
+                    "--venus-force-recovery requires --partition boot --standalone"
+                );
+                ensure!(
+                    skyward_config::DeviceConfig::load(&config)?.device.codename == "venus",
+                    "--venus-force-recovery is only for venus"
+                );
+                ensure!(
+                    venus_recovery_assets.is_none(),
+                    "--venus-force-recovery uses the stock recovery service, not integrated runtime assets"
+                );
             }
             if venus_ui {
                 let display = skyward_config::DeviceConfig::load(&config)?.display;
                 ensure!(venus_probe, "--venus-ui requires --venus-probe");
-                ensure!((display.width, display.height) == (1440, 3200)
+                ensure!(
+                    (display.width, display.height) == (1440, 3200)
                         && (160..=800).contains(&display.density),
-                        "venus UI requires observed 1440x3200 geometry and a valid density");
+                    "venus UI requires observed 1440x3200 geometry and a valid density"
+                );
             }
             ensure!(
                 matches!(partition.as_str(), "recovery" | "boot"),
                 "target partition must be recovery or boot, not {partition}"
             );
             ensure!(
-                !standalone || (partition == "boot"
-                    && !venus_normal_entry
-                    && ((venus_probe && venus_recovery_assets.is_some())
-                        || venus_force_recovery)),
+                !standalone
+                    || (partition == "boot"
+                        && !venus_normal_entry
+                        && ((venus_probe && venus_recovery_assets.is_some())
+                            || venus_force_recovery)),
                 "standalone REC requires either integrated Venus assets with --venus-probe or the stock-service path with --venus-force-recovery"
             );
             let size = partition_size(&stock)?;
             let mut img = BootImage::read(&stock)?;
-            ensure!(partition != "boot" || !img.kernel.is_empty(),
-                    "--partition boot requires a kernel");
+            ensure!(
+                partition != "boot" || !img.kernel.is_empty(),
+                "--partition boot requires a kernel"
+            );
             let mut rd = Ramdisk::decode(&img.ramdisk)?;
             let native_init = if venus_recovery_assets.is_some() {
-                rd.find("system/bin/init").context("original first-stage init missing")?.data.clone()
-            } else { Vec::new() };
+                rd.find("system/bin/init")
+                    .context("original first-stage init missing")?
+                    .data
+                    .clone()
+            } else {
+                Vec::new()
+            };
+            let native_wait_for_keymaster = if venus_recovery_assets.is_some() {
+                rd.find("system/etc/init/wait_for_keymaster.rc")
+                    .context("original wait_for_keymaster rc missing")?
+                    .data
+                    .clone()
+            } else {
+                Vec::new()
+            };
             // A stock recovery ramdisk has no third-party tree; refuse to build
             // on top of another custom recovery.
-            if let Some(e) = rd.entries.iter().find(|e| e.name == "FFiles" || e.name.starts_with("twres")) {
-                anyhow::bail!("{} holds {}, which is not a stock recovery", stock.display(), e.name);
+            if let Some(e) = rd
+                .entries
+                .iter()
+                .find(|e| e.name == "FFiles" || e.name.starts_with("twres"))
+            {
+                anyhow::bail!(
+                    "{} holds {}, which is not a stock recovery",
+                    stock.display(),
+                    e.name
+                );
             }
-            let read = |p: &PathBuf| std::fs::read(p).with_context(|| format!("read {}", p.display()));
+            let read =
+                |p: &PathBuf| std::fs::read(p).with_context(|| format!("read {}", p.display()));
             skyward_config::DeviceConfig::load(&config)?;
             rd.replace(paths::RECOVERY, read(&binary)?)?;
             // Install scripts look for the commands a stock recovery lacks
             // among its programs, and its unzip there too, a link to ziptool
             // until it points here; the recovery binary is each of them.
-            let (_, recovery) = paths::RECOVERY.rsplit_once('/').expect("the recovery binary is in a folder");
+            let (_, recovery) = paths::RECOVERY
+                .rsplit_once('/')
+                .expect("the recovery binary is in a folder");
             for command in paths::COMMANDS {
                 rd.link(command, recovery)?;
             }
@@ -242,18 +325,30 @@ fn main() -> Result<()> {
                 rd.add(paths::TASK_PROFILES, 0o644, TASK_PROFILES.to_vec())?;
             }
             if venus_probe {
-                ensure!(img.header.header_version() == 3, "venus probe requires boot header v3");
+                ensure!(
+                    img.header.header_version() == 3,
+                    "venus probe requires boot header v3"
+                );
                 venus_probe::prepare(&mut rd)?;
                 if venus_ui {
                     venus_ui::prepare(&mut rd)?;
-                    if venus_basic { venus_ui::enable_basic(&mut rd)?; }
+                    if venus_basic {
+                        venus_ui::enable_basic(&mut rd)?;
+                    }
                 }
             } else {
                 rd.add(paths::MTP_RC, 0o644, MTP_RC.to_vec())?;
             }
             if venus_force_recovery {
-                ensure!(img.header.header_version() == 3, "standalone venus REC requires boot header v3");
-                let original_init = rd.find("system/bin/init").context("missing first-stage init")?.data.clone();
+                ensure!(
+                    img.header.header_version() == 3,
+                    "standalone venus REC requires boot header v3"
+                );
+                let original_init = rd
+                    .find("system/bin/init")
+                    .context("missing first-stage init")?
+                    .data
+                    .clone();
                 let patched_init = venus_first_stage::patch(&original_init)?;
                 rd.replace("system/bin/init", patched_init)?;
                 rd.add(
@@ -265,7 +360,9 @@ fn main() -> Result<()> {
                         venus_first_stage::PATCHED_SHA256,
                     ).into_bytes(),
                 )?;
-                eprintln!("TEMPORARY standalone Skyward REC: stock kernel and recovery init service retained; do not flash.");
+                eprintln!(
+                    "TEMPORARY standalone Skyward REC: stock kernel and recovery init service retained; do not flash."
+                );
             }
             if let Some(assets) = &venus_recovery_assets {
                 venus_recovery::prepare(&mut rd, assets, venus_normal_entry, &native_init)?;
@@ -281,23 +378,63 @@ fn main() -> Result<()> {
                 .with_context(|| format!("{} is not in the ramdisk", paths::PROP_DEFAULT))?
                 .data;
             let mut props = without(stock_props, &BUILD_VERSION);
-            props.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n");
+            props.extend_from_slice(
+                b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n",
+            );
             rd.replace(paths::PROP_DEFAULT, props)?;
             if venus_install_capsule {
-                ensure!(venus_recovery_assets.is_some() && partition == "boot" && size == skyward_bootimg::capsule::PARTITION_SIZE,
-                    "Venus capsule requires the complete integrated boot partition");
+                ensure!(
+                    venus_recovery_assets.is_some()
+                        && partition == "boot"
+                        && size == skyward_bootimg::capsule::PARTITION_SIZE,
+                    "Venus capsule requires the complete integrated boot partition"
+                );
                 // The temporary carrier differs only in its init entry and entry marker.
                 // Build the capsule from the normal counterpart, then restore this carrier.
-                let selected_init = rd.find("system/bin/init").context("first-stage init missing")?.data.clone();
-                let selected_marker = rd.find("skyward/venus-recovery.txt").context("Recovery marker missing")?.data.clone();
-                let marker = std::str::from_utf8(&selected_marker)?.replace(
-                    "entry=temporary_forced_recovery\n", "entry=original_init\n");
+                let selected_init = rd
+                    .find("system/bin/init")
+                    .context("first-stage init missing")?
+                    .data
+                    .clone();
+                let selected_marker = rd
+                    .find("skyward/venus-recovery.txt")
+                    .context("Recovery marker missing")?
+                    .data
+                    .clone();
+                // Preserve the active temporary boot-only runtime action,
+                // but generate the install capsule from exactly the normal
+                // Android-entry configuration. Never install an image that
+                // accidentally disables stock Keymaster wait services.
+                let init_rc_path = "system/etc/init/hw/init.rc";
+                let wait_rc_path = "system/etc/init/wait_for_keymaster.rc";
+                let temporary_init_rc = rd
+                    .find(init_rc_path)
+                    .context("Recovery init rc missing")?
+                    .data
+                    .clone();
+                let temporary_wait_rc = rd
+                    .find(wait_rc_path)
+                    .context("Recovery wait rc missing")?
+                    .data
+                    .clone();
+                if !venus_normal_entry {
+                    venus_recovery::restore_normal_init_for_capsule(
+                        &mut rd,
+                        &native_wait_for_keymaster,
+                    )?;
+                }
+                let marker = std::str::from_utf8(&selected_marker)?
+                    .replace("entry=temporary_forced_recovery\n", "entry=original_init\n");
                 rd.replace("system/bin/init", native_init.clone())?;
                 rd.replace("skyward/venus-recovery.txt", marker.into_bytes())?;
                 img.ramdisk = rd.encode()?;
                 let capsule = skyward_bootimg::capsule::create(&img)?;
                 rd.replace("system/bin/init", selected_init)?;
                 rd.replace("skyward/venus-recovery.txt", selected_marker)?;
+                // Restore the temporary running ramdisk after the capsule
+                // was derived from its normal-entry counterpart.
+                rd.replace(init_rc_path, temporary_init_rc)?;
+                rd.replace(wait_rc_path, temporary_wait_rc)?;
                 skyward_bootimg::capsule::attach(&mut rd, &capsule)?;
             }
             img.ramdisk = rd.encode()?;
@@ -305,20 +442,41 @@ fn main() -> Result<()> {
             if standalone {
                 write(&out, &img, &bytes)
             } else {
-                write(&out, &img, &avb::footed(&bytes, &partition, size, &Sha256::digest(&bytes))?)
+                write(
+                    &out,
+                    &img,
+                    &avb::footed(&bytes, &partition, size, &Sha256::digest(&bytes))?,
+                )
             }
         }
         Cmd::Stock { config, out } => {
-            let stock = skyward_config::DeviceConfig::load(&config)?.stock.with_context(|| format!("{} names no stock build", config.display()))?;
-            println!("version={}\npackage={}\nrecovery={}", stock.version, stock.package, stock.recovery);
+            let stock = skyward_config::DeviceConfig::load(&config)?
+                .stock
+                .with_context(|| format!("{} names no stock build", config.display()))?;
+            println!(
+                "version={}\npackage={}\nrecovery={}",
+                stock.version, stock.package, stock.recovery
+            );
             match out {
                 Some(out) => take_stock_recovery(&stock, &out),
                 None => Ok(()),
             }
         }
-        Cmd::Described { config, partitions, out } => {
-            let stock = skyward_config::DeviceConfig::load(&config)?.stock.with_context(|| format!("{} names no stock build", config.display()))?;
-            let partitions = if partitions.is_empty() { skyward_programs::phone::PARTITIONS.map(str::to_string).to_vec() } else { partitions };
+        Cmd::Described {
+            config,
+            partitions,
+            out,
+        } => {
+            let stock = skyward_config::DeviceConfig::load(&config)?
+                .stock
+                .with_context(|| format!("{} names no stock build", config.display()))?;
+            let partitions = if partitions.is_empty() {
+                skyward_programs::phone::PARTITIONS
+                    .map(str::to_string)
+                    .to_vec()
+            } else {
+                partitions
+            };
             described::take(&stock.package, &partitions, &out)
         }
     }
@@ -331,27 +489,60 @@ const RECOVERY: &str = "recovery";
 /// on its server, reading only what that partition takes of it, and write it
 /// to `out` once its SHA-256 is the one the configuration names.
 fn take_stock_recovery(stock: &skyward_config::Stock, out: &Path) -> Result<()> {
-    let parent = out.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let parent = out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent).with_context(|| format!("make {}", parent.display()))?;
     // Taken out beside where it goes, so it is moved there whole.
-    let work = tempfile::Builder::new().prefix(".stock").tempdir_in(parent).with_context(|| format!("make a folder in {}", parent.display()))?;
-    let payload = unpayload::Payload::open_url(&stock.package).with_context(|| format!("open {}", stock.package))?;
-    let options = unpayload::ExtractOptions { output_dir: work.path().to_path_buf(), partitions: vec![RECOVERY.into()], ..Default::default() };
+    let work = tempfile::Builder::new()
+        .prefix(".stock")
+        .tempdir_in(parent)
+        .with_context(|| format!("make a folder in {}", parent.display()))?;
+    let payload = unpayload::Payload::open_url(&stock.package)
+        .with_context(|| format!("open {}", stock.package))?;
+    let options = unpayload::ExtractOptions {
+        output_dir: work.path().to_path_buf(),
+        partitions: vec![RECOVERY.into()],
+        ..Default::default()
+    };
     let report = |event: unpayload::Event<'_>| match event {
         unpayload::Event::Started { partitions } => {
             for (name, bytes) in partitions {
                 println!("taking {name} out of the package: {bytes} bytes");
             }
         }
-        unpayload::Event::Extracted(image) => println!("took {} out: {} bytes", image.partition, image.size),
+        unpayload::Event::Extracted(image) => {
+            println!("took {} out: {} bytes", image.partition, image.size)
+        }
         unpayload::Event::Progress { .. } => {}
     };
-    let taken = payload.extract(&options, &report).with_context(|| format!("take {RECOVERY} out of {}", stock.package))?;
-    let image = taken.iter().find(|i| i.partition == RECOVERY).with_context(|| format!("{} holds no {RECOVERY} partition", stock.package))?;
-    let sum = hex::encode(image.sha256.as_deref().context("the package's own sum of the image was not checked")?);
-    ensure!(sum == stock.recovery, "the {RECOVERY} partition in {} has the SHA-256 {sum}, where the configuration names {}", stock.package, stock.recovery);
-    std::fs::rename(&image.path, out).with_context(|| format!("move {} to {}", image.path.display(), out.display()))?;
-    println!("wrote {} ({} bytes), its SHA-256 the one the configuration names", out.display(), image.size);
+    let taken = payload
+        .extract(&options, &report)
+        .with_context(|| format!("take {RECOVERY} out of {}", stock.package))?;
+    let image = taken
+        .iter()
+        .find(|i| i.partition == RECOVERY)
+        .with_context(|| format!("{} holds no {RECOVERY} partition", stock.package))?;
+    let sum = hex::encode(
+        image
+            .sha256
+            .as_deref()
+            .context("the package's own sum of the image was not checked")?,
+    );
+    ensure!(
+        sum == stock.recovery,
+        "the {RECOVERY} partition in {} has the SHA-256 {sum}, where the configuration names {}",
+        stock.package,
+        stock.recovery
+    );
+    std::fs::rename(&image.path, out)
+        .with_context(|| format!("move {} to {}", image.path.display(), out.display()))?;
+    println!(
+        "wrote {} ({} bytes), its SHA-256 the one the configuration names",
+        out.display(),
+        image.size
+    );
     Ok(())
 }
 
@@ -359,11 +550,16 @@ fn take_stock_recovery(stock: &skyward_config::Stock, out: &Path) -> Result<()> 
 /// full update package hold it, which its AVB footer ends.
 fn partition_size(stock: &Path) -> Result<usize> {
     let mut file = File::open(stock).with_context(|| format!("open {}", stock.display()))?;
-    let size = file.metadata().with_context(|| format!("stat {}", stock.display()))?.len();
+    let size = file
+        .metadata()
+        .with_context(|| format!("stat {}", stock.display()))?
+        .len();
     let mut magic = [0u8; 4];
     if size >= 64 {
-        file.seek(SeekFrom::Start(size - 64)).with_context(|| format!("seek in {}", stock.display()))?;
-        file.read_exact(&mut magic).with_context(|| format!("read {}", stock.display()))?;
+        file.seek(SeekFrom::Start(size - 64))
+            .with_context(|| format!("seek in {}", stock.display()))?;
+        file.read_exact(&mut magic)
+            .with_context(|| format!("read {}", stock.display()))?;
     }
     ensure!(
         &magic == b"AVBf",
@@ -380,7 +576,11 @@ fn partition_size(stock: &Path) -> Result<usize> {
 /// build is running, and keys the installed system made are refused when
 /// they say the wrong one, so they are left out here for the recovery to
 /// fill in from the installed system once it has that mounted.
-const BUILD_VERSION: [&str; 3] = ["ro.build.version.release", "ro.build.version.security_patch", "ro.vendor.build.security_patch"];
+const BUILD_VERSION: [&str; 3] = [
+    "ro.build.version.release",
+    "ro.build.version.security_patch",
+    "ro.vendor.build.security_patch",
+];
 
 /// The scheduling profiles a recovery's programs look up by name. A
 /// recovery's cgroup setup mounts no controllers, so of all a system's
@@ -431,7 +631,14 @@ fn list(image: &Path) -> Result<()> {
     }
     let rd = Ramdisk::decode(&img.ramdisk)?;
     for e in &rd.entries {
-        println!("{:06o} {:>5}:{:<5} {:>10}  {}", e.mode, e.uid, e.gid, e.data.len(), e.name);
+        println!(
+            "{:06o} {:>5}:{:<5} {:>10}  {}",
+            e.mode,
+            e.uid,
+            e.gid,
+            e.data.len(),
+            e.name
+        );
     }
     println!("{} entries", rd.entries.len());
     Ok(())
@@ -443,18 +650,58 @@ mod tests {
 
     #[test]
     fn basic_features_require_ui_and_probe() {
-        let args = ["skyward-pack", "recovery", "--stock", "stock", "--binary", "binary", "--system-init", "system-init", "--config", "config", "--font", "font", "--mono", "mono", "--mono-license", "license", "--out", "out", "--venus-basic"];
+        let args = [
+            "skyward-pack",
+            "recovery",
+            "--stock",
+            "stock",
+            "--binary",
+            "binary",
+            "--system-init",
+            "system-init",
+            "--config",
+            "config",
+            "--font",
+            "font",
+            "--mono",
+            "mono",
+            "--mono-license",
+            "license",
+            "--out",
+            "out",
+            "--venus-basic",
+        ];
         assert!(Cli::try_parse_from(args).is_err());
-        let mut args = args.to_vec(); args.extend(["--venus-ui", "--venus-probe"]);
+        let mut args = args.to_vec();
+        args.extend(["--venus-ui", "--venus-probe"]);
         assert!(Cli::try_parse_from(args).is_ok());
     }
 
-
     #[test]
     fn ui_autostart_requires_an_explicit_probe_flag() {
-        let mut args = vec!["skyward-pack", "recovery", "--stock", "boot.img", "--binary", "skyward", "--system-init", "system-init",
-            "--config", "venus.toml", "--font", "font", "--mono", "mono", "--mono-license", "license",
-            "--out", "new.img", "--partition", "boot", "--venus-ui"];
+        let mut args = vec![
+            "skyward-pack",
+            "recovery",
+            "--stock",
+            "boot.img",
+            "--binary",
+            "skyward",
+            "--system-init",
+            "system-init",
+            "--config",
+            "venus.toml",
+            "--font",
+            "font",
+            "--mono",
+            "mono",
+            "--mono-license",
+            "license",
+            "--out",
+            "new.img",
+            "--partition",
+            "boot",
+            "--venus-ui",
+        ];
         assert!(Cli::try_parse_from(&args).is_err());
         args.push("--venus-probe");
         assert!(Cli::try_parse_from(&args).is_ok());
@@ -462,12 +709,39 @@ mod tests {
 
     #[test]
     fn ui_autostart_is_off_by_default() {
-        let cli = Cli::try_parse_from(["skyward-pack", "recovery", "--stock", "boot.img", "--binary", "skyward", "--system-init", "system-init",
-            "--config", "venus.toml", "--font", "font", "--mono", "mono", "--mono-license", "license",
-            "--out", "new.img", "--partition", "boot", "--venus-probe"]).unwrap();
-        assert!(matches!(cli.cmd, Cmd::Recovery { venus_probe: true, venus_ui: false, .. }));
+        let cli = Cli::try_parse_from([
+            "skyward-pack",
+            "recovery",
+            "--stock",
+            "boot.img",
+            "--binary",
+            "skyward",
+            "--system-init",
+            "system-init",
+            "--config",
+            "venus.toml",
+            "--font",
+            "font",
+            "--mono",
+            "mono",
+            "--mono-license",
+            "license",
+            "--out",
+            "new.img",
+            "--partition",
+            "boot",
+            "--venus-probe",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Recovery {
+                venus_probe: true,
+                venus_ui: false,
+                ..
+            }
+        ));
     }
-
 
     #[test]
     fn the_lines_that_set_a_name_are_the_only_ones_left_out() {
@@ -476,17 +750,32 @@ ro.vendor.build.security_patch=2026-10-01\nro.vendor.build.security_patch_level=
         let out = without(props, &BUILD_VERSION);
         let text = String::from_utf8(out).expect("property files are text");
         assert!(!text.contains("ro.build.version.release=13"));
-        assert!(!text.contains("ro.vendor.build.security_patch=2026-10-01"), "the vendor partition's patch level is left out too");
-        assert!(text.contains("ro.build.version.release_or_codename=13"), "a longer name is left alone");
-        assert!(text.contains("ro.vendor.build.security_patch_level=1"), "a longer name is left alone");
+        assert!(
+            !text.contains("ro.vendor.build.security_patch=2026-10-01"),
+            "the vendor partition's patch level is left out too"
+        );
+        assert!(
+            text.contains("ro.build.version.release_or_codename=13"),
+            "a longer name is left alone"
+        );
+        assert!(
+            text.contains("ro.vendor.build.security_patch_level=1"),
+            "a longer name is left alone"
+        );
         assert!(text.contains("ro.build.id=TQ") && text.contains("ro.product.name=ishtar"));
     }
 
     #[test]
     fn the_profiles_name_all_the_recovery_asks_for() {
-        let profiles: serde_json::Value = serde_json::from_slice(TASK_PROFILES).expect("the profiles are JSON");
+        let profiles: serde_json::Value =
+            serde_json::from_slice(TASK_PROFILES).expect("the profiles are JSON");
         let names = |key: &str| -> Vec<String> {
-            profiles[key].as_array().expect("a list").iter().map(|p| p["Name"].as_str().expect("a name").to_string()).collect()
+            profiles[key]
+                .as_array()
+                .expect("a list")
+                .iter()
+                .map(|p| p["Name"].as_str().expect("a name").to_string())
+                .collect()
         };
         let (plain, aggregate) = (names("Profiles"), names("AggregateProfiles"));
         // What libprocessgroup asks for when a program sets its scheduling
@@ -509,12 +798,19 @@ ro.vendor.build.security_patch=2026-10-01\nro.vendor.build.security_patch_level=
             "ServiceCapacityLow",
         ];
         for name in asked {
-            assert!(plain.iter().chain(&aggregate).any(|n| n == name), "{name} is missing");
+            assert!(
+                plain.iter().chain(&aggregate).any(|n| n == name),
+                "{name} is missing"
+            );
         }
         for a in profiles["AggregateProfiles"].as_array().expect("a list") {
             for part in a["Profiles"].as_array().expect("a list") {
                 let part = part.as_str().expect("a name");
-                assert!(plain.iter().any(|n| n == part), "{} is made of {part}, which is not a profile", a["Name"]);
+                assert!(
+                    plain.iter().any(|n| n == part),
+                    "{} is made of {part}, which is not a profile",
+                    a["Name"]
+                );
             }
         }
     }
@@ -528,9 +824,15 @@ ro.vendor.build.security_patch=2026-10-01\nro.vendor.build.security_patch_level=
         std::fs::write(&path, &whole).unwrap();
         assert_eq!(partition_size(&path).unwrap(), 8192);
         std::fs::write(&path, &whole[..8000]).unwrap();
-        assert!(partition_size(&path).is_err(), "an image cut short of its partition's end");
+        assert!(
+            partition_size(&path).is_err(),
+            "an image cut short of its partition's end"
+        );
         std::fs::write(&path, b"AVBf").unwrap();
-        assert!(partition_size(&path).is_err(), "too short to end in a footer");
+        assert!(
+            partition_size(&path).is_err(),
+            "too short to end in a footer"
+        );
     }
 
     #[test]

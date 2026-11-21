@@ -1,7 +1,8 @@
 # Isolated parameter-probe launcher
 
-`probe-launch.c` is a standalone diagnostic, outside the production image and
-`km41-launch`. It never starts a HAL, network role, DRM owner or Binder service.
+`display-probe-launch` is a standalone **Rust** diagnostic entry implemented in
+`crates/skyward-venus-runtime/src/display/root.rs`, outside the production
+display service and `km41-launch`. It never starts a HAL, network role, DRM owner or Binder service.
 It creates a private mount namespace and a small read-only tmpfs root, then
 executes the existing guarded probe with its arguments unchanged. The probe's
 35 vendor hashes and no-ioctl seccomp filter remain mandatory.
@@ -9,14 +10,16 @@ executes the existing guarded probe with its arguments unchanged. The probe's
 Build with:
 
 ```sh
-sh porting/venus/display/build-launch.sh /tmp/display-probe-launch
+bash porting/venus/display/build-launch.sh /tmp/display-probe-launch
 ```
 
-The static ARM64 output embeds the exact current `boot-ld.config.txt`; its
-adjacent build JSON records both source and configuration SHA256. The probe
+The static ARM64 Rust executable embeds the exact current `boot-ld.config.txt`;
+its adjacent build JSON records the Rust source and configuration SHA256.
+Preserve the executable basename `display-probe-launch` when deploying: the
+Rust dispatcher selects its role from that name. The probe
 executes as `/skyward/runtime/display-probe`, selecting the vendor section.
-The SHA256 subprocess executes `/system/bin/toybox`, selecting the separate
-platform section. No flat `LD_LIBRARY_PATH` or preloaded C++ library is used.
+The Rust probe verifies the pinned 35 vendor assets directly using SHA-256,
+without a helper shell or subprocess. No vendor mode is accepted on mismatch. No flat `LD_LIBRARY_PATH` or preloaded C++ library is used.
 
 Required source mounts must already exist. The launcher does not mount block
 devices or replay any journal:
@@ -26,8 +29,8 @@ devices or replay any journal:
 | `/mnt/skyward-ro/vendor` | `/vendor` | Full original vendor, already read-only |
 | `/mnt/skyward-ro/system/system` | `/system` | Full matching installed system, already read-only; includes toybox |
 | `/mnt/skyward-ro/system_ext` | `/system_ext` | Matching installed system_ext, already read-only |
-| `/tmp/venus-runtime` | `/apex/com.android.runtime` | Matching runtime; bind remounted read-only |
-| `/tmp/venus-vndk30` | `/apex/com.android.vndk.v30` | Matching VNDK30; bind remounted read-only |
+| `/skyward/run/hal/apex-runtime` | `/apex/com.android.runtime` | Matching runtime; bind remounted read-only |
+| `/skyward/run/hal/apex-vndk30` | `/apex/com.android.vndk.v30` | Matching VNDK30; bind remounted read-only |
 | `/dev/__properties__` | same | Property reads only |
 | `/dev/vndbinder` | same | Real character inode, directly or via the fixed `/dev/binderfs/vndbinder` symlink; separate read-only, nosuid, noexec bind, with nodev cleared only here |
 | Explicit DF_Param file | `/data/vendor/display/DF_Param.xml` | Only this file is exposed from Data; read-only bind |
@@ -58,7 +61,7 @@ mkdir -p /tmp/venus-display-test
 chmod 700 /tmp/venus-display-test
 # Root deploys the two verified ELF files here before the following command.
 /system/bin/toybox timeout -s KILL 40 \
-  /tmp/venus-display-test/probe-launch \
+  /tmp/venus-display-test/display-probe-launch \
   /tmp/venus-display-test/display-probe \
   /data/vendor/display/DF_Param.xml \
   --uncalibrated --list \
@@ -83,7 +86,7 @@ the existing outer deadline. For example, with its real path assigned to
 /system/bin/toybox timeout -s KILL 40 "$STRACE" -f -tt -s 160 \
   -e trace=execve,openat,ioctl,mmap,munmap,prctl,clone,write,close \
   -o /tmp/venus-display-test/list.trace \
-  /tmp/venus-display-test/probe-launch \
+  /tmp/venus-display-test/display-probe-launch \
   /tmp/venus-display-test/display-probe \
   /data/vendor/display/DF_Param.xml --uncalibrated --list \
   >/tmp/venus-display-test/list.json 2>/tmp/venus-display-test/list.stderr
@@ -91,7 +94,7 @@ the existing outer deadline. For example, with its real path assigned to
 
 Inspect the actual sequence, not just the exit status:
 
-1. The fixed toybox child verifies all 35 hashes and exits before
+1. Rust verifies all 35 pinned vendor hashes before
    `BINDER_INIT_BEGIN`.
 2. Between `BINDER_INIT_BEGIN` and `BINDER_INIT_DONE`, the probe opens
    `/dev/vndbinder`, obtains the real protocol version, sets the maximum

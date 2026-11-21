@@ -67,8 +67,9 @@ impl Decryptor {
 /// why it failed in words for the page.
 pub fn with_key_service<T>(work: impl FnOnce(&KeyMint) -> Result<T>) -> Result<T, String> {
     let done = (|| {
-        let binder = if crate::venus_rw::enabled() { Binder::hardware()? } else { Binder::open()? };
-        let service = if crate::venus_rw::enabled() { KeyMint::open_hidl(&binder, false)? } else { KeyMint::open(&binder)? };
+        anyhow::ensure!(!crate::venus_rw::enabled(), "Venus Data operations must use the unified recovery lifecycle");
+        let binder = Binder::open()?;
+        let service = KeyMint::open(&binder)?;
         work(&service)
     })();
     done.map_err(|e| format!("{e:#}"))

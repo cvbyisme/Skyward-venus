@@ -64,6 +64,56 @@ impl Message {
         self.data.extend_from_slice(&v.to_le_bytes());
     }
 
+    pub fn ok() -> Self {
+        let mut reply = Self::default();
+        reply.u32(0);
+        reply
+    }
+
+    pub fn exception(code: i32, message: &str) -> Self {
+        let mut reply = Self::default();
+        reply.u32(code as u32);
+        let units: Vec<u16> = message.encode_utf16().collect();
+        reply.u32(units.len() as u32);
+        for unit in units { reply.data.extend_from_slice(&unit.to_le_bytes()); }
+        reply.data.extend_from_slice(&[0, 0]);
+        while !reply.data.len().is_multiple_of(4) { reply.data.push(0); }
+        reply
+    }
+
+    /// Local hardware Binder object, without the AIDL stability word.
+    pub fn local(&mut self, number: u64) {
+        self.addresses.push(self.data.len() as u64);
+        self.u32(u32::from_be_bytes([b's', b'b', b'*', 0x85]));
+        self.u32(0x100 | 0x7f); // ACCEPTS_FDS, default priority
+        self.u64(number);
+        self.u64(number);
+    }
+
+    pub fn strings(&mut self, values: &[&str]) -> Result<()> {
+        let mut frame = vec![0; 16];
+        frame[8..12].copy_from_slice(&(values.len() as u32).to_le_bytes());
+        let root = self.buffer(frame);
+        let mut elements = vec![0; values.len() * 16];
+        for (i, value) in values.iter().enumerate() {
+            elements[i * 16 + 8..i * 16 + 12].copy_from_slice(&(value.len() as u32).to_le_bytes());
+        }
+        let parent = self.embedded_buffer(root, 0, elements)?;
+        for (i, value) in values.iter().enumerate() {
+            let mut bytes = value.as_bytes().to_vec(); bytes.push(0);
+            self.embedded_buffer(parent, i * 16, bytes)?;
+        }
+        Ok(())
+    }
+
+    pub fn hashes(&mut self, values: &[[u8; 32]]) -> Result<()> {
+        let mut frame = vec![0; 16];
+        frame[8..12].copy_from_slice(&(values.len() as u32).to_le_bytes());
+        let root = self.buffer(frame);
+        self.embedded_buffer(root, 0, values.iter().flatten().copied().collect())?;
+        Ok(())
+    }
+
     /// A run of bytes: the frame that says where they are, then an address
     /// for the bytes themselves.
     pub fn bytes(&mut self, value: &[u8]) {
@@ -201,7 +251,6 @@ impl<'a> Answer<'a> {
 
     /// A reply backed by a known Binder mapping. All buffer pointers are
     /// checked against that mapping before being dereferenced.
-    #[cfg(any(target_os = "android", test))]
     pub(crate) fn bounded(data: &'a [u8], start: usize, length: usize) -> Self {
         Self {
             data,
@@ -212,6 +261,33 @@ impl<'a> Answer<'a> {
 
     pub fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into()?))
+    }
+
+    /// Hardware Binder uses a NUL-terminated, four-byte-aligned ASCII token.
+    pub fn interface(&mut self) -> Result<&'a str> {
+        let rest = &self.data[self.at..];
+        let length = rest.iter().position(|b| *b == 0).context("unterminated HIDL interface")?;
+        anyhow::ensure!(length <= 1024, "overlong HIDL interface");
+        let token = self.take((length + 1).next_multiple_of(4))?;
+        anyhow::ensure!(token[length..].iter().all(|b| *b == 0), "nonzero interface padding");
+        Ok(std::str::from_utf8(&token[..length])?)
+    }
+
+    pub fn finish(&self) -> Result<()> {
+        anyhow::ensure!(self.at == self.data.len(), "trailing HIDL transaction data");
+        Ok(())
+    }
+
+    pub fn string(&mut self, maximum: usize) -> Result<&'a str> {
+        let frame = self.pointed()?;
+        anyhow::ensure!(frame.len() == FRAME_BYTES, "invalid HIDL string frame");
+        let count = u32::from_le_bytes(frame[8..12].try_into()?) as usize;
+        anyhow::ensure!(count <= maximum, "overlong HIDL string");
+        let bytes = self.pointed()?;
+        anyhow::ensure!(bytes.len() == count + 1 && bytes[count] == 0, "invalid HIDL string terminator/length");
+        anyhow::ensure!(u64::from_le_bytes(frame[..8].try_into()?) == bytes.as_ptr() as u64, "mismatched HIDL string buffer");
+        anyhow::ensure!(!bytes[..count].contains(&0), "embedded NUL in HIDL string");
+        Ok(std::str::from_utf8(&bytes[..count])?)
     }
 
     /// Whether the call went through. A service that refused says so first,

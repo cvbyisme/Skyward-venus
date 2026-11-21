@@ -243,10 +243,13 @@ pub fn status_bar(c: &mut Canvas, t: &Theme, f: &Fonts, bar: &Bar, ink: Rgba) {
     let cy = m.status_cy;
     // Digits carry no descender, so centre on half their height (≈0.72 em).
     c.text(&f.status, bar.clock, m.status_x, cy + m.status_px * 0.36, m.status_px, ink, None);
-    let mut right = m.w as f32 - m.status_right;
+    // Move the entire right-hand status cluster away from the curved right
+    // edge. Clock and left-side layout stay exactly where they were.
+    let left_shift = m.dp(STATUS_RIGHT_GROUP_LEFT_DP);
+    let mut right = m.w as f32 - m.status_right - left_shift;
     if let Some((level, charging)) = bar.battery {
         if let Some(kind) = charging {
-            let x = m.w as f32 - m.status_bolt_right - m.dp(BOLT_W_DP);
+            let x = m.w as f32 - m.status_bolt_right - m.dp(BOLT_W_DP) - left_shift;
             let (art, ox, oy) = bolt(t, kind, x, cy);
             c.lay(&art, ox, oy, 1.0);
             right = x - m.dp(2.42);
@@ -283,6 +286,10 @@ pub fn status_bar(c: &mut Canvas, t: &Theme, f: &Fonts, bar: &Bar, ink: Rgba) {
         speed(c, t, f, &w.speed, w.unit, left - gap, cy, ink);
     }
 }
+
+/// Shift the complete right status cluster 12 dp left, including the
+/// charging bolt, battery and all marks preceding it.
+const STATUS_RIGHT_GROUP_LEFT_DP: f32 = 12.0;
 
 /// Room between the marks on the bar's right, as the stock bar leaves it
 /// after its network speed and before its battery, in dp.
@@ -2920,6 +2927,7 @@ mod tests {
         // 970..979, and the speed's lines from 54 to 71 and 80 to 95, ending
         // 13 pixels short of the fan.
         let t = Theme::light(1200, 2608, 3.0);
+        let shift = t.m.dp(STATUS_RIGHT_GROUP_LEFT_DP);
         let f = crate::font::bundled();
         let draw = |mark: WlanMark| {
             let mut c = Canvas::filled(1200, 160, t.pal.bg);
@@ -2930,14 +2938,14 @@ mod tests {
         let full = WlanMark { level: 3, receiving: true, sending: true, speed: "7.02".into(), unit: "KB/s" };
         let c = draw(full);
         let inked = |p: &[u8]| p[0] < 220;
-        let fan = ink_box(&c, Rect::new(920.0, 40.0, 49.0, 70.0), inked);
-        assert!((fan.0 - 930.0).abs() <= 1.0 && (fan.1 - 59.0).abs() <= 1.0 && (fan.3 - 95.0).abs() <= 1.0, "fan {fan:?}");
+        let fan = ink_box(&c, Rect::new(920.0 - shift, 40.0, 49.0, 70.0), inked);
+        assert!((fan.0 - (930.0 - shift)).abs() <= 1.0 && (fan.1 - 59.0).abs() <= 1.0 && (fan.3 - 95.0).abs() <= 1.0, "fan {fan:?}");
         for row in [85.0, 90.0] {
-            let arrow = ink_box(&c, Rect::new(965.0, row, 20.0, 1.0), |p| p[0] < 200);
-            assert!((arrow.0 - 970.0).abs() <= 1.0 && (arrow.2 - 980.0).abs() <= 1.0, "arrow row {row}: {arrow:?}");
+            let arrow = ink_box(&c, Rect::new(965.0 - shift, row, 20.0, 1.0), |p| p[0] < 200);
+            assert!((arrow.0 - (970.0 - shift)).abs() <= 1.0 && (arrow.2 - (980.0 - shift)).abs() <= 1.0, "arrow row {row}: {arrow:?}");
         }
-        let figures = ink_box(&c, Rect::new(840.0, 45.0, 85.0, 30.0), inked);
-        let unit = ink_box(&c, Rect::new(840.0, 76.0, 85.0, 24.0), inked);
+        let figures = ink_box(&c, Rect::new(840.0 - shift, 45.0, 85.0, 30.0), inked);
+        let unit = ink_box(&c, Rect::new(840.0 - shift, 76.0, 85.0, 24.0), inked);
         assert!((figures.1 - 54.0).abs() <= 1.0 && (figures.3 - 72.0).abs() <= 1.0, "figures {figures:?}");
         assert!((unit.1 - 80.0).abs() <= 1.0 && (unit.3 - 96.0).abs() <= 1.0, "unit {unit:?}");
         assert!((fan.0 - figures.2.max(unit.2) - 13.0).abs() <= 1.5, "the speed ends short of the fan: {figures:?} {unit:?}");
@@ -2946,10 +2954,10 @@ mod tests {
         let c = draw(WlanMark { level: 1, receiving: false, sending: false, speed: "0.00".into(), unit: "KB/s" });
         let dim = over(t.pal.battery.empty, t.pal.bg);
         let at = |x: u32, y: u32| Rgba::rgb(c.data[((y * 1200 + x) * 4) as usize], c.data[((y * 1200 + x) * 4 + 1) as usize], c.data[((y * 1200 + x) * 4 + 2) as usize]);
-        assert_eq!(at(954, 62), dim, "the outer arc");
-        assert_eq!(at(954, 75), dim, "the inner arc");
-        assert_eq!(at(954, 88), t.pal.status, "the slice");
-        assert_eq!((at(975, 84), at(975, 91)), (dim, dim), "the arrows");
+        assert_eq!(at((954.0 - shift) as u32, 62), dim, "the outer arc");
+        assert_eq!(at((954.0 - shift) as u32, 75), dim, "the inner arc");
+        assert_eq!(at((954.0 - shift) as u32, 88), t.pal.status, "the slice");
+        assert_eq!((at((975.0 - shift) as u32, 84), at((975.0 - shift) as u32, 91)), (dim, dim), "the arrows");
     }
 
     #[test]
@@ -3025,11 +3033,29 @@ mod tests {
     }
 
     #[test]
+    fn right_status_group_moves_left_together_and_preserves_bolt_spacing() {
+        let t = Theme::dark(1200, 2608, 3.0);
+        let m = &t.m;
+        let shift = m.dp(STATUS_RIGHT_GROUP_LEFT_DP);
+        assert_eq!(shift, 36.0);
+        let plain_battery_right = m.w as f32 - m.status_right - shift;
+        let charged_bolt_left = m.w as f32 - m.status_bolt_right - m.dp(BOLT_W_DP) - shift;
+        let stock_battery_right = m.w as f32 - m.status_right;
+        let stock_bolt_left = m.w as f32 - m.status_bolt_right - m.dp(BOLT_W_DP);
+        assert!((stock_battery_right - plain_battery_right - shift).abs() < 0.01);
+        assert!((stock_bolt_left - charged_bolt_left - shift).abs() < 0.01);
+        assert!(plain_battery_right > charged_bolt_left);
+        // Only the right side uses left_shift; the left clock stays at status_x.
+        assert_eq!(m.status_x, m.dp(37.0));
+    }
+
+    #[test]
     fn the_bolts_stand_past_the_battery_as_the_stock_bar_draws_them() {
         // The 17 Ultra's bar, three pixels a dp, charging quickly: the stock
         // bolt covers a quarter of a pixel or more across 1069..1086 and
         // down 60..94, and its left edge steps right at rows 76 and 85.
         let t = Theme::dark(1200, 2608, 3.0);
+        let shift = t.m.dp(STATUS_RIGHT_GROUP_LEFT_DP);
         let f = crate::font::bundled();
         let draw = |kind| {
             let mut c = Canvas::filled(1200, 160, Rgba::rgb(0, 0, 0));
@@ -3042,17 +3068,17 @@ mod tests {
         let cover = |p: &[u8]| p[0] as f32 / t.pal.battery.bolt.a as f32;
         let steps = |c: &Canvas| -> Vec<u32> {
             let lefts: Vec<(u32, u32)> = (40..120)
-                .filter_map(|y| (1064..1100).find(|&x| cover(&c.data[((y * 1200 + x) * 4) as usize..]) > 0.6).map(|x| (y, x)))
+                .filter_map(|y| ((1064.0 - shift) as u32..(1100.0 - shift) as u32).find(|&x| cover(&c.data[((y * 1200 + x) * 4) as usize..]) > 0.6).map(|x| (y, x)))
                 .collect();
             lefts.windows(2).filter(|w| w[1].1 >= w[0].1 + 3).map(|w| w[1].0).collect()
         };
         let quick = draw(Bolt::Quick);
-        let ink = ink_box(&quick, Rect::new(1064.0, 40.0, 36.0, 80.0), |p| cover(p) > 0.25);
-        assert_eq!(ink, (1069.0, 60.0, 1086.0, 94.0), "where the stock bolt is");
+        let ink = ink_box(&quick, Rect::new(1064.0 - shift, 40.0, 36.0, 80.0), |p| cover(p) > 0.25);
+        assert_eq!(ink, (1069.0 - shift, 60.0, 1086.0 - shift, 94.0), "where the stock bolt is");
         assert_eq!(steps(&quick), [76, 85], "two steps where the stock bolt's are");
         let plain = draw(Bolt::Charging);
-        let ink = ink_box(&plain, Rect::new(1064.0, 40.0, 36.0, 80.0), |p| cover(p) > 0.25);
-        assert!(ink.0 >= 1068.0 && ink.2 <= 1092.0 && ((ink.1 + ink.3) / 2.0 - t.m.status_cy).abs() <= 1.0, "in the same box: {ink:?}");
+        let ink = ink_box(&plain, Rect::new(1064.0 - shift, 40.0, 36.0, 80.0), |p| cover(p) > 0.25);
+        assert!(ink.0 >= 1068.0 - shift && ink.2 <= 1092.0 - shift && ((ink.1 + ink.3) / 2.0 - t.m.status_cy).abs() <= 1.0, "in the same box: {ink:?}");
         assert_eq!(steps(&plain).len(), 1, "one step while the charger charges as it may");
     }
 

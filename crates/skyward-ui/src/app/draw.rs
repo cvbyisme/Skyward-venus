@@ -828,7 +828,7 @@ mod tests {
             app.state.data = data;
             app.bar("12:00", &i).data
         };
-        assert_eq!(lock(&mut app, Data::Locked { user: 0, keys: Keys::Digits, checking: false }), Some(false), "shut while its files are out of reach");
+        assert_eq!(lock(&mut app, Data::Locked { user: 0, keys: Keys::Digits, checking: false, storage_ready: false }), Some(false), "shut while its files are out of reach");
         assert_eq!(lock(&mut app, Data::Open), Some(true));
         assert_eq!(lock(&mut app, Data::Erased), None, "nothing to open once wiped");
         let none = app.bar("12:00", &info());

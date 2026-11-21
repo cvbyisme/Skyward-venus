@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
 
-const DIRECTORY: &str = "/tmp/skyward-task-scopes";
+const DIRECTORY: &str = "/skyward/run/tasks";
 const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 

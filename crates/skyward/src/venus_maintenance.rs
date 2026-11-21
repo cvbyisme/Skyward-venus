@@ -138,10 +138,10 @@ mod runtime {
         thread,
         time::{Duration, Instant},
     };
-    const LOCK: &str = "/tmp/skyward-maintenance.lock";
-    const LEGACY_LOCK: &str = "/tmp/skyward-maintenance-legacy.lock";
+    const LOCK: &str = "/skyward/run/locks/maintenance.lock";
+    const LEGACY_LOCK: &str = "/skyward/run/locks/maintenance-legacy.lock";
     static PROCESS_LEASE: Mutex<Option<File>> = Mutex::new(None);
-    const DATA_LOCK: &str = "/tmp/skyward-km41-data.lock";
+    const DATA_LOCK: &str = "/skyward/run/locks/data.lock";
     const BACKUPS: &str = "/data/media/0/SkywardRecoveryMaintenance";
 
     fn lock(path: &str) -> Result<File> {

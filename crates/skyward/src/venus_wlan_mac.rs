@@ -67,7 +67,7 @@ mod runtime {
     }
 
     fn factory_config() -> Result<Vec<u8>> {
-        let at=Path::new("/tmp/skyward-wlan-persist");
+        let at=Path::new("/skyward/run/hal/wlan-persist");
         if !at.exists() { DirBuilder::new().mode(0o700).create(at)?; }
         let m=fs::symlink_metadata(at)?;
         ensure!(m.is_dir() && !m.file_type().is_symlink() && m.uid()==0 && m.mode()&0o077==0,
@@ -107,7 +107,7 @@ mod runtime {
         let config=factory_config()?;
         let boot=fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
         let receipt=format!("venus-wlan-factory-mac-v1\nboot={}\nconfig_sha256={:x}\n",boot.trim(),Sha256::digest(&config));
-        let root=Path::new("/tmp/skyward-wlan-firmware");
+        let root=Path::new("/skyward/run/hal/wlan-firmware");
         if root.exists() {
             ensure!(fs::read(root.join(".skyward-ready"))?==receipt.as_bytes(), "foreign WLAN firmware receipt");
             ensure!(fs::read(root.join("wlan_mac.bin"))?==config, "WLAN firmware address changed");

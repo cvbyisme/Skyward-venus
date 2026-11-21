@@ -7,6 +7,8 @@ export PATH="$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
 export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$HOME/Android/Sdk/ndk/29.0.14206865}"
 DUMP="${VENUS_DUMP_DIR:-$HOME/SKYWARD/venus_dump}"
 TOOLS="${VENUS_TOOLS_DIR:-$HOME/SKYWARD/tools}"
+CHECKPOLICY="${VENUS_CHECKPOLICY:-$TOOLS/selinux/usr/bin/checkpolicy}"
+SECILC="${VENUS_SECILC:-$TOOLS/selinux/usr/bin/secilc}"
 CACHE="${VENUS_KM41_CACHE:-$DUMP/keymaster41.sSBzw7}"
 TETHERING="${VENUS_TETHERING_IMAGE:-$DUMP/network-20261110/apex-ro/com.android.tethering.img}"
 NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
@@ -16,8 +18,9 @@ CC="$NDK_BIN/aarch64-linux-android30-clang"
 export CC_aarch64_linux_android="$CC"
 export CXX_aarch64_linux_android="$NDK_BIN/aarch64-linux-android30-clang++"
 export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
+REFERENCE="${VENUS_TWRP_REFERENCE:-$HOME/SKYWARD/[TWRP]3.7.1_17_A17.img}"
 CONFIG=devices/venus.toml
-for file in "$DUMP/boot_a.img" "$DUMP/vendor_boot_a.img" "$DUMP/vbmeta_a.img" "$CC" "$CONFIG" "$TOOLS/avbtool.py" "$CACHE/runtime.img" "$CACHE/vndk30.img" "$TETHERING" porting/venus/framework-manifest.xml porting/venus/suspend/build.sh; do
+for file in "$DUMP/boot_a.img" "$DUMP/vendor_boot_a.img" "$DUMP/vbmeta_a.img" "$REFERENCE" "$CC" "$CONFIG" "$TOOLS/avbtool.py" "$CHECKPOLICY" "$SECILC" "$CACHE/runtime.img" "$CACHE/vndk30.img" "$TETHERING" porting/venus/framework-manifest.xml porting/venus/suspend/build.sh; do
     test -s "$file" || { printf 'Missing input: %s\n' "$file" >&2; exit 1; }
 done
 mkdir -p target
@@ -26,26 +29,18 @@ mkdir "$OUT/input" "$OUT/assets" "$OUT/temporary" "$OUT/standalone" "$OUT/normal
 # Python tests and py_compile must not leave __pycache__ in the source tree.
 export PYTHONPYCACHEPREFIX="$OUT/python-cache"
 printf 'Output: %s\n' "$OUT"
-sha256sum "$DUMP/boot_a.img" "$DUMP/vendor_boot_a.img" "$DUMP/vbmeta_a.img" > "$OUT/inputs.sha256"
+sha256sum "$DUMP/boot_a.img" "$DUMP/vendor_boot_a.img" "$DUMP/vbmeta_a.img" "$REFERENCE" > "$OUT/inputs.sha256"
 cp -p "$DUMP/boot_a.img" "$OUT/input/boot_a.img"
 cp -p "$CONFIG" "$OUT/input/device.toml"
 cmp "$DUMP/boot_a.img" "$OUT/input/boot_a.img"
-for script in km41-runtime ce-runtime rw-runtime boot-runtime cache-runtime modem-prepare; do sh -n "porting/venus/$script.sh"; done
 python3 -m py_compile porting/venus/verify-recovery.py
-python3 porting/venus/test-rw-recovery.py 2>&1 | tee "$OUT/rw-runtime-tests.log"
-python3 porting/venus/test-runtime-cache.py 2>&1 | tee "$OUT/cache-runtime-tests.log"
-python3 porting/venus/test-modem-prepare.py 2>&1 | tee "$OUT/modem-prepare-tests.log"
-python3 porting/venus/test-boot-readiness.py 2>&1 | tee "$OUT/boot-readiness-tests.log"
-sh porting/venus/test-km41-properties.sh porting/venus/km41-runtime.sh 2>&1 | tee "$OUT/property-tests.log"
-sh porting/venus/test-km41-readiness.sh porting/venus/km41-runtime.sh 2>&1 | tee "$OUT/readiness-tests.log"
+python3 porting/venus/test-crypto-policy.py 2>&1 | tee "$OUT/crypto-policy-tests.log"
+python3 porting/venus/prepare-crypto-policy.py "$OUT/input/boot_a.img" "$OUT/policy" --checkpolicy "$CHECKPOLICY" --secilc "$SECILC" > "$OUT/crypto-policy-build.log" 2>&1
+cp -p "$OUT/policy/recovery-sepolicy" "$OUT/policy/recovery-sepolicy.source.sha256" "$OUT/assets/"
+python3 porting/venus/test-tmp-isolation.py 2>&1 | tee "$OUT/tmp-isolation-tests.log"
 python3 porting/venus/test-ce-local.py 2>&1 | tee "$OUT/ce-helper-tests.log"
 python3 porting/venus/test-km41-host.py 2>&1 | tee "$OUT/km41-host-tests.log"
 python3 porting/venus/test-network-capture.py 2>&1 | tee "$OUT/network-capture-tests.log"
-python3 porting/venus/test-netmgr-ready.py 2>&1 | tee "$OUT/netmgr-ready-tests.log"
-${HOST_CC:-cc} -std=c11 -O2 -Wall -Wextra -Werror porting/venus/test-netmgr-init.c -o "$OUT/test-netmgr-init"
-"$OUT/test-netmgr-init" | tee "$OUT/netmgr-init-tests.log"
-${HOST_CC:-cc} -std=c11 -O2 -Wall -Wextra -Werror -DKM41_RPMB_TEST porting/venus/km41-rpmb.c -o "$OUT/test-rpmb"
-"$OUT/test-rpmb" | tee "$OUT/rpmb-tests.log"
 git diff --check
 cargo test --locked -p skyward-lp -p skyward-vab 2>&1 | tee "$OUT/logical-partition-tests.log"
 cargo test --locked -p skyward-binder -p skyward-block -p skyward-crypto -p skyward-files -p skyward-install -p skyward-net -p skyward-sys --lib 2>&1 | tee "$OUT/library-tests.log"
@@ -64,18 +59,16 @@ if readelf -l "$OUT/assets/system-init" | grep -q INTERP; then
     echo 'system-init must be statically linked' >&2
     exit 1
 fi
-for name in binderfs-setup km41-launch km41-rpmb km41-kmsg modem-hold; do
-    "$CC" -std=c11 -Os -s -Wall -Wextra -Werror -static "porting/venus/$name.c" -o "$OUT/assets/$name"
-done
-"$CC" -std=c11 -Os -s -Wall -Wextra -Werror -fPIE -pie porting/venus/netmgr-ready.c -ldl -o "$OUT/assets/netmgr-ready"
-VENUS_KM41_CACHE="$CACHE" bash porting/venus/suspend/build.sh "$OUT/assets/network-suspend" 2>&1 | tee "$OUT/network-suspend-build.log"
-VENUS_KM41_CACHE="$CACHE" bash porting/venus/netd/build.sh "$OUT/assets/network-netd" 2>&1 | tee "$OUT/network-netd-build.log"
+bash porting/venus/build-runtime.sh "$OUT/assets" 2>&1 | tee "$OUT/rust-runtime-build.log"
+cargo run --locked --release -p skyward-pack --example export_crypto_runtime -- "$REFERENCE" "$OUT/crypto-reference" 2>&1 | tee "$OUT/crypto-export.log"
+python3 porting/venus/verify-crypto-runtime.py "$OUT/crypto-reference/root" > "$OUT/crypto-reference/ELF-CLOSURE.json"
+cp -p "$OUT/crypto-reference/runtime.cpio.lz4" "$OUT/assets/crypto-runtime.cpio.lz4"
+cp -p "$OUT/crypto-reference/SOURCE.sha256" "$OUT/assets/crypto-runtime.SOURCE.sha256"
 cp -p "$CACHE/runtime.img" "$CACHE/vndk30.img" "$OUT/assets/"
 cp -p porting/venus/framework-manifest.xml "$OUT/assets/"
 cp -p porting/venus/boot-ld.config.txt "$OUT/assets/"
 cp -p porting/venus/network-ld.config.txt "$OUT/assets/"
 cp -p "$TETHERING" "$OUT/assets/tethering.img"
-for script in km41-runtime ce-runtime rw-runtime boot-runtime cache-runtime modem-prepare; do cp -p "porting/venus/$script.sh" "$OUT/assets/"; done
 printf '%s  %s\n' \
     9776b642132872ce4931218694c345231ecaac4490ead5d7c2f7c24e17481c17 "$OUT/assets/runtime.img" \
     8948745de8d27cae3fbdf23f6185ae4b6aec680b6a6febf2a2f0eaba1ab59b9e "$OUT/assets/vndk30.img" \

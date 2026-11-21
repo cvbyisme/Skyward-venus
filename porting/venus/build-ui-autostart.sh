@@ -20,7 +20,6 @@ sha256sum "$DUMP/boot_a.img" "$DUMP/vendor_boot_a.img" "$DUMP/vbmeta_a.img" > "$
 cp -p "$DUMP/boot_a.img" "$OUT/input/boot_a.img"
 cp -p "$CONFIG" "$OUT/input/device.toml"
 cmp "$DUMP/boot_a.img" "$OUT/input/boot_a.img"
-for script in crates/skyward-pack/src/venus_probe.sh crates/skyward-pack/src/venus_probe_logs.sh crates/skyward-pack/src/venus_ui_start.sh; do sh -n "$script"; done
 git diff --check
 cargo test --locked -p skyward-pack 2>&1 | tee "$OUT/pack-tests.log"
 cargo clippy --locked -p skyward-pack --all-targets -- -D warnings 2>&1 | tee "$OUT/pack-clippy.log"

@@ -44,7 +44,7 @@ if args and args[0]=='shell' and 'KEYMASTER_REMOTE_EXIT' in a:
  print('KEYMASTER_ORIGINAL_KEY_FILES_UNCHANGED')
  print('KEYMASTER_PHASE KEYMASTER_DIAGNOSTIC_COMPLETE')
  print('KEYMASTER_REMOTE_EXIT=0');sys.exit(0)
-if 'km41-runtime.sh start' in a:print('KEYMASTER41_RUNTIME_READY mock-only')
+if 'km41-runtime start' in a:print('KEYMASTER41_RUNTIME_READY mock-only')
 sys.exit(0)
 '''
 
@@ -58,7 +58,7 @@ class HostWrapper(unittest.TestCase):
                 shutil.copy2(HERE/name,repo/'porting/venus'/name)
             (tools/'adb').write_text(FAKE);(tools/'adb').chmod(0o700)
             out=repo/'out';(out/'assets').mkdir(parents=True)
-            names=('skyward','binderfs-setup','km41-launch','km41-kmsg','km41-rpmb','runtime.img','vndk30.img','framework-manifest.xml','km41-runtime.sh')
+            names=('skyward','binderfs-setup','km41-launch','km41-kmsg','km41-rpmb','runtime.img','vndk30.img','framework-manifest.xml','km41-runtime')
             checks=[]
             for n in names:
                 p=out/'assets'/n;p.write_bytes(b'mock asset\n')

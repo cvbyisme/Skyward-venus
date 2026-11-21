@@ -1,5 +1,12 @@
 # Venus color parameter experiment
 
+**Implementation update (2026-11-19):** All Skyward-owned display experiment
+runtime code and host regression logic has been ported to Rust. See
+[README-RUST.md](README-RUST.md) for current build commands and verification
+requirements. Older historical C++ build descriptions below are retained as
+ABI research records, not current build instructions.
+
+
 This directory is isolated from production Skyward, its UI, KMS owner, build and
 ramdisk. `display-probe` is an ARM64 STC V2 client, **not a display service**. It
 does not open DRM, create a kernel property blob, perform an atomic commit, or
@@ -24,36 +31,26 @@ asset fails the entire render. This may require extending the adapter after
 the first real output is inspected. Missing assets are not silently assigned
 defaults, and no existing CRTC property is changed.
 
-## Build and host checks
+## Build and host checks (Rust)
 
-`bash porting/venus/display/build.sh OUTPUT_ELF` uses the already verified
-official VNDK30 header cache from the suspend bridge. It does not mutate that
-cache. The Binder headers use the same official commit and are verified
-against `binder-headers.json` (downloaded into a separate display cache if
-needed). `libbinder`, `libutils` and `libc++` are freshly extracted from the
-matching `vndk30.img` into that separate cache; their hashes are recorded next
-to the output ELF. The binary links platform `libc++.so` / `std::__1`, never NDK
-`libc++_shared.so` / `std::__ndk1`. All private layout sizes and offsets are
-compile-time assertions.
-
-The host tests require the read-only Venus kernel UAPI include directory:
+All Skyward-owned display code is Rust. See [README-RUST.md](README-RUST.md)
+for the supported build and verification workflow:
 
 ```sh
-g++ -std=c++17 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined \
-  -I/home/abc/android_kernel_xiaomi_sm8350_venus/techpack/display/include/uapi/display/drm \
-  porting/venus/display/test_blobs.cpp -o /tmp/test-display-blobs
-/tmp/test-display-blobs
-g++ -std=c++17 -O2 -Wall -Wextra -Werror \
-  porting/venus/display/test_io_guard.cpp -o /tmp/test-display-io-guard
-/tmp/test-display-io-guard
-cd porting/venus/display
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest test_unpack.py
+bash porting/venus/display/build-launch.sh target/venus-display-rust/display-probe-launch
+python3 porting/venus/display/build.py target/venus-display-rust/display-probe
+python3 porting/venus/display/ipc/build.py target/venus-display-rust/ipc
+cargo test --locked -p skyward-venus-runtime --lib
+cargo clippy --locked -p skyward-venus-runtime --all-targets -- -D warnings
 ```
 
-The tests cover actual kernel UAPI sizes, G/B/R hardware channel ordering,
-IGC's 257th sample, GC pair packing, rejection of wrong sizes/values, gamut
-buffer ownership and tail padding, all truncated frames, duplicate/unknown
-properties, and the live seccomp guard in a host child process.
+The Rust test suite covers the matching kernel UAPI byte lengths,
+G/B/R hardware channel order, 257th IGC sample, GC packing, owned gamut
+pointers, full-frame decoding, packet truncation, vendor pin count,
+ProcessState symbol identity and real seccomp enforcement in child processes.
+The binary uses the original Android 11 platform C++ ABI through FFI, without
+linking any NDK C++ runtime or building Skyward-owned C/C++ files. Runtime
+behavior on the phone must still be validated independently.
 
 ## Controlled target experiment
 

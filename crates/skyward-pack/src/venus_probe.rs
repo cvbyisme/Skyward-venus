@@ -11,7 +11,7 @@ fn patch_init(input: &str) -> Result<String> {
     let mut text = input.replacen(factory, "# Factory-reset hooks disabled for venus probe.\n", 1);
     text = text.replacen(
         service,
-        "service recovery /system/bin/sh /skyward/probe.sh\n    disabled\n    oneshot\n",
+        "service recovery /system/bin/skyward venus-helper probe\n    disabled\n    oneshot\n",
         1,
     );
     text.push_str(include_str!("venus_probe.rc"));
@@ -34,8 +34,6 @@ pub fn prepare(rd: &mut Ramdisk) -> Result<()> {
     eprintln!("TEMPORARY venus probe: two verified init branch instructions patched; Kernel unchanged. Do not flash.");
     // argv[0] must not be "recovery", even when asking for --help.
     rd.link("system/bin/skyward", "recovery")?;
-    rd.add("skyward/probe.sh", 0o755, include_bytes!("venus_probe.sh").to_vec())?;
-    rd.add("skyward/probe-logs.sh", 0o755, include_bytes!("venus_probe_logs.sh").to_vec())?;
     Ok(())
 }
 
@@ -47,7 +45,7 @@ mod tests {
         let s = "import /miui.factoryreset.rc\nservice recovery /system/bin/recovery\n    seclabel u:r:recovery:s0\n";
         let out = patch_init(s).unwrap();
         assert!(!out.contains("import /miui.factoryreset.rc"));
-        assert!(out.contains("service recovery /system/bin/sh /skyward/probe.sh"));
+        assert!(out.contains("service recovery /system/bin/skyward venus-helper probe"));
         assert!(out.contains("setprop sys.usb.config adb"));
         assert!(out.contains("    disabled\n    oneshot\n"));
         assert!(out.contains("    seclabel u:r:recovery:s0\n"));

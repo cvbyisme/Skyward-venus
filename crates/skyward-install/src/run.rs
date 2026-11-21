@@ -1091,6 +1091,11 @@ fn run_binary(ctx: &Context) -> Result<(i32, bool)> {
     command
         .current_dir("/")
         .env("PATH", SCRIPT_PATH)
+        // Packages expect the traditional recovery TMP and may clear it.
+        // Never let a service's private TMPDIR escape into update-binary.
+        .env("TMPDIR", "/tmp")
+        .env("TMP", "/tmp")
+        .env("TEMP", "/tmp")
         .stdin(Stdio::null())
         .stdout(Stdio::from(output_write.try_clone().context("share the script's output")?))
         .stderr(Stdio::from(output_write));

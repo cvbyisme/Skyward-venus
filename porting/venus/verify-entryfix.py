@@ -137,30 +137,27 @@ def main():
         for off, word in SITES.items():
             check(init_old[off:off + 4] == word and init_new[off:off + 4] == NOP, "instruction mismatch")
         rc = after["system/etc/init/hw/init.rc"][1].decode()
-        check("service recovery /system/bin/sh /skyward/probe.sh\n    disabled\n    oneshot\n" in rc, "probe entry missing")
+        check("service recovery /system/bin/skyward venus-helper probe\n    disabled\n    oneshot\n" in rc, "probe entry missing")
         check("import /miui.factoryreset.rc" not in rc, "factory reset still imported")
         check("VENUS_PROBE_INIT_EARLY" in rc and "setprop sys.usb.config adb" in rc, "independent init diagnostics missing")
         check(after["system/bin/skyward"][1] == b"recovery", "wrong CLI symlink")
-        check("skyward/probe-logs.sh" in after and "skyward/probe-entryfix.txt" in after, "probe resources missing")
+        check("service venus_probe_logs /system/bin/skyward venus-helper probe-logs" in rc and "skyward/probe-entryfix.txt" in after, "probe resources missing")
     rc = after["system/etc/init/hw/init.rc"][1].decode()
-    ui_files = {"skyward/ui-autostart.txt", "skyward/ui-start.sh"}
+    ui_files = {"skyward/ui-autostart.txt"}
     source_dir = Path(__file__).resolve().parents[2] / "crates/skyward-pack/src"
     if a.ui:
         check(ui_files.issubset(after), "UI-autostart files missing")
         check(after["skyward/ui-autostart.txt"][1].startswith(b"venus-ui-autostart-v1\n"), "UI marker mismatch")
-        script = (source_dir / "venus_ui_start.sh").read_bytes()
         if a.basic:
-            script = script.replace(b"--until-stopped\n", b"--until-stopped --basic-features\n", 1)
             check(after.get("skyward/basic-features.txt", (None, b""))[1] == b"venus-basic-v1\n", "basic marker missing")
-        check(after["skyward/ui-start.sh"][1] == script, "UI wrapper differs from reviewed source")
+        check("service venus_ui /system/bin/skyward venus-helper ui-start" in rc, "Rust UI startup missing")
         ui_rc = (source_dir / "venus_ui.rc").read_text()
         check(rc.endswith(ui_rc), "UI service stanza missing or changed")
         check(rc.count("service venus_ui ") == 1, "UI service must be unique")
         check("on boot\n    start venus_ui\n" in ui_rc, "UI is not started at boot")
         check("    oneshot\n" in ui_rc and "reboot_on_failure" not in ui_rc, "UI must not trigger reboot/restart loops")
         check("ui-probe".encode() in after["system/bin/recovery"][1], "missing isolated UI command")
-        for name, src in [("skyward/probe.sh", "venus_probe.sh"), ("skyward/probe-logs.sh", "venus_probe_logs.sh")]:
-            check(after[name][1] == (source_dir / src).read_bytes(), "existing diagnostics changed: " + name)
+        check(not any(name in after for name in ["skyward/probe.sh", "skyward/probe-logs.sh", "skyward/ui-start.sh"]), "legacy shell runtime retained")
     else:
         check(not ui_files.intersection(after), "UI files leaked into a non-UI image")
         check("service venus_ui " not in rc, "UI service leaked into a non-UI image")

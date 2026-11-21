@@ -7,6 +7,10 @@ pub mod keymaster;
 mod keymint_aidl;
 pub mod gatekeeper;
 pub mod keystore;
+#[cfg(any(target_os = "android", test))]
+pub mod keystore2_client;
+#[cfg(any(target_os = "android", test))]
+pub mod recovery;
 pub mod locksettings;
 pub mod sharedsecret;
 pub mod token;

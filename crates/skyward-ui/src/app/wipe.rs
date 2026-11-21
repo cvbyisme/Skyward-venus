@@ -244,11 +244,11 @@ mod tests {
     fn parts_waiting_on_a_locked_user_erase_nothing_and_send_the_user_home_to_decrypt() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Home, W, H, PPD);
-        app.state.data = Data::Locked { user: 0, keys: Keys::Digits, checking: false };
+        app.state.data = Data::Locked { user: 0, keys: Keys::Digits, checking: false, storage_ready: false };
         app.erase_started(false, false, vec![Part::AppCaches, Part::Logs]);
         app.erase_ended(Err(EraseStop::Locked(vec![0])), 0);
         assert_eq!(app.state.erase.done, 0, "nothing was erased");
-        assert_eq!(app.state.data, Data::Locked { user: 0, keys: Keys::Digits, checking: false }, "the partition stays as it was");
+        assert_eq!(app.state.data, Data::Locked { user: 0, keys: Keys::Digits, checking: false, storage_ready: false }, "the partition stays as it was");
         assert_eq!(tap_at(&mut app, &f, &i, Action::Dismiss, 1000), vec![Effect::Dismiss]);
         assert_eq!(app.screen(), Screen::Home);
         assert_eq!(tap_at(&mut app, &f, &i, Action::Open(Screen::Decrypt), 1000), Vec::new(), "the screen lock is asked for at once");

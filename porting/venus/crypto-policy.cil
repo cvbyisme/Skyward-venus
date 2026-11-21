@@ -1,0 +1,28 @@
+; Keystore 2.0 userspace classes from AOSP android12-release/private/access_vectors.
+; Append to the Venus Android 11 Recovery policy without reordering its classes.
+(class keystore2 (add_auth change_password change_user clear_ns clear_uid early_boot_ended get_auth_token get_state list lock pull_metrics report_off_body reset unlock delete_all_keys))
+(class keystore2_key (convert_storage_key_to_ephemeral delete gen_unique_id get_info grant manage_blob rebind req_forced_op update use use_dev_id))
+(classorder (drmservice keystore2 keystore2_key))
+
+; Namespaces in the reference's plat_keystore2_key_contexts. Unused namespaces
+; get valid labels only; no access is granted to them.
+(type su_key)
+(roletype object_r su_key)
+(type shell_key)
+(roletype object_r shell_key)
+(type vold_key)
+(roletype object_r vold_key)
+(type odsign_key)
+(roletype object_r odsign_key)
+(type wifi_key)
+(roletype object_r wifi_key)
+(type locksettings_key)
+(roletype object_r locksettings_key)
+(type resume_on_reboot_key)
+(roletype object_r resume_on_reboot_key)
+
+; Skyward and its keystore2 service both run in the existing recovery domain.
+; Match vold's blob operations and the two locksettings SP read operations.
+(allow recovery vold_key (keystore2_key (convert_storage_key_to_ephemeral delete get_info manage_blob rebind req_forced_op update use)))
+(allow recovery locksettings_key (keystore2_key (get_info use)))
+(allow recovery self (keystore2 (add_auth)))

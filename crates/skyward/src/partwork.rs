@@ -308,7 +308,9 @@ fn reach<T>(part: &Part, work: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
     match part {
         Part::Data => {
             crate::wipe::release_data()?;
-            let mapped = crate::decrypt::with_key_service(data::map_unmounted).map_err(anyhow::Error::msg)?;
+            let mapped = if crate::venus_rw::enabled() { crate::venus_rw::map_unmounted()? } else {
+                crate::decrypt::with_key_service(data::map_unmounted).map_err(anyhow::Error::msg)?
+            };
             let done = work(&mapped);
             data::unmap()?;
             done

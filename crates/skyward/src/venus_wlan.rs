@@ -18,7 +18,7 @@ pub struct Runtime {
 /// finished caching the installed runtime. Readiness only schedules work;
 /// Runtime::start still verifies all six live services before launching.
 pub fn ready() -> bool {
-    std::path::Path::new("/tmp/skyward-recovery/runtime-ready").is_file()
+    std::path::Path::new("/skyward/run/state/recovery/runtime-ready").is_file()
         && skyward_sys::prop("init.svc.venus_security").as_deref() == Some("running")
 }
 
@@ -27,7 +27,7 @@ impl Runtime {
         crate::venus_runtime::verified()?;
         let lock = OpenOptions::new().read(true).write(true).create(true).truncate(false)
             .mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open("/tmp/skyward-wlan.lock")?;
+            .open("/skyward/run/locks/wlan.lock")?;
         ensure!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
             "another Venus WLAN controller is running");
         crate::venus_wlan_mac::prepare()?;
@@ -35,7 +35,7 @@ impl Runtime {
         for role in ["vndmanager", "peripheral", "cnss"] {
             let log = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(format!("/tmp/skyward-wlan-{role}.log"))?;
+                .open(format!("/skyward/run/logs/wlan-{role}.log"))?;
             let child = Command::new("/skyward/runtime/km41-launch").arg(role)
                 .stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log).spawn()
                 .with_context(|| format!("start the installed WLAN helper {role}"))?;
@@ -55,7 +55,7 @@ impl Runtime {
 
     pub fn check(&mut self) -> Result<()> {
         for child in &mut self.children {
-            ensure!(child.try_wait()?.is_none(), "an installed WLAN helper ended; see /tmp/skyward-wlan-*.log");
+            ensure!(child.try_wait()?.is_none(), "an installed WLAN helper ended; see /skyward/run/logs/wlan-*.log");
         }
         Ok(())
     }

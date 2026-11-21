@@ -16,6 +16,7 @@ pub(crate) const BINDER_VERSION: u32 = ioc(WRITE | READ, b'b', 9, 4);
 
 pub(crate) const BC_TRANSACTION: u32 = ioc(WRITE, b'c', 0, size_of::<TransactionData>());
 pub(crate) const BC_REPLY: u32 = ioc(WRITE, b'c', 1, size_of::<TransactionData>());
+pub(crate) const BC_REPLY_SG: u32 = ioc(WRITE, b'c', 18, size_of::<TransactionData>() + 8);
 pub(crate) const BC_TRANSACTION_SG: u32 = ioc(WRITE, b'c', 17, size_of::<TransactionData>() + 8);
 pub(crate) const BC_FREE_BUFFER: u32 = ioc(WRITE, b'c', 3, 8);
 pub(crate) const BC_ACQUIRE: u32 = ioc(WRITE, b'c', 5, 4);
@@ -78,6 +79,7 @@ mod tests {
 
         assert_eq!(BC_TRANSACTION, 0x4040_6300);
         assert_eq!(BC_REPLY, 0x4040_6301);
+        assert_eq!(BC_REPLY_SG, 0x4048_6312);
         assert_eq!(BC_TRANSACTION_SG, 0x4048_6311);
         assert_eq!(BC_FREE_BUFFER, 0x4008_6303);
         assert_eq!(BC_ACQUIRE, 0x4004_6305);

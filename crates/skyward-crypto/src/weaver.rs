@@ -231,3 +231,48 @@ mod tests {
         assert!(format!("{waiting:#}").starts_with("the secure element is holding off further tries"));
     }
 }
+
+/// TWRP Decrypt.cpp selects the Weaver 1.0 HIDL interface. Keep this
+/// explicit so a Venus protector does not silently take a different HAL.
+#[cfg(target_os = "android")]
+pub struct HidlWeaver<'a> { handle: skyward_binder::driver::Handle<'a> }
+#[cfg(target_os = "android")]
+impl<'a> HidlWeaver<'a> {
+    const INTERFACE: &'static str = "android.hardware.weaver@1.0::IWeaver";
+    pub fn open(hardware: &'a skyward_binder::driver::Binder) -> Result<Self> {
+        let handle = skyward_binder::hidl::find(hardware, Self::INTERFACE, "default")?
+            .context("Weaver 1.0 service is not registered")?;
+        Ok(Self { handle })
+    }
+    pub fn config(&self) -> Result<Config> {
+        let reply = self.handle.transact(1, &skyward_binder::hidl::Message::call(Self::INTERFACE))?;
+        let mut r = reply.hidl(); r.status()?;
+        anyhow::ensure!(r.i32()? == 0, "Weaver getConfig failed");
+        let raw = r.pointed()?;
+        anyhow::ensure!(raw.len() == 12, "invalid WeaverConfig size");
+        let n = |offset| u32::from_le_bytes(raw[offset..offset+4].try_into().unwrap());
+        Ok(Config { slots: n(0), key_bytes: n(4) as usize, value_bytes: n(8) as usize })
+    }
+    pub fn read(&self, slot: u32, key: &[u8]) -> Result<Vec<u8>> {
+        let config = self.config()?;
+        anyhow::ensure!(slot < config.slots && key.len() == config.key_bytes, "invalid Weaver slot/key size");
+        let mut call = skyward_binder::hidl::Message::call(Self::INTERFACE);
+        call.u32(slot); call.bytes(key);
+        let reply = self.handle.transact(3, &call)?;
+        let mut r = reply.hidl(); r.status()?; let status = r.i32()?;
+        let raw = r.pointed()?;
+        anyhow::ensure!(raw.len() == 24, "invalid WeaverReadResponse size");
+        let timeout = u32::from_le_bytes(raw[..4].try_into()?);
+        // hidl_vec is 16 bytes, aligned to 8 after the uint32 timeout.
+        let length = u32::from_le_bytes(raw[16..20].try_into()?) as usize;
+        match status {
+            0 => (),
+            2 | 3 => bail!("Weaver refused credential: status={status}, timeout_ms={timeout}; no automatic retry"),
+            _ => bail!("Weaver read failed: status={status}, timeout_ms={timeout}"),
+        }
+        anyhow::ensure!(length == config.value_bytes, "Weaver value size mismatch");
+        let value = r.pointed()?;
+        anyhow::ensure!(value.len() == length, "truncated Weaver value");
+        Ok(value.to_vec())
+    }
+}

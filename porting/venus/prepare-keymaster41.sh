@@ -46,16 +46,16 @@ BOOT_ID="$(timeout 5 adb -s "$SERIAL" shell cat /proc/sys/kernel/random/boot_id 
 LOG="$(mktemp -d "$HOME/SKYWARD/venus_dump/keymaster41-retry.XXXXXX")"
 echo "本轮日志：$LOG"
 printf '%s\n' "$BOOT_ID" > "$LOG/boot-id-before.txt"
-adb -s "$SERIAL" shell 'mkdir -p /tmp/skyward-km41-stage; chmod 0700 /tmp/skyward-km41-stage'
-for name in skyward binderfs-setup km41-launch km41-kmsg km41-rpmb runtime.img vndk30.img framework-manifest.xml km41-runtime.sh; do
-    adb -s "$SERIAL" push "$OUT/assets/$name" "/tmp/skyward-km41-stage/$name.new" >/dev/null
-    adb -s "$SERIAL" shell "mv /tmp/skyward-km41-stage/$name.new /tmp/skyward-km41-stage/$name"
+adb -s "$SERIAL" shell 'mkdir -p /skyward/run/hal/stage-km41; chmod 0700 /skyward/run/hal/stage-km41'
+for name in skyward binderfs-setup km41-launch km41-kmsg km41-rpmb runtime.img vndk30.img framework-manifest.xml km41-runtime; do
+    adb -s "$SERIAL" push "$OUT/assets/$name" "/skyward/run/hal/stage-km41/$name.new" >/dev/null
+    adb -s "$SERIAL" shell "mv /skyward/run/hal/stage-km41/$name.new /skyward/run/hal/stage-km41/$name"
 done
-adb -s "$SERIAL" shell 'chmod 0700 /tmp/skyward-km41-stage/skyward /tmp/skyward-km41-stage/binderfs-setup /tmp/skyward-km41-stage/km41-launch /tmp/skyward-km41-stage/km41-kmsg /tmp/skyward-km41-stage/km41-rpmb'
+adb -s "$SERIAL" shell 'chmod 0700 /skyward/run/hal/stage-km41/skyward /skyward/run/hal/stage-km41/binderfs-setup /skyward/run/hal/stage-km41/km41-launch /skyward/run/hal/stage-km41/km41-kmsg /skyward/run/hal/stage-km41/km41-rpmb /skyward/run/hal/stage-km41/km41-runtime'
 # Stream directly to Ubuntu before any operation. No dependence on a later
 # successful Android boot or the kernel's existing Metadata ring snapshots.
 # This child is bounded to 300 seconds and stopped by the EXIT trap.
-adb -s "$SERIAL" exec-out /tmp/skyward-km41-stage/km41-kmsg > "$LOG/kernel-live.txt" 2> "$LOG/kernel-capture-error.txt" &
+adb -s "$SERIAL" exec-out /skyward/run/hal/stage-km41/km41-kmsg > "$LOG/kernel-live.txt" 2> "$LOG/kernel-capture-error.txt" &
 KLOG_PID=$!
 ready=0
 for ((i=0; i<60; i++)); do
@@ -64,7 +64,7 @@ for ((i=0; i<60; i++)); do
     sleep 0.1
 done
 [[ "$ready" = 1 ]] || { echo '内核实时日志未就绪，未运行解密测试。' >&2; exit 1; }
-adb -s "$SERIAL" shell 'sh /tmp/skyward-km41-stage/km41-runtime.sh start' 2>&1 | tee "$LOG/runtime.txt"
+adb -s "$SERIAL" shell '/skyward/run/hal/stage-km41/km41-runtime start' 2>&1 | tee "$LOG/runtime.txt"
 kill -0 "$KLOG_PID" 2>/dev/null || { echo 'Kernel capture ended before the test; refusing data operation' >&2; exit 1; }
 ARGS='keymaster41'
 case "$MODE" in
@@ -74,7 +74,7 @@ case "$MODE" in
 esac
 # Record the remote exit explicitly: some USB failures do not propagate as
 # an informative adb exit status. A timeout does NOT prove remote cleanup.
-REMOTE="/tmp/skyward-km41-stage/skyward $ARGS; rc=\$?; printf '\\nKEYMASTER_REMOTE_EXIT=%s\\n' \"\$rc\"; exit \"\$rc\""
+REMOTE="/skyward/run/hal/stage-km41/skyward $ARGS; rc=\$?; printf '\\nKEYMASTER_REMOTE_EXIT=%s\\n' \"\$rc\"; exit \"\$rc\""
 set +e
 timeout 180 adb -s "$SERIAL" shell "$REMOTE" 2>&1 | tee "$LOG/result.txt"
 statuses=("${PIPESTATUS[@]}")

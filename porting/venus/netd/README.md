@@ -3,7 +3,7 @@
 This is the narrow `android.system.net.netd@1.1::INetd/default` service needed by
 the stock Venus netmgr. It does not start Android framework netd, replace DNS,
 change the main/default route, configure interface addresses, or control WDS.
-It uses the original VNDK30 HIDL/C++ ABI. The parent recovery modem runtime owns
+Its Rust implementation speaks the original Android 11 HIDL wire protocol. The parent recovery modem runtime owns
 its process and must keep it alive while native netmgr uses its network handles.
 
 ## Implemented contract
@@ -36,7 +36,7 @@ a complete replacement for framework netd.
 ## Process protocol and current integration boundary
 
 Run with no arguments as root in the launcher's verified private RAM root, with
-VNDK30 linkage and hwbinder available. Registration emits exactly
+hwbinder and the verified Android runtime tools available. Registration emits exactly
 `VENUS_NETD_READY pid=<pid>` on stdout. The owner must check this PID and real HIDL
 lookup from a separate bounded probe; registration can synchronously unblock
 the stock netmgr initialization thread.
@@ -56,35 +56,31 @@ requirement before arbitrary automatic crash/restart recovery is enabled.
 
 ## Build and tests
 
-`build.sh OUTPUT_ELF` builds the service; `build.sh OUTPUT_ELF --probe` builds the
-independent HIDL probe. Header members are SHA-pinned to official VNDK30 and
-libraries are extracted from the selected verified `vndk30.img`. No NDK C++ ABI
-is allowed into either executable.
+`build.sh OUTPUT_ELF` builds the static Rust service; `build.sh OUTPUT_ELF --probe`
+builds the independent Rust HIDL probe. The implementation lives in
+`crates/skyward-venus-runtime/src/netd`; the transport is in `skyward-binder`.
+No generated C++ header or VNDK C++ linkage is needed by these helpers.
 
-Host transaction/codec/failure tests:
-
-```sh
-c++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread test_manager.cpp -o /tmp/test-netd
-/tmp/test-netd
-```
-
-The same test passes ASan/UBSan. `test_kernel.cpp` additionally checks actual
-IPv4/IPv6 rule and route mutations, duplicate rejection, kernel normalization,
-iptables incoming MARK, full Manager transactions and exact cleanup in a new
-host user/network namespace. It refuses the caller's original network namespace:
+Host transaction, codec, ownership and failure tests:
 
 ```sh
-c++ -std=c++17 -O2 -Wall -Wextra -Werror -pthread \
-  '-DVENUS_NETD_TEST_IPTABLES_DIR="/usr/sbin"' test_kernel.cpp -o /tmp/test-netd-kernel
-python3 - <<'PY'
-import os, subprocess
-inode = os.stat('/proc/self/ns/net').st_ino
-subprocess.run(['unshare', '-Urn', 'sh', '-c',
-    'ip link add netdtest0 type dummy && ip link set netdtest0 up && /tmp/test-netd-kernel "$1"',
-    'sh', str(inode)], check=True)
-PY
+cargo test -p skyward-venus-runtime netd::
 ```
 
-The host-only iptables path macro must not be set when building the Android ELF.
-These tests do not establish device registration, vendor-netmgr compatibility,
-or cellular connectivity; those require the parent's controlled RAM tests.
+The opt-in kernel test checks actual IPv4/IPv6 rules and routes, duplicate
+rejection, normalization, iptables MARK rules, and complete cleanup. It refuses
+to mutate the caller's original network namespace. From the repository root:
+
+```sh
+export SKYWARD_TEST_INITIAL_NETNS=$(stat -Lc %i /proc/self/ns/net)
+unshare -Urn sh -c '
+    set -eu
+    ip link add netdtest0 type dummy
+    ip link set netdtest0 up
+    cargo test -p skyward-venus-runtime isolated_real_kernel_rules_routes_and_mark_cleanup -- --ignored
+'
+```
+
+The isolated host test uses `/usr/sbin/iptables`; production uses
+`/system/bin/iptables`. These tests do not establish device registration,
+vendor-netmgr compatibility, or cellular connectivity.

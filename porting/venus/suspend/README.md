@@ -48,31 +48,22 @@ bash porting/venus/suspend/build.sh target/venus-suspend/network-suspend
 bash porting/venus/suspend/build.sh target/venus-suspend/network-suspend-probe --probe
 ```
 
-The build uses Android NDK 29's ARM64 API-30 compiler, official pinned
-Android 11 headers, and the VNDK30 shared libraries extracted from the existing
-Venus carrier cache. `ANDROID_NDK_HOME` and `VENUS_KM41_CACHE` override their
-locations. Headers download to `target/venus-suspend/headers`; their exact
-member contents are verified against `official-headers.json`. Gitiles archive
-timestamps vary, so compressed archive hashes are deliberately not used.
-`VENUS_SUSPEND_HEADERS` is an explicit local include-tree override intended for
-development; production builds use the verified default cache.
+The implementation is Rust in `crates/skyward-venus-runtime/src/suspend.rs`;
+the diagnostic client is `suspend_probe.rs`. `skyward-binder` sends and receives
+the Android 11 HIDL wire format directly, including single-direction release,
+local Binder object ownership, nested buffers, and the frozen AOSP hash chain.
+No C++ transport shim or VNDK shared-library dependency is built into the helper.
 
-Builds share an exclusive cache lock. The linker uses platform `std::__1`,
-not the NDK `std::__ndk1` ABI. Checks require the official suspend/HIDL/libc++
-dependencies and reject `libc++_shared.so` and NDK C++ symbols. Each output has
-an adjacent `.build.json` recording its hash, pinned header manifest, selected
-carrier path, linked-library hashes, and dynamic dependencies. Actual loader
-compatibility and HIDL registration still require device validation.
+The build uses the Android NDK linker and the Rust `aarch64-linux-android`
+target. `ANDROID_NDK_HOME` selects the NDK. Outputs are static ARM64 executables;
+each adjacent `.build.json` records source and ELF SHA-256 values. Recovery
+packaging deduplicates the service entrypoint against the Rust multicall binary.
+Actual HIDL registration and vendor interoperability still need device testing.
 
 ## Validation
 
-Host tests run the production lease and token-pool code with a fault-injectable
-kernel-operation model:
-
 ```sh
-g++ -std=c++17 -pthread -fsanitize=address,undefined -g \
-  porting/venus/suspend/test_locks.cpp -o /tmp/venus-suspend-test
-/tmp/venus-suspend-test
+cargo test -p skyward-venus-runtime suspend::
 ```
 
 They cover independent holders, repeated and concurrent release, destruction,

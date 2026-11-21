@@ -100,7 +100,7 @@ pub fn verify(
         .write(true)
         .create(true)
         .truncate(false)
-        .open("/tmp/skyward-km41-data.lock")?;
+        .open("/skyward/run/locks/data.lock")?;
     ensure!(
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
         "another data probe is running"

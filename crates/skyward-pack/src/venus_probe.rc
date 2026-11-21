@@ -1,11 +1,26 @@
 
 # Temporary venus entryfix: init itself marks progress, even if sh cannot run.
 on early-init
+    # Recovery-owned RAM must survive update-binary clearing /tmp. Mount
+    # once, before any probe, UI or HAL writes its runtime state.
+    mkdir /skyward/run 0755 root root
+    mount tmpfs tmpfs /skyward/run nosuid nodev mode=0755
+    mkdir /skyward/run/locks 0700 root root
+    mkdir /skyward/run/state 0700 root root
+    mkdir /skyward/run/logs 0700 root root
+    mkdir /skyward/run/tasks 0700 root root
+    mkdir /skyward/run/tmp 0700 root root
+    mkdir /skyward/run/hal 0700 root root
+    mkdir /skyward/run/hal/scratch 0700 root root
+    mkdir /skyward/run/crypto 0700 root root
+    mkdir /skyward/run/crypto/tmp 0700 root root
+    mkdir /skyward/run/install 0700 root root
+    install_keyring
     write /dev/kmsg "VENUS_PROBE_INIT_EARLY entryfix-v1"
 
 # USB is independent of both the diagnostic program and metadata logging.
 on post-fs
-    mkdir /tmp/skyward-probe 0700 root root
+    mkdir /skyward/run/logs/probe 0700 root root
     write /dev/kmsg "VENUS_PROBE_POST_FS entryfix-v1"
     start logd
     setprop sys.usb.config adb
@@ -16,7 +31,7 @@ on boot
     write /dev/kmsg "VENUS_PROBE_BOOT entryfix-v1"
     start recovery
 
-service venus_probe_logs /system/bin/sh /skyward/probe-logs.sh
+service venus_probe_logs /system/bin/skyward venus-helper probe-logs
     disabled
     user root
     group root

@@ -140,7 +140,7 @@ pub mod runtime {
     use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    const RAM: &str = "/tmp/skyward-basic";
+    const RAM: &str = "/skyward/run/logs/basic";
     const NOTICE: &str = "此功能仍在适配：暂不执行刷写、清除、解密或切换槽位";
 
     pub fn guard(config: &Path) -> Result<DeviceConfig> {
@@ -398,9 +398,9 @@ pub mod runtime {
         private_dir(&folder)?;
         if recovery {
             for (name, src) in [
-                ("ui.log", "/tmp/skyward-ui-probe/ui.log"),
-                ("probe.log", "/tmp/skyward-probe/probe.log"),
-                ("basic.log", "/tmp/skyward-basic/ui.log"),
+                ("ui.log", "/skyward/run/logs/ui-probe/ui.log"),
+                ("probe.log", "/skyward/run/logs/probe/probe.log"),
+                ("basic.log", "/skyward/run/logs/basic/ui.log"),
             ] {
                 match tail(Path::new(src), 2 * 1024 * 1024) {
                     Ok(data) => fs::write(folder.join(name), data)?,

@@ -124,7 +124,7 @@ pub fn run(config: &Path, seconds: u64, until_stopped: bool, basic_features: boo
             "install SIGINT handler"
         );
     }
-    fs::create_dir_all("/tmp/skyward-ui-probe")?;
+    fs::create_dir_all("/skyward/run/logs/ui-probe")?;
     let duration = limit.map_or_else(
         || "until-stopped".to_owned(),
         |d| format!("{}s", d.as_secs()),
@@ -211,7 +211,7 @@ pub fn run(config: &Path, seconds: u64, until_stopped: bool, basic_features: boo
             blanked = false;
             if first {
                 surface.settle()?;
-                fs::write("/tmp/skyward-ui-probe/first-frame.rgba", &canvas.data)?;
+                fs::write("/skyward/run/logs/ui-probe/first-frame.rgba", &canvas.data)?;
                 eprintln!(
                     "UI_PROBE_FIRST_FRAME_SETTLED {w}x{h} density={}",
                     cfg.display.density

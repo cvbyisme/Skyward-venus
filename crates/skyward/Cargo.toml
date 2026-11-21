@@ -9,6 +9,7 @@ name = "skyward"
 path = "src/main.rs"
 
 [dependencies]
+skyward-venus-runtime = { path = "../skyward-venus-runtime" }
 anyhow = { workspace = true }
 clap = { version = "4.5.51", features = ["derive"] }
 skyward-config = { path = "../skyward-config" }
@@ -21,6 +22,7 @@ skyward-sys = { path = "../skyward-sys" }
 skyward-lp = { path = "../skyward-lp" }
 
 [dev-dependencies]
+skyward-crypto = { path = "../skyward-crypto" }
 sha2 = "0.10.9"
 tempfile = "3.27.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }

@@ -6,7 +6,7 @@
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
-use anyhow::{bail, ensure, Result};
+use anyhow::{bail, ensure, Context, Result};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -114,6 +114,7 @@ pub struct Lock {
 impl Lock {
     pub const NONE: i32 = -1;
     pub const PATTERN: i32 = 1;
+    pub const PASSWORD_OR_PIN: i32 = 2;
     pub const PIN: i32 = 3;
     pub const PASSWORD: i32 = 4;
 
@@ -128,7 +129,7 @@ impl Lock {
         let upper = (field as u32 >> 16) as u16;
         ensure!(matches!(upper, 0 | 2 | 0xffff), "unsupported password-data header");
         let kind = i32::from(field as i16);
-        ensure!(matches!(kind, Self::NONE | Self::PATTERN | Self::PIN | Self::PASSWORD),
+        ensure!(matches!(kind, Self::NONE | Self::PATTERN | Self::PASSWORD_OR_PIN | Self::PIN | Self::PASSWORD),
             "unsupported credential type");
         let cost = [record.u8()?, record.u8()?, record.u8()?];
         let salt = record.counted()?.to_vec();
@@ -145,8 +146,17 @@ impl Lock {
         let (n, r, p) = (1u64 << log_n, 1u64 << log_r, 1u64 << log_p);
         ensure!(128 * n * r <= 64 * 1024 * 1024 && n * r * p <= 16 * 1024 * 1024,
             "credential stretching exceeds bounded memory/work limits");
-        let cost = scrypt::Params::new(log_n, r as u32, p as u32, STRETCHED_BYTES)
-            .map_err(|e| anyhow::anyhow!("the phone asks for stretching this code cannot do: {e}"))?;
+        self.stretched_recovery(credential)
+    }
+
+    /// Decrypt.cpp::Get_Password_Token uses the recorded scrypt parameters.
+    /// Recovery accepts valid Android costs beyond the diagnostic cap.
+    pub fn stretched_recovery(&self, credential: &[u8]) -> Result<Vec<u8>> {
+        let [log_n, log_r, log_p] = self.cost;
+        let r = 1u32.checked_shl(u32::from(log_r)).context("invalid scrypt r exponent")?;
+        let p = 1u32.checked_shl(u32::from(log_p)).context("invalid scrypt p exponent")?;
+        let cost = scrypt::Params::new(log_n, r, p, STRETCHED_BYTES)
+            .map_err(|e| anyhow::anyhow!("invalid recorded scrypt parameters: {e}"))?;
         let mut out = vec![0u8; STRETCHED_BYTES];
         scrypt::scrypt(credential, &self.salt, &cost, &mut out).map_err(|e| anyhow::anyhow!("stretch the credential: {e}"))?;
         Ok(out)

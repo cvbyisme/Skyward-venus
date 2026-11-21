@@ -19,7 +19,7 @@ import tempfile
 import warnings
 
 ROOT = Path(__file__).resolve().parents[2]
-REMOTE = "/tmp/skyward-ce-stage/skyward"
+REMOTE = "/skyward/run/hal/stage-ce/skyward"
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 PREFLIGHT = re.compile(r"^VENUS_CE_PREFLIGHT_OK user=0 credential=(pin|password|pattern|none) input_supported=(true|false) storage_unlocked=(true|false) source_files_unchanged=true$", re.M)
 
@@ -139,7 +139,7 @@ class Device:
         return value
 
     def session(self) -> str:
-        return self.checked("shell", "cat /tmp/skyward-km41-data-session.txt")
+        return self.checked("shell", "cat /skyward/run/state/data-ro.txt")
 
 
 def verify_assets(out: Path) -> None:
@@ -147,7 +147,7 @@ def verify_assets(out: Path) -> None:
     for line in (out / "ASSETS.sha256").read_text().splitlines():
         digest, path = line.split(maxsplit=1)
         entries[path.lstrip("*")] = digest
-    for name in ("skyward", "ce-runtime.sh", "km41-rpmb"):
+    for name in ("skyward", "ce-runtime", "km41-rpmb"):
         relative = "assets/" + name
         if relative not in entries:
             raise RuntimeError("CE assets have not been built")
@@ -200,7 +200,7 @@ def main() -> int:
         raise RuntimeError("Unexpected CE build path")
     verify_assets(out)
     device = Device(os.environ.get("ANDROID_SERIAL", "535e451a"))
-    device.checked("shell", 'test "$(id -u)" = 0 && grep -q "^venus-entryfix-v1$" /skyward/probe-entryfix.txt && ! grep -q " /data " /proc/mounts && test -f /tmp/skyward-km41-data-session.txt')
+    device.checked("shell", 'test "$(id -u)" = 0 && grep -q "^venus-entryfix-v1$" /skyward/probe-entryfix.txt && ! grep -q " /data " /proc/mounts && test -f /skyward/run/state/data-ro.txt')
     before = device.boot()
     session = device.session()
     log = Path(tempfile.mkdtemp(prefix="ce-local.", dir=ROOT.parent / "venus_dump"))
@@ -209,15 +209,15 @@ def main() -> int:
     transport = device.verify_transport()
     (log / "transport.json").write_text(json.dumps(transport, indent=2) + "\n")
     print("VENUS_CE_TRANSPORT_OK shell_v2=true stdin_tty=false binary_stdin=true eof=true exit_status=true")
-    device.checked("shell", "mkdir -p /tmp/skyward-ce-stage; chmod 0700 /tmp/skyward-ce-stage")
-    for name in ("skyward", "ce-runtime.sh", "km41-rpmb"):
-        device.checked("push", str(out / "assets" / name), f"/tmp/skyward-ce-stage/{name}.new")
-        device.checked("shell", f"chmod 0700 /tmp/skyward-ce-stage/{name}.new; mv /tmp/skyward-ce-stage/{name}.new /tmp/skyward-ce-stage/{name}")
+    device.checked("shell", "mkdir -p /skyward/run/hal/stage-ce; chmod 0700 /skyward/run/hal/stage-ce")
+    for name in ("skyward", "ce-runtime", "km41-rpmb"):
+        device.checked("push", str(out / "assets" / name), f"/skyward/run/hal/stage-ce/{name}.new")
+        device.checked("shell", f"chmod 0700 /skyward/run/hal/stage-ce/{name}.new; mv /skyward/run/hal/stage-ce/{name}.new /skyward/run/hal/stage-ce/{name}")
         expected = hashlib.sha256((out / "assets" / name).read_bytes()).hexdigest()
-        actual = device.checked("shell", f"sha256sum /tmp/skyward-ce-stage/{name}").split()[0]
+        actual = device.checked("shell", f"sha256sum /skyward/run/hal/stage-ce/{name}").split()[0]
         if expected != actual:
             raise RuntimeError("Deployed CE asset checksum mismatch")
-    runtime = device.checked("shell", "sh /tmp/skyward-ce-stage/ce-runtime.sh", timeout=50)
+    runtime = device.checked("shell", "/skyward/run/hal/stage-ce/ce-runtime", timeout=50)
     (log / "runtime.txt").write_text(runtime)
     print(runtime, end="")
     query = device.raw(remote_command(False), timeout=45)

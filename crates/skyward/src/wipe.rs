@@ -292,7 +292,9 @@ impl Parts {
     pub fn carry_out(self, tell: &mut dyn FnMut(Event)) -> Result<(), Stop> {
         let in_data = self.steps.iter().any(|&s| s != Step::Cache);
         if in_data && !mount::is_mount_point(Path::new(DATA)).map_err(|e| Stop::Closed(format!("{e:#}")))? {
-            let opening = crate::decrypt::with_key_service(data::open_without_credential).map_err(Stop::Closed)?;
+            let opening = if crate::venus_rw::enabled() {
+                crate::venus_rw::open().map_err(|e| Stop::Closed(format!("{e:#}")))?
+            } else { crate::decrypt::with_key_service(data::open_without_credential).map_err(Stop::Closed)? };
             tell(Event::Opened(opening));
         }
         let users = Users::of_the_phone();
@@ -524,6 +526,9 @@ fn casefolds(entry: &Entry) -> bool {
 /// mounted from it ends, the terminal's shell among them, and the partition
 /// is closed.
 pub fn release_data() -> Result<()> {
+    if crate::venus_rw::enabled() {
+        return crate::venus_rw::release_for_maintenance();
+    }
     let at = Path::new(DATA);
     if mount::is_mount_point(at)? {
         let device = mount::visible(at)?.with_context(|| format!("nothing shows at {DATA}"))?.device;

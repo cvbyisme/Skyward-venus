@@ -119,7 +119,7 @@ mod tests {
         assert_eq!(tap(&mut app, &f, &i, Action::CheckUpdate), vec![Effect::CheckUpdate]);
         assert_eq!(app.state.check, Check::Asking);
         app.update_checked(Ok(Some(newest())), Have::Nothing);
-        app.state.data = Data::Locked { user: 0, keys: Keys::Digits, checking: false };
+        app.state.data = Data::Locked { user: 0, keys: Keys::Digits, checking: false, storage_ready: false };
         app.refresh();
         assert!(tap(&mut app, &f, &i, Action::Download).is_empty());
         assert_eq!(app.screen(), Screen::Decrypt, "the package goes to internal storage, which opens with the owner's files");

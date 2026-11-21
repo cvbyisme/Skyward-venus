@@ -1,3 +1,19 @@
+# Rust implementation and interface provenance
+
+The service and diagnostic sources are now implemented in
+`crates/skyward-venus-runtime`; Binder transport is in `crates/skyward-binder`.
+The production implementation does not compile C/C++ or load VNDK transport
+libraries. The historical pinned header manifests below are retained as
+interface reference data. No vendor implementation is copied into Rust.
+
+Frozen interface names, method ordering, transaction semantics and hash chains
+were checked against the Android 11 contracts:
+
+- [System interfaces and frozen hashes](https://android.googlesource.com/platform/system/hardware/interfaces/+/refs/tags/android-11.0.0_r48/)
+- [HIDL IBase and frozen hashes](https://android.googlesource.com/platform/system/libhidl/+/refs/tags/android-11.0.0_r48/transport/)
+
+The rest of this document records the prior build input provenance for audit.
+
 # Source and license provenance
 
 The bridge and host tests are new code in this directory, identified with

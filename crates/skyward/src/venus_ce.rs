@@ -45,7 +45,7 @@ fn guard() -> Result<fs::File> {
         .write(true)
         .create(true)
         .truncate(false)
-        .open("/tmp/skyward-km41-data.lock")?;
+        .open("/skyward/run/locks/data.lock")?;
     ensure!(
         unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
         "another Data/CE operation is running"
@@ -80,7 +80,7 @@ fn guard() -> Result<fs::File> {
         "retained Data identity changed"
     );
     // All disposable SQL copies must stay in tmpfs, never under userdata.
-    let p = std::ffi::CString::new("/tmp").unwrap();
+    let p = std::ffi::CString::new("/skyward/run/crypto/tmp").unwrap();
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     ensure!(
         unsafe { libc::statfs(p.as_ptr(), &mut st) } == 0 && st.f_type as u64 == 0x01021994,
@@ -131,7 +131,7 @@ pub fn run(unlock_stdin: bool, accept_check: bool) -> Result<()> {
     println!(
         "GATEKEEPER_HIDL_READY interface=android.hardware.gatekeeper@1.0::IGatekeeper credential_submitted=false"
     );
-    let profile = Profile::load(Path::new(MOUNT), Path::new("/tmp"))
+    let profile = Profile::load(Path::new(MOUNT), Path::new("/skyward/run/crypto/tmp"))
         .context("read owner CE protector and wrapped-key layout")?;
     if let Some(l) = &profile.lock {
         let sid = u64::from_le_bytes(l.enrolled[1..9].try_into()?);

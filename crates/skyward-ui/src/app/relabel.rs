@@ -58,7 +58,7 @@ mod tests {
         assert_eq!(app.screen(), Screen::Relabel);
         assert!(swipe(&mut app, &f, &i, Confirm::Relabel).is_empty());
         assert_eq!(toast(&app), Some("请先在「解密」中打开 data 分区"));
-        app.state.data = Data::Locked { user: 0, keys: Keys::Digits, checking: false };
+        app.state.data = Data::Locked { user: 0, keys: Keys::Digits, checking: false, storage_ready: false };
         app.refresh();
         assert_eq!(swipe(&mut app, &f, &i, Confirm::Relabel), vec![Effect::Relabel], "open, though a user has yet to unlock");
         app.state.data = Data::Open;

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const HOME: &str = "/tmp/skyward-modem";
+const HOME: &str = "/skyward/run/state/modem";
 const COMMAND: &str = "skyward.modem.command";
 const IFACE: &str = "rmnet_data0";
 const SUSPEND: &str = "android.system.suspend@1.0::ISystemSuspend";
@@ -122,7 +122,7 @@ fn stop_child(child:&mut Option<Child>, timeout:Duration)->Result<()> {
 
 fn nv_lock()->Result<File> {
     let f=OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW|libc::O_CLOEXEC).open("/tmp/skyward-modem-nv.lock")?;
+        .custom_flags(libc::O_NOFOLLOW|libc::O_CLOEXEC).open("/skyward/run/state/modem-nv.lock")?;
     ensure!(unsafe{libc::flock(f.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}==0,"modem or EFS work still owns the radio storage");
     Ok(f)
 }
@@ -298,7 +298,7 @@ impl Runtime {
     fn prepare(&mut self)->Result<()> {
         let log=OpenOptions::new().write(true).create(true).truncate(true).mode(0o600)
             .custom_flags(libc::O_NOFOLLOW|libc::O_CLOEXEC).open(Path::new(HOME).join("prepare.log"))?;
-        self.prep=Some(Command::new("/system/bin/sh").arg("/skyward/runtime/modem-prepare.sh")
+        self.prep=Some(Command::new("/skyward/runtime/modem-prepare")
             .stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log).spawn()?);
         let until=Instant::now()+Duration::from_secs(60);
         loop {
@@ -318,7 +318,7 @@ impl Runtime {
     }
 
     fn holder_ready(&self)->Result<bool> {
-        let path=Path::new("/tmp/venus-modem-held.ready");
+        let path=Path::new("/skyward/run/state/modem-held.ready");
         let meta=match fs::symlink_metadata(path) {
             Ok(m)=>m,Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(false),Err(e)=>return Err(e.into()),
         };
