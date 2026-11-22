@@ -96,8 +96,12 @@ jobs:
                 --font resources/fonts/MiSansVF.ttf
                 --mono resources/fonts/KirkMono-Regular.ttf
                 --mono-license resources/fonts/KirkMono-OFL.txt)
+          # No installer capsule: the capsule is derived from the normal-Android
+          # entry, which needs the stock image's own legacy Keymaster service,
+          # and a third-party carrier does not carry one. It comes back as soon
+          # as this is built on a stock boot dump instead.
           FULL=(--venus-probe --venus-ui --venus-basic
-                --venus-recovery-assets venus/assets --venus-install-capsule)
+                --venus-recovery-assets venus/assets)
           mkdir -p venus/out/temporary venus/out/standalone
           # The whole partition, flashed as it is.
           target/release/skyward-pack "${ARGS[@]}" "${FULL[@]}" --out venus/out/temporary/boot.img

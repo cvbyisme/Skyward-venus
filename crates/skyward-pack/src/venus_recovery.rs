@@ -211,19 +211,26 @@ pub fn prepare(
         // The old service has no `disabled` or `oneshot` and init respawns it
         // forever. Replacing only in the temporary Recovery leaves the normal
         // system boot contract unchanged. Refuse unexpected source content.
-        let legacy = std::str::from_utf8(
-            &rd.find(LEGACY_WAIT_RC)
-                .context("legacy Keymaster init service missing")?
-                .data,
-        )?;
-        ensure!(
-            legacy.lines().next()
-                == Some("service wait_for_keymaster /system/bin/wait_for_keymaster")
-                && !legacy.contains("override")
-                && !legacy.contains("on boot"),
-            "unexpected legacy Keymaster service definition"
-        );
-        rd.replace(LEGACY_WAIT_RC, LEGACY_WAIT_DISABLED.as_bytes().to_vec())?;
+        //
+        // A carrier that declares no such service at all (a third-party
+        // recovery image, for one) has nothing that could respawn, so there is
+        // nothing to take away and nothing to refuse.
+        match rd.find(LEGACY_WAIT_RC) {
+            Some(entry) => {
+                let legacy = std::str::from_utf8(&entry.data)?;
+                ensure!(
+                    legacy.lines().next()
+                        == Some("service wait_for_keymaster /system/bin/wait_for_keymaster")
+                        && !legacy.contains("override")
+                        && !legacy.contains("on boot"),
+                    "unexpected legacy Keymaster service definition"
+                );
+                rd.replace(LEGACY_WAIT_RC, LEGACY_WAIT_DISABLED.as_bytes().to_vec())?;
+            }
+            None => eprintln!(
+                "VENUS_RECOVERY_NO_LEGACY_WAIT the carrier declares no legacy Keymaster service"
+            ),
+        }
     }
     rd.add(
         "skyward/venus-recovery.txt",
