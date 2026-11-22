@@ -118,7 +118,9 @@ pub fn prepare(
                     || entry.name.starts_with("system/bin/")
                     || entry.name.starts_with("system/etc/")
                     || entry.name == "file_contexts"),
-            "invalid crypto asset"
+            "invalid crypto asset {} mode={:#o}",
+            entry.name,
+            entry.mode
         );
         rd.add(
             &format!("skyward/crypto-runtime/{}", entry.name),
