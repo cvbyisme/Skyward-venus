@@ -15,7 +15,13 @@ scripts pin. It writes everything the packer asks for except the Rust helpers
 makes that from the stock recovery, so it matches the stock image it is laid
 on).
 
-usage: restore-upstream-assets.py IMAGE OUT_DIR
+The recovery policy is taken out of the same image. It replaces the stock
+recovery's policy whole, so what the packer checks it against is the SHA-256
+of the stock policy it was built for: that is computed here from the stock
+boot image, which keeps the packer from laying the policy on a carrier it was
+not built for.
+
+usage: restore-upstream-assets.py IMAGE STOCK_BOOT OUT_DIR
 """
 
 import gzip
@@ -117,12 +123,13 @@ def newc(entries):
 
 
 def main():
-    if len(sys.argv) != 3:
+    if len(sys.argv) != 4:
         fail(__doc__)
-    image, out_dir = sys.argv[1], sys.argv[2]
+    image, stock, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
     os.makedirs(out_dir, exist_ok=True)
     with tempfile.TemporaryDirectory() as workdir:
         cpio = unpack(boot_ramdisk(image), workdir)
+        stock_cpio = unpack(boot_ramdisk(stock), workdir)
     table = {n: (m, s, a) for n, m, s, a in walk(cpio)}
     print(f'{image}: {len(table)} ramdisk entries')
 
@@ -140,6 +147,24 @@ def main():
         with open(os.path.join(out_dir, short), 'wb') as f:
             f.write(data)
         print(f'took {short}: {size} bytes')
+
+    if 'sepolicy' not in table:
+        fail(f'{image} holds no recovery policy')
+    mode, size, at = table['sepolicy']
+    policy = cpio[at:at + size]
+    if struct.unpack_from('<I', policy)[0] != 0xf97cff8c:
+        fail('the policy in the image is not an SELinux policy')
+    with open(os.path.join(out_dir, 'recovery-sepolicy'), 'wb') as f:
+        f.write(policy)
+    stock_table = {n: (m, s2, a) for n, m, s2, a in walk(stock_cpio)}
+    if 'sepolicy' not in stock_table:
+        fail(f'{stock} holds no policy to lay this one on')
+    mode, size, at = stock_table['sepolicy']
+    stock_policy = stock_cpio[at:at + size]
+    with open(os.path.join(out_dir, 'recovery-sepolicy.source.sha256'), 'w') as f:
+        f.write(hashlib.sha256(stock_policy).hexdigest() + '\n')
+    print(f'took recovery-sepolicy: {len(policy)} bytes, for the stock policy '
+          f'{hashlib.sha256(stock_policy).hexdigest()[:16]}...')
 
     if CRYPTO_SOURCE not in table:
         fail(f'{image} holds no {CRYPTO_SOURCE}')

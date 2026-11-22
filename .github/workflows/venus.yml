@@ -70,17 +70,11 @@ jobs:
           curl -fsSL --retry 3 -o venus/upstream/skyward-rec.img "$UPSTREAM_IMAGE"
           sha256sum venus/stock/boot_a.img venus/upstream/skyward-rec.img
 
-      - name: Take the runtime assets out of a built venus Recovery
-        run: python3 porting/venus/restore-upstream-assets.py venus/upstream/skyward-rec.img venus/assets
+      - name: Take the runtime assets and the policy out of a built venus Recovery
+        run: python3 porting/venus/restore-upstream-assets.py venus/upstream/skyward-rec.img venus/stock/boot_a.img venus/assets
 
-      # The policy has to be built from the stock recovery this image is laid
-      # on, which is why it is not one of the assets taken from the upstream
-      # image: the packer refuses a policy built for another carrier.
-      - name: Build the crypto policy for that stock recovery
-        run: |
-          python3 porting/venus/prepare-crypto-policy.py venus/stock/boot_a.img venus/policy \
-            --checkpolicy "$(command -v checkpolicy)" --secilc "$(command -v secilc)"
-          cp -p venus/policy/recovery-sepolicy venus/policy/recovery-sepolicy.source.sha256 venus/assets/
+      # The policy comes out of the same image: it replaces the stock one
+      # whole, and the script checks it against the stock policy it is laid on.
 
       - name: Build the helpers the phone runs
         run: bash porting/venus/build-runtime.sh venus/assets
