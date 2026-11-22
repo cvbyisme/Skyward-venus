@@ -509,15 +509,15 @@ mod runtime {
         // Only an encrypted session talks to Keymaster: plaintext Data has no
         // key to unwrap, so a service that is not up must not stop it from
         // being mounted.
-        let mut hardware = None;
-        let mut keymaster = None;
-        // The binder handle has to outlive the keystore that borrows it, so it
-        // is bound here rather than inside the call.
+        // The keystore borrows the binder, so the binder is declared first and
+        // dropped last; both are opened only for an encrypted session.
         let binder = if plain {
             None
         } else {
             Some(Binder::recovery_crypto()?)
         };
+        let mut hardware = None;
+        let mut keymaster = None;
         if let Some(binder) = binder.as_ref() {
             hardware = Some(Binder::hardware()?);
             keymaster = Some(Keystore::open(binder)?);

@@ -2905,7 +2905,7 @@ impl Pages<'_> {
                     (c.user, keys)
                 });
                 let auto = self.app.state.auto_decrypt.then(|| self.app.state.saved_lock.clone()).flatten().zip(waiting.filter(|(user, _)| *user == 0));
-                if let Some(((credential), (user, keys))) = auto {
+                if let Some((credential, (user, keys))) = auto {
                     self.app.data_waiting_storage(Some((user, keys)), !self.closed.iter().any(|c| c.user == 0));
                     if let Data::Locked { checking, .. } = &mut self.app.state.data {
                         *checking = true;
