@@ -1315,18 +1315,43 @@ mod tests {
             source: (259, 18),
             mapped: (253, 5),
             mount_id: 184,
+            plain: false,
         };
         assert_eq!(Session::decode(&s.encode()).unwrap(), s);
         assert!(
             Session::decode(
                 &s.encode()
-                    .replace("venus-rw-session-v1", "venus-readonly-data-session-v1")
+                    .replace("venus-rw-session-v2", "venus-readonly-data-session-v2")
             )
             .is_err()
         );
         assert!(Session::decode(&(s.encode() + "extra\n")).is_err());
         assert!(Session::decode(&s.encode().replace("mount_id=184", "mount_id=0")).is_err());
         assert!(Session::decode(&s.encode().replace("source=259:18", "source=0:18")).is_err());
+    }
+    #[test]
+    fn a_receipt_from_before_unencrypted_data_still_reads() {
+        // Session receipts are left on a partition that outlives the image, so
+        // a v1 one has to keep its meaning: it always described a mapping.
+        let v1 = "venus-rw-session-v1\nboot=4a23f017-b8b0-4d24-a124-506701f455d8\nsource=259:18\nmapped=253:5\nmount_id=184\n";
+        let s = Session::decode(v1).unwrap();
+        assert!(!s.plain);
+        assert_eq!(s.mapped, (253, 5));
+    }
+    #[test]
+    fn unencrypted_userdata_is_mounted_without_a_policy() {
+        let mut e = entry();
+        e.extras.retain(|x| {
+            !x.starts_with("fileencryption=")
+                && !x.starts_with("metadata_encryption=")
+                && !x.starts_with("keydirectory=")
+        });
+        assert!(!encrypted(&e));
+        let opts = options(&e).unwrap();
+        assert!(opts.contains(&"rw".into()));
+        // The same entry with a policy is still held to it.
+        assert!(encrypted(&entry()));
+        assert!(options(&entry()).is_ok());
     }
     #[test]
     fn unsafe_reserve_option_refused() {
