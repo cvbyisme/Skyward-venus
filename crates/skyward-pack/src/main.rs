@@ -55,6 +55,12 @@ enum Cmd {
         /// phone or a full update package holds it, ending in its AVB footer.
         #[arg(long)]
         stock: PathBuf,
+        /// Build on another recovery's ramdisk instead of a stock one: the
+        /// trees that recovery adds (TWRP's, for one) are kept as they are.
+        /// Only what builds a venus Recovery on a third-party carrier passes
+        /// this, where no stock boot dump is at hand.
+        #[arg(long)]
+        stock_third_party: bool,
         /// AVB target: dedicated recovery or Recovery-as-Boot.
         #[arg(long, default_value = "recovery")]
         partition: String,
@@ -203,6 +209,7 @@ fn main() -> Result<()> {
         }
         Cmd::Recovery {
             stock,
+            stock_third_party,
             partition,
             binary,
             system_init,
@@ -291,11 +298,12 @@ fn main() -> Result<()> {
                 Vec::new()
             };
             // A stock recovery ramdisk has no third-party tree; refuse to build
-            // on top of another custom recovery.
-            if let Some(e) = rd
-                .entries
-                .iter()
-                .find(|e| e.name == "FFiles" || e.name.starts_with("twres"))
+            // on top of another custom recovery unless it was asked for.
+            if !stock_third_party
+                && let Some(e) = rd
+                    .entries
+                    .iter()
+                    .find(|e| e.name == "FFiles" || e.name.starts_with("twres"))
             {
                 anyhow::bail!(
                     "{} holds {}, which is not a stock recovery",

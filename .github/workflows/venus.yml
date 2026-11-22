@@ -90,7 +90,9 @@ jobs:
 
       - name: Pack it
         run: |
-          ARGS=(recovery --partition boot --stock venus/stock/boot_a.img
+          # The published stock is a third-party (TWRP) boot dump, which this
+          # fork's archived port used for the same phone: its trees are kept.
+          ARGS=(recovery --partition boot --stock-third-party --stock venus/stock/boot_a.img
                 --binary venus/assets/skyward --system-init venus/assets/system-init
                 --config devices/venus.toml
                 --font resources/fonts/MiSansVF.ttf
