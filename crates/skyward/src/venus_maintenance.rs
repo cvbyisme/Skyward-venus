@@ -25,23 +25,23 @@ fn kernel_values(text: &str, key: &str, bootconfig: bool) -> Result<Vec<String>>
     let mut values = Vec::new();
     if bootconfig {
         for line in text.lines() {
-            if let Some((name, value)) = line.split_once('=') {
-                if name.trim() == key {
-                    let value = value.trim().trim_end_matches(';').trim();
-                    let value = if value.starts_with('"') {
-                        value
-                            .strip_prefix('"')
-                            .and_then(|s| s.strip_suffix('"'))
-                            .context("malformed quoted boot evidence")?
-                    } else {
-                        value
-                    };
-                    ensure!(
-                        !value.contains(['"', ',', '\n', ' ']),
-                        "ambiguous boot evidence"
-                    );
-                    values.push(value.into());
-                }
+            if let Some((name, value)) = line.split_once('=')
+                && name.trim() == key
+            {
+                let value = value.trim().trim_end_matches(';').trim();
+                let value = if value.starts_with('"') {
+                    value
+                        .strip_prefix('"')
+                        .and_then(|s| s.strip_suffix('"'))
+                        .context("malformed quoted boot evidence")?
+                } else {
+                    value
+                };
+                ensure!(
+                    !value.contains(['"', ',', '\n', ' ']),
+                    "ambiguous boot evidence"
+                );
+                values.push(value.into());
             }
         }
     } else {

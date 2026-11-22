@@ -13,10 +13,10 @@ fn publish_staged(root: &std::path::Path, build: impl FnOnce(&std::path::Path) -
     struct Staging(std::path::PathBuf);
     impl Drop for Staging {
         fn drop(&mut self) {
-            if let Err(error) = fs::remove_dir_all(&self.0) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("release WLAN firmware staging: {error}");
-                }
+            if let Err(error) = fs::remove_dir_all(&self.0)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!("release WLAN firmware staging: {error}");
             }
         }
     }

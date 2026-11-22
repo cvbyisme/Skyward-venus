@@ -485,6 +485,7 @@ fn needs_maintenance_lease(command: &Cmd) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod maintenance_command_tests {
     use super::*;
 

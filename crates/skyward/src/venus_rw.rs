@@ -7,6 +7,9 @@ use skyward_block::fstab::Entry;
 #[allow(dead_code)]
 pub const MARKER: &str = "venus-recovery-rw-v1\n";
 pub const MOUNT: &str = "/data";
+/// Named only by the phone-side session, so a build for the computer does not
+/// define it at all.
+#[cfg(target_os = "android")]
 pub const MAPPING: &str = "userdata";
 #[cfg(target_os = "android")]
 const RECORD: &str = "/skyward/run/state/data-rw.txt";
