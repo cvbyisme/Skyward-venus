@@ -508,9 +508,16 @@ mod runtime {
         // being mounted.
         let mut hardware = None;
         let mut keymaster = None;
-        if !plain {
+        // The binder handle has to outlive the keystore that borrows it, so it
+        // is bound here rather than inside the call.
+        let binder = if plain {
+            None
+        } else {
+            Some(Binder::recovery_crypto()?)
+        };
+        if let Some(binder) = binder.as_ref() {
             hardware = Some(Binder::hardware()?);
-            keymaster = Some(Keystore::open(&Binder::recovery_crypto()?)?);
+            keymaster = Some(Keystore::open(binder)?);
         }
         let mounted = if Path::new(RECORD).exists() {
             verify()?;
