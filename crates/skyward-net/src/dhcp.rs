@@ -219,8 +219,10 @@ mod client {
                     Ok((n, from)) => {
                         if stop.load(Ordering::Relaxed) { bail!(crate::Stopped); }
                         if from.port() != to.port() { continue; }
-                        if let Some(r) = reply(&buf[..n], xid, mac) {
-                            if accepts(&r) { return Ok(Some(r)); }
+                        if let Some(r) = reply(&buf[..n], xid, mac)
+                            && accepts(&r)
+                        {
+                            return Ok(Some(r));
                         }
                     }
                     Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted) => {}

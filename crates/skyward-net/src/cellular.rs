@@ -77,12 +77,12 @@ pub fn mobile() -> Result<crate::mobile::Mobile> {
             3 => {
                 mobile.network = read(qrtr::status(endpoint,qmi::StatusRequest::ServingSystem,qmi::serving_system),"network registration",&mut issues);
                 mobile.signals = read(qrtr::status(endpoint,qmi::StatusRequest::Signal,qmi::signal),"signal strength",&mut issues).unwrap_or_default();
-                if let Some(current) = mobile.network.as_mut().and_then(|n| n.plmn.as_mut()).filter(|p| p.description.is_empty()) {
-                    if let Some(home) = read(qrtr::status(endpoint,qmi::StatusRequest::HomeNetwork,qmi::home_network),"operator name",&mut issues) {
-                        // A home operator is not the serving operator while
-                        // roaming. Fill only the very same reported PLMN.
-                        if (current.mcc,current.mnc) == (home.mcc,home.mnc) { current.description=home.description; }
-                    }
+                if let Some(current) = mobile.network.as_mut().and_then(|n| n.plmn.as_mut()).filter(|p| p.description.is_empty())
+                    && let Some(home) = read(qrtr::status(endpoint,qmi::StatusRequest::HomeNetwork,qmi::home_network),"operator name",&mut issues)
+                {
+                    // A home operator is not the serving operator while
+                    // roaming. Fill only the very same reported PLMN.
+                    if (current.mcc,current.mnc) == (home.mcc,home.mnc) { current.description=home.description; }
                 }
             },
             _ => unreachable!(),
