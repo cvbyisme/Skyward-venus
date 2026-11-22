@@ -160,7 +160,84 @@ impl Power {
 }
 
 pub fn power(target: Power) -> Result<()> {
-    set_prop("sys.powerctl", target.command())
+    match target {
+        Power::System | Power::Recovery => restart(target),
+        _ => set_prop("sys.powerctl", target.command()),
+    }
+}
+
+/// How long a restart into the system or the recovery waits for the kernel
+/// to take it before the kernel is told at once.
+#[cfg(target_os = "android")]
+const RESTART_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ask the kernel for a restart into `target` without going through init.
+///
+/// Through `sys.powerctl` init stops the services and unmounts before it
+/// restarts, and on this phone that is where the restart stops: the recovery
+/// owns the secure world's services, each in a mount namespace of its own
+/// with the data partition's mappings still open, and a stop that does not
+/// finish leaves the screen dark and the phone waiting for a held power
+/// button. What is on disc is synced from a thread of its own, so a sync that
+/// blocks holds nothing up; the kernel is then asked to restart while the
+/// recovery is still running, and if that has not happened in
+/// [`RESTART_WAIT`] the kernel is told to restart at once. Nothing is
+/// unmounted here: the kernel closes what it holds when it restarts.
+fn restart(target: Power) -> Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        say_of_restart(target);
+        let name = match target {
+            Power::Recovery => "recovery",
+            _ => "",
+        };
+        let argument = std::ffi::CString::new(name).expect("no NUL in a restart target");
+        // The countdown runs before the restart is asked for, so a kernel
+        // that holds the restart up is still told at once after a while.
+        std::thread::spawn(|| {
+            std::thread::sleep(RESTART_WAIT);
+            let _ = std::fs::write("/proc/sysrq-trigger", "b");
+        });
+        std::thread::spawn(|| unsafe { libc::sync() });
+        let asked = unsafe {
+            libc::syscall(
+                libc::SYS_reboot,
+                libc::LINUX_REBOOT_MAGIC1,
+                libc::LINUX_REBOOT_MAGIC2,
+                libc::LINUX_REBOOT_CMD_RESTART2,
+                argument.as_ptr(),
+            )
+        };
+        if asked != 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = kmsg(&format!("the kernel would not restart: {error}; asking init instead"));
+            return set_prop("sys.powerctl", target.command());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        set_prop("sys.powerctl", target.command())
+    }
+}
+
+/// What the restart was asked for and what still holds the phone when it was:
+/// written before the kernel is asked, so a restart that stops short leaves a
+/// line saying what was open.
+#[cfg(target_os = "android")]
+fn say_of_restart(target: Power) {
+    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    let held = |point: &str| mounts.lines().any(|line| line.split_whitespace().nth(1) == Some(point));
+    let services = std::fs::read_dir("/skyward/run/hal").map(|dir| dir.flatten().count()).unwrap_or(0);
+    let mapped = std::fs::read_to_string("/proc/modules").map(|text| text.lines().count()).unwrap_or(0);
+    let _ = kmsg(&format!(
+        "restart into {} asked for: data={} metadata={} sdcard={} hal_services={} modules={mapped}",
+        target.command(),
+        held("/data"),
+        held("/metadata"),
+        held("/sdcard"),
+        services
+    ));
 }
 
 /// The folder the recovery service keeps what it makes for itself in, for

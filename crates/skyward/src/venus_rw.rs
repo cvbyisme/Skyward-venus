@@ -65,17 +65,29 @@ fn mount_metadata(mut attempt: impl FnMut() -> Result<()>, mut pause: impl FnMut
     attempt()
 }
 
+/// Whether the installed fstab promises encrypted userdata. HyperOS images
+/// of this phone can be installed with userdata that is not encrypted at all:
+/// there is then no `fileencryption`, no `metadata_encryption`, no key
+/// directory, and nothing to unwrap.
+/// (From the standalone venus port, GPL-3.0, same fork family.)
+fn encrypted(entry: &Entry) -> bool {
+    entry.extra("fileencryption").is_some() || entry.extra("metadata_encryption").is_some()
+}
 fn options(entry: &Entry) -> Result<Vec<String>> {
     ensure!(
         entry.mount_point == MOUNT && matches!(entry.filesystem.as_str(), "f2fs" | "ext4"),
         "expected an installed userdata filesystem"
     );
-    skyward_crypto::encryption::Encryption::of(entry)?;
-    skyward_crypto::encryption::key_dir(entry)?;
-    ensure!(
-        entry.extra("fileencryption").is_some(),
-        "missing file encryption policy"
-    );
+    // Only an encrypted entry names a policy and a key directory; an
+    // unencrypted one legitimately names neither.
+    if encrypted(entry) {
+        skyward_crypto::encryption::Encryption::of(entry)?;
+        skyward_crypto::encryption::key_dir(entry)?;
+        ensure!(
+            entry.extra("fileencryption").is_some(),
+            "missing file encryption policy"
+        );
+    }
     // Preserve the effective additional-fstab options, including its fsync
     // mode. Do not replace them with the old diagnostic/posix option set.
     ensure!(
@@ -99,21 +111,33 @@ fn options(entry: &Entry) -> Result<Vec<String>> {
 struct Session {
     boot: String,
     source: (u32, u32),
+    /// The device the filesystem was mounted from: the mapping of an
+    /// encrypted session, the partition itself when it carries plaintext.
     mapped: (u32, u32),
     mount_id: i32,
+    /// True when userdata is not encrypted, so there is no mapping to remove
+    /// when the session is closed.
+    plain: bool,
 }
 impl Session {
     fn encode(&self) -> String {
         format!(
-            "venus-rw-session-v1\nboot={}\nsource={}:{}\nmapped={}:{}\nmount_id={}\n",
-            self.boot, self.source.0, self.source.1, self.mapped.0, self.mapped.1, self.mount_id
+            "venus-rw-session-v2\nboot={}\nsource={}:{}\nmapped={}:{}\nmount_id={}\nplain={}\n",
+            self.boot,
+            self.source.0,
+            self.source.1,
+            self.mapped.0,
+            self.mapped.1,
+            self.mount_id,
+            self.plain as u8
         )
     }
     fn decode(raw: &str) -> Result<Self> {
         ensure!(raw.len() < 256, "oversized writable session record");
         let l: Vec<_> = raw.lines().collect();
         ensure!(
-            l.len() == 5 && l[0] == "venus-rw-session-v1",
+            (l.len() == 5 && l[0] == "venus-rw-session-v1")
+                || (l.len() == 6 && l[0] == "venus-rw-session-v2"),
             "invalid writable session version"
         );
         let boot = l[1]
@@ -152,11 +176,22 @@ impl Session {
             .context("missing mount ID")?
             .parse()?;
         ensure!(id > 0, "bad mount ID");
+        let plain = if l.len() == 6 {
+            match l[5].strip_prefix("plain=").context("missing plain flag")? {
+                "0" => false,
+                "1" => true,
+                _ => anyhow::bail!("bad plain flag"),
+            }
+        } else {
+            // A v1 receipt was always written by a mapped, encrypted session.
+            false
+        };
         Ok(Self {
             boot: boot.to_owned(),
             source: dev(l[2], "source=")?,
             mapped: dev(l[3], "mapped=")?,
             mount_id: id,
+            plain,
         })
     }
 }
@@ -220,8 +255,16 @@ mod runtime {
         Ok(f)
     }
     fn snapshot() -> Result<Session> {
-        let mapped = dm::status(MAPPING)?.context("writable userdata mapping missing")?;
-        ensure!(!dm::readonly(MAPPING)?, "userdata mapping is read-only");
+        // Unencrypted userdata is mounted straight from its partition, so the
+        // device to compare against is the raw node and there is no mapping
+        // that could be read-only. Every other session keeps that contract.
+        let (mapped, plain) = match dm::status(MAPPING)? {
+            Some(mapped) => {
+                ensure!(!dm::readonly(MAPPING)?, "userdata mapping is read-only");
+                (mapped, false)
+            }
+            None => (skyward_block::devnum(SOURCE)?, true),
+        };
         let visible =
             mount::visible(Path::new(MOUNT))?.context("writable userdata mount missing")?;
         ensure!(
@@ -250,6 +293,7 @@ mod runtime {
             source: skyward_block::devnum(SOURCE)?,
             mapped,
             mount_id: ids[0].0,
+            plain,
         })
     }
     pub fn verify() -> Result<()> {
@@ -429,28 +473,90 @@ mod runtime {
         // should be running in parallel already; log readiness separately
         // from the MetadataCrypt, filesystem and CE work that follows.
         let total_started = std::time::Instant::now();
+        // Unencrypted userdata is a real configuration, and everything below
+        // branches on this one fact. (From the standalone venus port,
+        // GPL-3.0, same fork family.)
+        let plain = !encrypted(&vendor_entry()?);
         crate::venus_keymaster::phase("DATA_RW_SECURITY_WAIT_BEGIN");
-        prepare_services()?;
+        if plain {
+            // No key is needed to mount plaintext Data, so a security runtime
+            // that does not come up must not keep Data away from the user.
+            // The failure is logged for the diagnostics screen instead.
+            if let Err(error) = prepare_services() {
+                let _ = skyward_sys::kmsg(&format!(
+                    "VENUS_DATA_PLAIN security_skipped error={error:#}"
+                ));
+            }
+        } else {
+            prepare_services()?;
+        }
         let security_ms = total_started.elapsed().as_millis();
         let _ = skyward_sys::kmsg(&format!(
             "VENUS_DATA_TIMING security_ready_ms={security_ms}"
         ));
         let _guard = lock()?;
-        for (name, value) in [("ro.crypto.state", "encrypted"), ("ro.crypto.type", "file")] {
+        // A phone with unencrypted Data must not claim otherwise: the UI and
+        // every caller read this to know whether a credential is needed.
+        let state = if plain { "unencrypted" } else { "encrypted" };
+        for (name, value) in [("ro.crypto.state", state), ("ro.crypto.type", "file")] {
             if skyward_sys::prop(name).is_none() {
                 crypto_property(name, value)?;
             }
         }
-        let hw = Binder::hardware()?;
-        let binder = Binder::recovery_crypto()?;
-        let km = Keystore::open(&binder)?;
+        // Only an encrypted session talks to Keymaster: plaintext Data has no
+        // key to unwrap, so a service that is not up must not stop it from
+        // being mounted.
+        let mut hardware = None;
+        let mut keymaster = None;
+        if !plain {
+            hardware = Some(Binder::hardware()?);
+            keymaster = Some(Keystore::open(&Binder::recovery_crypto()?)?);
+        }
         let mounted = if Path::new(RECORD).exists() {
             verify()?;
             None
+        } else if plain {
+            // Nothing is unwrapped and nothing is mapped: the partition
+            // already carries plaintext, so it is mounted where it is.
+            no_other_data_mount()?;
+            let entry = vendor_entry()?;
+            let opts = options(&entry)?;
+            let _ = skyward_sys::kmsg(
+                "VENUS_DATA_PLAIN unencrypted userdata; no key, no mapping, mount read/write",
+            );
+            let m = fs::symlink_metadata(MOUNT)?;
+            ensure!(
+                m.is_dir() && !m.file_type().is_symlink(),
+                "unsafe /data mount point"
+            );
+            crate::venus_keymaster::phase("DATA_RW_MOUNT_BEGIN");
+            let mount_started = std::time::Instant::now();
+            mount::mount(Path::new(SOURCE), Path::new(MOUNT), &entry.filesystem, &opts)
+                .context("mount unencrypted userdata read/write")?;
+            let _ = skyward_sys::kmsg(&format!(
+                "VENUS_DATA_TIMING mount_ms={}",
+                mount_started.elapsed().as_millis()
+            ));
+            // Internal storage lives inside the same tree, and an image that
+            // has never been booted has no media directory yet.
+            fs::create_dir_all("/data/media/0")?;
+            save().context(
+                "mounted writable Data retained; session receipt failed, no automatic teardown",
+            )?;
+            crate::venus_keymaster::phase("DATA_RW_MOUNT_OK");
+            println!("VENUS_DATA_RW_MOUNT_OK mapping_readonly=false filesystem_readonly=false");
+            Some(Opened {
+                // Unencrypted Data is read and written through the partition
+                // itself, so that is the device the session names.
+                mapped: std::path::PathBuf::from(SOURCE),
+                filesystem: entry.filesystem.clone(),
+                checked: None,
+            })
         } else {
             no_other_data_mount()?;
             let entry = vendor_entry()?;
             let opts = options(&entry)?;
+            let km = keymaster.as_ref().context("keystore unavailable for Data")?;
             crate::venus_keymaster::phase("DATA_RW_METADATA_UNWRAP_BEGIN");
             let metadata_started = std::time::Instant::now();
             let encryption = skyward_crypto::encryption::Encryption::of(&entry)?;
@@ -575,7 +681,9 @@ mod runtime {
         let mut crypto = CRYPTO
             .lock()
             .map_err(|_| anyhow::anyhow!("crypto session owner failed"))?;
-        if crypto.is_none() {
+        if !plain && crypto.is_none() {
+            let km = keymaster.as_ref().context("keystore unavailable for Data")?;
+            let hw = hardware.as_ref().context("hardware binder unavailable for Data")?;
             let entry = vendor_entry()?;
             let mode = entry
                 .extra("fileencryption")
@@ -588,7 +696,7 @@ mod runtime {
             }
             let mut result = None;
             for retry in 0..3 {
-                match CryptoSession::initialize(&km, &hw, init.as_mut().unwrap()) {
+                match CryptoSession::initialize(km, hw, init.as_mut().unwrap()) {
                     Ok(session) => {
                         *crypto = Some(session);
                         break;
@@ -604,6 +712,19 @@ mod runtime {
             if crypto.is_none() {
                 return Err(result.context("DE initialization did not run")?);
             }
+        }
+        if plain {
+            // There is no device-encrypted user to unlock, but internal
+            // storage still has to be exposed, and no user is left closed.
+            show_storage()?;
+            let _ = skyward_sys::kmsg(&format!(
+                "VENUS_DATA_TIMING open_total_ms={} security_wait_ms={security_ms} plain=true closed_users=0",
+                total_started.elapsed().as_millis()
+            ));
+            return Ok(Opening {
+                mounted,
+                closed: Vec::new(),
+            });
         }
         let session = crypto.as_ref().context("crypto session unavailable")?;
         if session.owner_ready() {
@@ -702,12 +823,24 @@ mod runtime {
                 "/sdcard belongs to another tree"
             );
         } else {
-            let m = fs::symlink_metadata(to)?;
-            ensure!(
-                m.is_dir() && !m.file_type().is_symlink(),
-                "/sdcard is not a plain directory"
-            );
-            mount::bind(Path::new("/data/media/0"), to)?;
+            // `/sdcard` on this phone is a symlink to /storage/self/primary
+            // and the kernel refuses to bind onto the link itself, so the
+            // bind goes to the directory the link names.
+            // (From the standalone venus port, GPL-3.0, same fork family.)
+            let real = match fs::read_link(to) {
+                Ok(link) if link.is_absolute() => link,
+                Ok(link) => to.parent().context("no parent for /sdcard")?.join(link),
+                Err(_) => to.to_path_buf(),
+            };
+            if !real.exists() {
+                fs::create_dir_all(&real)?;
+            }
+            ensure!(real.is_dir(), "/sdcard is not a directory");
+            let _ = skyward_sys::kmsg(&format!(
+                "VENUS_DATA_PLAIN sdcard bind target={}",
+                real.display()
+            ));
+            mount::bind(Path::new("/data/media/0"), &real)?;
         }
         Ok(())
     }
@@ -757,7 +890,9 @@ mod runtime {
                 "foreign /sdcard mount"
             );
         }
-        let mapped = snapshot()?.mapped;
+        let session = snapshot()?;
+        let mapped = session.mapped;
+        let plain = session.plain;
         for (_, point) in mount::mount_ids()? {
             ensure!(
                 !(point.starts_with(MOUNT) && point != Path::new(MOUNT))
@@ -806,11 +941,20 @@ mod runtime {
                             mount::points_of(mapped)?.is_empty(),
                             "userdata is still mounted"
                         );
-                        dm::remove(MAPPING)?;
-                        ensure!(
-                            dm::status(MAPPING)?.is_none(),
-                            "userdata mapping survived removal"
-                        );
+                        if plain {
+                            // The partition was mounted directly: there is no
+                            // mapping of ours to take away.
+                            ensure!(
+                                dm::status(MAPPING)?.is_none(),
+                                "a mapping appeared under a plaintext session"
+                            );
+                        } else {
+                            dm::remove(MAPPING)?;
+                            ensure!(
+                                dm::status(MAPPING)?.is_none(),
+                                "userdata mapping survived removal"
+                            );
+                        }
                     }
                     CloseStep::Receipt => {
                         fs::remove_file(RECORD)?;
@@ -828,7 +972,8 @@ mod runtime {
             },
         )?;
         println!(
-            "VENUS_DATA_RW_CLOSE_OK synced=true mounts_removed=true mapping_removed=true receipt_removed=true"
+            "VENUS_DATA_RW_CLOSE_OK synced=true mounts_removed=true mapping_removed={} receipt_removed=true",
+            !plain
         );
         Ok(())
     }
