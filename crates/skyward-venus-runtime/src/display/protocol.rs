@@ -8,6 +8,8 @@ pub const PAUSE: u32 = 2;
 pub const RESUME: u32 = 3;
 pub const READY: u32 = 0;
 pub const PAUSED: u32 = 1;
+/// Sent by the display side only; kept named for the protocol description.
+#[allow(dead_code)]
 pub const FAILED: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,11 +68,16 @@ impl Message {
     }
 }
 
+/// What the owner drives: implemented where a frame is really presented.
+#[allow(dead_code)]
 pub trait Display {
     fn settle(&mut self) -> Result<(), String>;
     fn refresh(&mut self) -> Result<(), String>;
 }
 
+/// Holds the frame the display has been given, for the moment only by the
+/// experiment's own tests.
+#[allow(dead_code)]
 pub struct Owner<D> {
     pub display: D,
     pub current: Message,

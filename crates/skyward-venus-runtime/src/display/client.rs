@@ -3,7 +3,7 @@ use super::{
     guard::{self, Policy},
     platform_binder, stc,
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use skyward_binder::{driver::Binder, parcel::Parcel, service};
 use std::{ffi::OsString, fs::File, io::Write, os::fd::FromRawFd, path::Path};
 const QSERVICE: &str = "android.display.IQService";

@@ -216,6 +216,7 @@ impl Owner {
         self.last = response;
         Ok(response)
     }
+    #[allow(dead_code)]
     pub(super) fn socket(&self) -> i32 {
         self.conn.as_raw_fd()
     }

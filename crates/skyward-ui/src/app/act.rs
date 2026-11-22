@@ -766,12 +766,13 @@ impl App {
         match which {
             Confirm::Maintenance => {
                 let same_page = self.state.maintenance.as_ref().is_some_and(|m| self.screen() == Screen::Maintenance(m.action));
-                if self.state.venus_maintenance && same_page {
-                    if let Some(job) = self.state.maintenance.as_mut().filter(|m| matches!(m.phase, MaintenancePhase::Ready { .. })) {
-                        job.phase = MaintenancePhase::Writing { done: 0, total: 0 };
-                        self.refresh();
-                        fx.push(Effect::ExecuteMaintenance);
-                    }
+                if self.state.venus_maintenance
+                    && same_page
+                    && let Some(job) = self.state.maintenance.as_mut().filter(|m| matches!(m.phase, MaintenancePhase::Ready { .. }))
+                {
+                    job.phase = MaintenancePhase::Writing { done: 0, total: 0 };
+                    self.refresh();
+                    fx.push(Effect::ExecuteMaintenance);
                 }
             }
             Confirm::Reboot => fx.push(Effect::Reboot(TARGETS[self.state.reboot])),

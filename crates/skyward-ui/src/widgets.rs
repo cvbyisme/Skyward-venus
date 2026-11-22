@@ -1740,6 +1740,9 @@ fn stat_strip(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, items: &[Stat]) ->
     bottom
 }
 
+/// The parts of a card are all distinct: the canvas, the theme, the fonts,
+/// where it starts, its three texts and its rows.
+#[allow(clippy::too_many_arguments)]
 pub fn device_card(c: &mut Canvas, t: &Theme, f: &Fonts, top: f32, title: &str, sub: &str, stats: &[Stat], rows: &[Row]) -> Block {
     let m = &t.m;
     let lays: Vec<Layout> = rows.iter().map(|r| layout(c, t, f, r)).collect();
