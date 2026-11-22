@@ -280,11 +280,13 @@ fn main() -> Result<()> {
             } else {
                 Vec::new()
             };
+            // Only the installer capsule needs the stock image's own legacy
+            // Keymaster service, and a third-party carrier declares none: that
+            // is refused where the capsule is built, not here.
             let native_wait_for_keymaster = if venus_recovery_assets.is_some() {
                 rd.find("system/etc/init/wait_for_keymaster.rc")
-                    .context("original wait_for_keymaster rc missing")?
-                    .data
-                    .clone()
+                    .map(|entry| entry.data.clone())
+                    .unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -414,10 +416,14 @@ fn main() -> Result<()> {
                     .clone();
                 let temporary_wait_rc = rd
                     .find(wait_rc_path)
-                    .context("Recovery wait rc missing")?
-                    .data
-                    .clone();
+                    .map(|entry| entry.data.clone())
+                    .unwrap_or_default();
                 if !venus_normal_entry {
+                    ensure!(
+                        !native_wait_for_keymaster.is_empty()
+                            && !temporary_wait_rc.is_empty(),
+                        "the installer capsule needs a stock image that declares the legacy Keymaster service"
+                    );
                     venus_recovery::restore_normal_init_for_capsule(
                         &mut rd,
                         &native_wait_for_keymaster,
