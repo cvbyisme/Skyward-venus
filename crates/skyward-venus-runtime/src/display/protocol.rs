@@ -83,6 +83,7 @@ pub struct Owner<D> {
     pub current: Message,
     last_request: u64,
 }
+#[allow(dead_code)]
 impl<D: Display> Owner<D> {
     // Caller must really present and settle the initial frame before using this.
     pub fn initialized(display: D, generation: u64, width: u32, height: u32) -> Self {
