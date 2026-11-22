@@ -322,7 +322,16 @@ fn main() -> Result<()> {
                 .rsplit_once('/')
                 .expect("the recovery binary is in a folder");
             for command in paths::COMMANDS {
-                rd.link(command, recovery)?;
+                match rd.find(command) {
+                    // A stock recovery carries these as links to its own
+                    // recovery service, so they are pointed at this one.
+                    Some(entry) if entry.mode & 0o170000 != 0o120000 && stock_third_party => {
+                        // Another recovery ships its own programs here: they
+                        // work as they are and are left alone.
+                        eprintln!("{command} is the carrier's own program; left as it is");
+                    }
+                    _ => rd.link(command, recovery)?,
+                }
             }
             rd.add(paths::SYSTEM_INIT, 0o755, read(&system_init)?)?;
             rd.add(paths::CONFIG, 0o644, read(&config)?)?;
