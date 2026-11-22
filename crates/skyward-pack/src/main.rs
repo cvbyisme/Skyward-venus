@@ -350,7 +350,7 @@ fn main() -> Result<()> {
                 );
                 venus_probe::prepare(&mut rd, stock_third_party)?;
                 if venus_ui {
-                    venus_ui::prepare(&mut rd)?;
+                    venus_ui::prepare(&mut rd, stock_third_party)?;
                     if venus_basic {
                         venus_ui::enable_basic(&mut rd)?;
                     }

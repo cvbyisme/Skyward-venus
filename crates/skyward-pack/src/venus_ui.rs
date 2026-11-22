@@ -7,9 +7,11 @@ const INIT: &str = "system/etc/init/hw/init.rc";
 const RC: &str = include_str!("venus_ui.rc");
 const MARKER: &[u8] = b"venus-ui-autostart-v1\nTEMPORARY UI TEST ONLY - DO NOT FLASH\nSystem effects remain disabled.\n";
 
-fn append_rc(input: &str) -> Result<String> {
+fn append_rc(input: &str, third_party: bool) -> Result<String> {
+    // A third-party carrier starts the probe from its own service file.
     ensure!(
-        input
+        third_party
+            || input
             .matches("service recovery /system/bin/skyward venus-helper probe\n")
             .count()
             == 1,
@@ -24,13 +26,13 @@ fn append_rc(input: &str) -> Result<String> {
     Ok(result)
 }
 
-pub fn prepare(rd: &mut Ramdisk) -> Result<()> {
+pub fn prepare(rd: &mut Ramdisk, third_party: bool) -> Result<()> {
     ensure!(
         rd.find("skyward/probe-entryfix.txt").is_some(),
         "venus UI requires entryfix probe"
     );
     let input = std::str::from_utf8(&rd.find(INIT).context("missing recovery init.rc")?.data)?;
-    let rc = append_rc(input)?;
+    let rc = append_rc(input, third_party)?;
     rd.add("skyward/ui-autostart.txt", 0o644, MARKER.to_vec())?;
     rd.replace(INIT, rc.into_bytes())?;
     eprintln!(
@@ -60,7 +62,7 @@ mod tests {
     fn ui_is_a_separate_oneshot_service_and_preserves_probe() {
         let original =
             "service recovery /system/bin/skyward venus-helper probe\n    disabled\n    oneshot\n";
-        let out = append_rc(original).unwrap();
+        let out = append_rc(original, false).unwrap();
         assert!(out.starts_with(original));
         assert_eq!(out.matches("service venus_ui ").count(), 1);
         assert!(out.contains(
@@ -73,9 +75,9 @@ mod tests {
 
     #[test]
     fn unknown_and_already_modified_rc_are_refused() {
-        assert!(append_rc("service recovery /system/bin/recovery\n").is_err());
-        let once = append_rc("service recovery /system/bin/skyward venus-helper probe\n").unwrap();
-        assert!(append_rc(&once).is_err());
+        assert!(append_rc("service recovery /system/bin/recovery\n", false).is_err());
+        let once = append_rc("service recovery /system/bin/skyward venus-helper probe\n", false).unwrap();
+        assert!(append_rc(&once, false).is_err());
     }
 
 }
