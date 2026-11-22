@@ -348,7 +348,7 @@ fn main() -> Result<()> {
                     img.header.header_version() == 3,
                     "venus probe requires boot header v3"
                 );
-                venus_probe::prepare(&mut rd)?;
+                venus_probe::prepare(&mut rd, stock_third_party)?;
                 if venus_ui {
                     venus_ui::prepare(&mut rd)?;
                     if venus_basic {

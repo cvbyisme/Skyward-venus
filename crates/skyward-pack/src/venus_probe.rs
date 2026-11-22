@@ -1,26 +1,37 @@
 use crate::ramdisk::Ramdisk;
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, Context, Result};
 
 const INIT: &str = "system/etc/init/hw/init.rc";
+const PROBE_SERVICE: &str =
+    "service recovery /system/bin/skyward venus-helper probe\n    disabled\n    oneshot\n";
 
-fn patch_init(input: &str) -> Result<String> {
+fn patch_init(input: &str, third_party: bool) -> Result<String> {
     let service = "service recovery /system/bin/recovery\n";
-    ensure!(input.matches(service).count() == 1, "unexpected recovery service");
     let factory = "import /miui.factoryreset.rc\n";
-    ensure!(input.matches(factory).count() == 1, "unexpected factory-reset import");
-    let mut text = input.replacen(factory, "# Factory-reset hooks disabled for venus probe.\n", 1);
-    text = text.replacen(
-        service,
-        "service recovery /system/bin/skyward venus-helper probe\n    disabled\n    oneshot\n",
-        1,
-    );
+    let mut text = match input.matches(service).count() {
+        1 => input.replacen(service, PROBE_SERVICE, 1),
+        // A third-party carrier (TWRP) has no recovery service of its own:
+        // the probe entry is appended instead of replacing one.
+        0 if third_party => input.to_string(),
+        n => bail!("unexpected recovery service ({n} declarations)"),
+    };
+    match text.matches(factory).count() {
+        1 => {
+            text = text.replacen(factory, "# Factory-reset hooks disabled for venus probe.\n", 1);
+        }
+        0 if third_party => {}
+        n => bail!("unexpected factory-reset import ({n} declarations)"),
+    }
+    if !text.contains(PROBE_SERVICE) {
+        text.push_str(PROBE_SERVICE);
+    }
     text.push_str(include_str!("venus_probe.rc"));
     Ok(text)
 }
 
-pub fn prepare(rd: &mut Ramdisk) -> Result<()> {
+pub fn prepare(rd: &mut Ramdisk, third_party: bool) -> Result<()> {
     let input = std::str::from_utf8(&rd.find(INIT).context("missing recovery init.rc")?.data)?;
-    let text = patch_init(input)?;
+    let text = patch_init(input, third_party)?;
     let old_init = &rd.find("system/bin/init").context("missing first-stage init")?.data;
     let new_init = crate::venus_first_stage::patch(old_init)?;
     rd.replace("system/bin/init", new_init)?;
@@ -40,18 +51,28 @@ pub fn prepare(rd: &mut Ramdisk) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn probe_does_not_start_full_recovery() {
         let s = "import /miui.factoryreset.rc\nservice recovery /system/bin/recovery\n    seclabel u:r:recovery:s0\n";
-        let out = patch_init(s).unwrap();
+        let out = patch_init(s, false).unwrap();
         assert!(!out.contains("import /miui.factoryreset.rc"));
         assert!(out.contains("service recovery /system/bin/skyward venus-helper probe"));
         assert!(out.contains("setprop sys.usb.config adb"));
         assert!(out.contains("    disabled\n    oneshot\n"));
         assert!(out.contains("    seclabel u:r:recovery:s0\n"));
     }
+
     #[test]
     fn unknown_layout_is_refused() {
-        assert!(patch_init("service recovery /wrong/path\n").is_err());
+        assert!(patch_init("service recovery /wrong/path\n", false).is_err());
+    }
+
+    #[test]
+    fn a_third_party_carrier_gets_the_service_added() {
+        let out = patch_init("on boot\n    start adbd\n", true).unwrap();
+        assert!(out.contains(PROBE_SERVICE));
+        assert!(out.contains("on boot\n    start adbd\n"));
+        assert!(patch_init("on boot\n    start adbd\n", false).is_err());
     }
 }
