@@ -101,7 +101,9 @@ jobs:
             test -f "devices/$DEVICE.toml"
             echo "devices=$(jq -nc --arg device "$DEVICE" '[$device]')" >> "$GITHUB_OUTPUT"
           else
-            echo "devices=$(basename -s .toml devices/*.toml | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+            # venus is packed by its own workflow: its stock build is the boot
+            # partition, not a package on an update server (see venus.yml).
+            echo "devices=$(basename -s .toml devices/*.toml | grep -vx venus | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
           fi
 
   recovery:

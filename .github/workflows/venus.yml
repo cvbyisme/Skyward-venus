@@ -1,0 +1,132 @@
+name: Venus
+
+# The venus Recovery is not packed the way the other devices' are: its stock
+# build is the phone's boot partition, which no update package on a server
+# gives whole, and its assets come from the phone's own vendor partitions.
+# This workflow puts the same pieces together in the same order the porting
+# scripts do, out of two published images, so a change can be checked on a
+# phone without a local dump.
+#
+#   venus/stock/boot_a.img   the boot partition the Recovery is laid on,
+#                            published with this fork's archived port
+#   venus/upstream/*.img     an already built venus Recovery, from which the
+#                            vendor assets are taken back out and checked
+#                            against the SHA-256 the build pins
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "crates/**"
+      - "devices/venus.toml"
+      - "porting/venus/**"
+      - "resources/**"
+      - ".github/actions/**"
+      - ".github/workflows/venus.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: venus-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  STOCK_ZIP: https://github.com/cvbyisme/skyward-venus-archive/releases/download/stock-venus/stock-venus-boot.zip
+  UPSTREAM_IMAGE: https://github.com/hushangda/Skyward-venus/releases/download/v0.3.1/skyward-rec-venus-0.3.1.img
+
+jobs:
+  build:
+    name: Pack the venus Recovery
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+
+      - name: Install what the packaging scripts ask for
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lz4 checkpolicy secilc
+
+      # Both images are large and neither changes while this workflow does.
+      - name: Keep the images this is built from
+        id: inputs
+        uses: actions/cache@v6
+        with:
+          path: |
+            venus/stock/boot_a.img
+            venus/upstream/skyward-rec.img
+          key: venus-inputs-v1
+
+      - name: Fetch them
+        if: steps.inputs.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p venus/stock venus/upstream
+          curl -fsSL --retry 3 -o venus/stock/stock.zip "$STOCK_ZIP"
+          python3 -c "import zipfile; zipfile.ZipFile('venus/stock/stock.zip').extract('boot_a.img', 'venus/stock')"
+          rm venus/stock/stock.zip
+          curl -fsSL --retry 3 -o venus/upstream/skyward-rec.img "$UPSTREAM_IMAGE"
+          sha256sum venus/stock/boot_a.img venus/upstream/skyward-rec.img
+
+      - name: Take the runtime assets out of a built venus Recovery
+        run: python3 porting/venus/restore-upstream-assets.py venus/upstream/skyward-rec.img venus/assets
+
+      # The policy has to be built from the stock recovery this image is laid
+      # on, which is why it is not one of the assets taken from the upstream
+      # image: the packer refuses a policy built for another carrier.
+      - name: Build the crypto policy for that stock recovery
+        run: |
+          python3 porting/venus/prepare-crypto-policy.py venus/stock/boot_a.img venus/policy \
+            --checkpolicy "$(command -v checkpolicy)" --secilc "$(command -v secilc)"
+          cp -p venus/policy/recovery-sepolicy venus/policy/recovery-sepolicy.source.sha256 venus/assets/
+
+      - name: Build the helpers the phone runs
+        run: bash porting/venus/build-runtime.sh venus/assets
+
+      - name: Build the Recovery and its first program
+        run: |
+          cargo build --locked --release -p skyward-pack
+          cargo ndk -t arm64-v8a --platform 30 build --locked --release -p skyward
+          cp -p target/aarch64-linux-android/release/skyward venus/assets/skyward
+          RUSTFLAGS='-C target-feature=+crt-static' cargo ndk -t arm64-v8a --platform 30 \
+            build --locked --release -p skyward-system-init --target-dir target/system-init
+          cp -p target/system-init/aarch64-linux-android/release/system-init venus/assets/system-init
+
+      - name: Pack it
+        run: |
+          ARGS=(recovery --partition boot --stock venus/stock/boot_a.img
+                --binary venus/assets/skyward --system-init venus/assets/system-init
+                --config devices/venus.toml
+                --font resources/fonts/MiSansVF.ttf
+                --mono resources/fonts/KirkMono-Regular.ttf
+                --mono-license resources/fonts/KirkMono-OFL.txt)
+          FULL=(--venus-probe --venus-ui --venus-basic
+                --venus-recovery-assets venus/assets --venus-install-capsule)
+          mkdir -p venus/out/temporary venus/out/standalone
+          # The whole partition, flashed as it is.
+          target/release/skyward-pack "${ARGS[@]}" "${FULL[@]}" --out venus/out/temporary/boot.img
+          # What fastboot boots without flashing anything.
+          target/release/skyward-pack "${ARGS[@]}" "${FULL[@]}" --standalone --out venus/out/standalone/skyward-rec.img
+
+      - name: Check what was packed
+        run: |
+          curl -fsSL -o venus/avbtool.b64 'https://android.googlesource.com/platform/external/avb/+/refs/heads/main/avbtool.py?format=TEXT'
+          base64 -d venus/avbtool.b64 > venus/avbtool.py
+          python3 venus/avbtool.py info_image --image venus/out/temporary/boot.img | head -20
+          python3 venus/avbtool.py verify_image --image venus/out/temporary/boot.img
+          python3 venus/avbtool.py verify_image --image venus/out/standalone/skyward-rec.img || true
+          target/release/skyward-pack list venus/out/temporary/boot.img \
+            | grep -E '^skyward/(runtime/(runtime|vndk30|tethering)\.img|venus-recovery\.txt|system-init)$'
+          (cd venus/out && sha256sum temporary/boot.img standalone/skyward-rec.img > SHA256SUMS && cat SHA256SUMS)
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: skyward-venus-${{ github.sha }}
+          path: |
+            venus/out/temporary/boot.img
+            venus/out/standalone/skyward-rec.img
+            venus/out/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
